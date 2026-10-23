@@ -375,7 +375,12 @@ USE_TILED = True
 USE_TMA = False  # fetch tiles with TMA descriptors (box inner dim <= 256 elements)
 
 
+_OVERRIDE = None   # a config dict, during in-prepare benchmarking
+
+
 def _config(layer: str, m: int, n: int, k: int):
+    if _OVERRIDE is not None:
+        return dict(_OVERRIDE)
     cfg = _config_table(layer, m, n, k)
     if cfg is None:
         return None
@@ -562,6 +567,68 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
+BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH_BUDGET_S = 160
+
+
+def _bench(state):
+    import time
+    global _OVERRIDE
+    t0 = time.time()
+    dev = state["router"].device
+    layers = {"qkv_gate": (2304, 8192), "o": (8192, 1024), "pooler": (4096, 8192), "unpooler": (8192, 4096),
+              "router": (256, 8192)}
+    xs = {(m, k): torch.randn((m, k), device=dev).to(torch.bfloat16) for m in (1, 8, 16, 32) for k in (8192, 1024, 4096)}
+
+    def timeit(fn, reps=20):
+        for _ in range(2):
+            fn()
+        torch.cuda.synchronize()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(reps):
+            fn()
+        e1.record()
+        torch.cuda.synchronize()
+        return e0.elapsed_time(e1) * 1000.0 / reps
+
+    print("BENCH proj: us per call (warm L2), configs = (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
+    plan = {
+        "pooler":   [(32, 256, 1, 4, 4, True), (32, 256, 1, 4, 6, True), (32, 256, 1, 4, 8, True), (32, 256, 2, 4, 4, True),
+                     (32, 256, 1, 4, 4, False), (32, 256, 1, 4, 6, False), (32, 256, 1, 2, 6, True), (32, 256, 1, 8, 6, True)],
+        "unpooler": [(32, 256, 1, 4, 4, True), (32, 256, 1, 4, 6, True), (32, 256, 1, 4, 8, True), (32, 256, 2, 4, 4, True),
+                     (32, 256, 1, 4, 6, False), (32, 256, 4, 4, 4, True), (32, 256, 4, 4, 6, True), (32, 256, 8, 4, 4, True)],
+        "o":        [(64, 256, 1, 4, 4, True), (64, 256, 1, 4, 5, True), (64, 256, 1, 4, 4, False), (64, 256, 1, 2, 4, True),
+                     (64, 256, 1, 8, 4, True), (64, 256, 2, 4, 4, True)],
+        "qkv_gate": [(32, 256, 4, 4, 4, True), (32, 256, 4, 4, 6, True), (32, 256, 2, 4, 6, True), (32, 256, 8, 4, 4, True),
+                     (32, 256, 4, 4, 4, False), (32, 256, 2, 4, 4, False), (32, 256, 1, 4, 6, True)],
+        "router":   [(32, 256, 16, 4, 3, True), (32, 256, 16, 4, 3, False), (32, 256, 8, 4, 4, True), (32, 256, 8, 4, 6, True),
+                     (32, 256, 16, 4, 4, True), (32, 256, 32, 4, 3, True)],
+    }
+    for layer, cfgs in plan.items():
+        N, K = layers[layer]
+        for bn, bk, sk, nw, ns, tma in cfgs:
+            if time.time() - t0 > BENCH_BUDGET_S:
+                print("BENCH budget reached"); break
+            row = []
+            for m in (1, 8, 16, 32):
+                n = 1024 if (layer == "unpooler" and m <= 8) else N
+                _OVERRIDE = dict(BLOCK_M=_block_m(m), BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns,
+                                 tiled=True, tma=tma)
+                try:
+                    if not _usable(_OVERRIDE, m, n, K):
+                        row.append("   n/a"); continue
+                    x = xs[(m, K)]
+                    row.append(f"{timeit(lambda: _proj_forward(x, layer, n, state)):6.1f}")
+                except Exception as e:
+                    row.append(" fail")
+                    print("   ", layer, (bn, bk, sk, nw, ns, tma), m, str(e)[:100])
+            _OVERRIDE = None
+            print(f"  {layer:9s} {str((bn, bk, sk, nw, ns, tma)):32s} m1 {row[0]} m8 {row[1]} m16 {row[2]} m32 {row[3]}")
+    _OVERRIDE = None
+    print(f"BENCH proj done in {time.time() - t0:.0f}s")
+
+
 def prepare(weights: Weights, warm: bool = True):
     """Called once, untimed; then every scored shape is run once so the judge never compiles
     under capture."""
@@ -569,6 +636,12 @@ def prepare(weights: Weights, warm: bool = True):
     device = state["router"].device
     if not warm:
         return state
+    if BENCH:
+        try:
+            _bench(state)
+        except Exception as e:
+            print("BENCH failed:", repr(e))
+        torch.cuda.synchronize()
     # Warm-up / compile for the shapes the judge will run (tests and scored), with throwaway x.
     layers = {"qkv_gate": 8192, "o": 1024, "pooler": 8192, "unpooler": 4096, "router": 8192}
     try:
