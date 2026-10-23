@@ -57,9 +57,23 @@ class Inputs(TypedDict):
 
 RMS_EPS = tl.constexpr(1e-5)
 OUT_DTYPE = torch.bfloat16
-ACT_DTYPE = tl.bfloat16   # the dots' operand precision (BF16, as SGLang's FA3 path keeps activations)
+ACT_DTYPE = tl.float16    # the dots' operand dtype: exact for the E4M3 cache values and finer than BF16
+FP8_ASM = True            # hardware e4m3x2 -> f16x2 conversion (False: generic cast, for the interpreter)
 NEG = tl.constexpr(-1.0e30)  # finite "minus infinity" for masked logits (keeps every exp2 finite)
 LOG2E = 1.4426950408889634
+
+
+@triton.jit
+def _cache_to_act(x8, ACT: tl.constexpr, FP8_ASM: tl.constexpr):
+    """FP8 E4M3 cache bytes -> the dots' operand dtype. On the GPU, one cvt.f16x2.e4m3x2 per
+    pair (exact); Triton's generic cast would spend three conversions per element."""
+    if FP8_ASM:
+        b = x8.to(tl.uint8, bitcast=True)
+        return tl.inline_asm_elementwise(
+            asm="cvt.rn.f16x2.e4m3x2 $0, $1;", constraints="=r,h", args=[b],
+            dtype=tl.float16, is_pure=True, pack=2)
+    else:
+        return x8.to(ACT)
 
 
 @triton.jit
@@ -85,7 +99,7 @@ def _attn_decode_kernel(
     max_pages, qk_scale, sm_scale_log2, log2_theta,
     L: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
     PS: tl.constexpr, WINDOW: tl.constexpr, ROPE: tl.constexpr, SPLITS: tl.constexpr,
-    RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr, ACT: tl.constexpr,
+    RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr, ACT: tl.constexpr, FP8_ASM: tl.constexpr,
 ):
     GROUP: tl.constexpr = HQ // HKV
     R: tl.constexpr = L * GROUP
@@ -115,7 +129,8 @@ def _attn_decode_kernel(
     qe = tl.load(qp, mask=rmask[:, None], other=0.0).to(tl.float32)
     qo = tl.load(qp + 1, mask=rmask[:, None], other=0.0).to(tl.float32)
     qe, qo = _rms_rope(qe, qo, rmask, seq + j, inv_freq, qk_scale, ROPE, D)
-    q = tl.interleave(qe, qo).to(ACT)   # [RB, D]
+    # keys are used as their raw E4M3 values: the cache scale multiplies q instead
+    q = (tl.interleave(qe, qo) * k_scale).to(ACT)   # [RB, D]
 
     # ---- the block's new keys and values for this KV head: [LB, D] (rows >= L masked) ----
     kj = tl.arange(0, LB)
@@ -134,9 +149,9 @@ def _attn_decode_kernel(
         cp = loc[:, None] * ROW_W + h * D + d[None, :]
         tl.store(kc_ptr + cp, k_new8, mask=kmask[:, None])
         tl.store(vc_ptr + cp, v_new8, mask=kmask[:, None])
-    # Attend to the entries as stored (what the reference checks against).
-    k_new = (k_new8.to(tl.float32) * k_scale).to(ACT)   # [LB, D]
-    v_newb = (v_new8.to(tl.float32) * v_scale).to(ACT)  # [LB, D]
+    # Attend to the entries as stored (what the reference checks against), raw E4M3 values.
+    k_new = _cache_to_act(k_new8, ACT, FP8_ASM)    # [LB, D]
+    v_newb = _cache_to_act(v_new8, ACT, FP8_ASM)   # [LB, D]
 
     # ---- online softmax over this split's slice of the past keys ----
     m_i = tl.full((RB,), NEG, tl.float32)
@@ -158,7 +173,7 @@ def _attn_decode_kernel(
         row = page.to(tl.int64) * PS + (t % PS).to(tl.int64)
         cp = row[:, None] * ROW_W + h * D + d[None, :]
         k8 = tl.load(kc_ptr + cp, mask=valid[:, None], other=0.0)
-        kt = (k8.to(tl.float32) * k_scale).to(ACT)        # [BLOCK_T, D]
+        kt = _cache_to_act(k8, ACT, FP8_ASM)                      # [BLOCK_T, D]
         sc = tl.dot(q, tl.trans(kt)) * sm_scale_log2              # [RB, BLOCK_T]
         if WINDOW > 0:
             ok = valid[None, :] & (t[None, :] >= first[:, None])
@@ -170,7 +185,7 @@ def _attn_decode_kernel(
         p = tl.exp2(sc - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
         v8 = tl.load(vc_ptr + cp, mask=valid[:, None], other=0.0)
-        vt = (v8.to(tl.float32) * v_scale).to(ACT)
+        vt = _cache_to_act(v8, ACT, FP8_ASM)
         acc = acc * alpha[:, None] + tl.dot(p.to(ACT), vt)
         m_i = m_new
 
@@ -186,6 +201,8 @@ def _attn_decode_kernel(
         acc = acc * alpha[:, None] + tl.dot(p.to(ACT), v_newb)
         m_i = m_new
 
+    acc = acc * v_scale   # values were accumulated as raw E4M3
+
     # ---- merge the splits (last CTA of this (b, h)), then the gated norm ----
     if SPLITS > 1:
         base = (bh * SPLITS + s) * RB
@@ -199,14 +216,14 @@ def _attn_decode_kernel(
             m_all = tl.full((RB,), NEG, tl.float32)
             for s2 in tl.static_range(SPLITS):
                 b2 = (bh * SPLITS + s2) * RB
-                m_all = tl.maximum(m_all, tl.load(ml_ptr + (b2 + rows) * 2, volatile=True))
+                m_all = tl.maximum(m_all, tl.load(ml_ptr + (b2 + rows) * 2, cache_modifier=".cg"))
             l_all = tl.zeros((RB,), tl.float32)
             o = tl.zeros((RB, D), tl.float32)
             for s2 in tl.static_range(SPLITS):
                 b2 = (bh * SPLITS + s2) * RB
-                m2 = tl.load(ml_ptr + (b2 + rows) * 2, volatile=True)
-                l2 = tl.load(ml_ptr + (b2 + rows) * 2 + 1, volatile=True)
-                a2 = tl.load(part_ptr + (b2 + rows)[:, None] * D + d[None, :], volatile=True)
+                m2 = tl.load(ml_ptr + (b2 + rows) * 2, cache_modifier=".cg")
+                l2 = tl.load(ml_ptr + (b2 + rows) * 2 + 1, cache_modifier=".cg")
+                a2 = tl.load(part_ptr + (b2 + rows)[:, None] * D + d[None, :], cache_modifier=".cg")
                 w = tl.exp2(m2 - m_all)
                 l_all += l2 * w
                 o += a2 * w[:, None]
@@ -254,14 +271,14 @@ def _plan(cfg):
     """Splits and tile size from the shape only."""
     b, hkv, L = cfg["batch"], cfg["num_kv_heads"], cfg["q_len"]
     ctas = b * hkv
+    rb = max(16, triton.next_power_of_2(L * (cfg["num_q_heads"] // hkv)))   # dots need >= 16 rows
+    cap = 128 if rb <= 16 else 32
     if cfg["window"]:
-        splits = max(1, min(16, 512 // ctas))
+        splits = max(1, min(16 if rb <= 16 else 8, 512 // ctas))
         block_t = 64 if cfg["window"] <= 2048 else 128
     else:
-        splits = max(1, min(128, 1024 // ctas))
+        splits = max(1, min(cap, 1024 // ctas))
         block_t = 128
-    # (dots need >= 16 rows; LB is the padded block length)
-    rb = max(16, triton.next_power_of_2(L * (cfg["num_q_heads"] // hkv)))
     lb = 16
     return splits, block_t, rb, lb
 
@@ -289,7 +306,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         page_table.shape[1], cfg["qk_scale_factor"], cfg["sm_scale"] * LOG2E,
         math.log2(theta) if theta else 0.0,
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
-        ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t, ACT=ACT_DTYPE,
+        ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t, ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
         num_warps=4, num_stages=3,
     )
     return out

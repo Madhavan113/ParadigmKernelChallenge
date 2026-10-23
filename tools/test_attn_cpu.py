@@ -12,6 +12,7 @@ import submission as S
 S.OUT_DTYPE = torch.float16   # numpy has no bfloat16
 import triton.language as tl
 S.ACT_DTYPE = tl.float16
+S.FP8_ASM = False
 
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"
 dev = "cpu"
