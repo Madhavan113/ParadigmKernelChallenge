@@ -53,11 +53,13 @@ class Inputs(TypedDict):
     config: Config
 
 
+# == BEGIN SHARED moe ==
 TOPK = 8
 LOCAL = 32
 POST_NORM_EPS = 1e-8
 MAX_M = 1024
 NUM_SMS = 132
+MOE_OUT_DTYPE = torch.bfloat16
 DEQUANT_ASM = True          # inline PTX for the nibble -> fp16 placement (False: plain Triton ops)
 SCALE_FIX = 2.0 ** 14       # folded into the global scales: the placement trick yields value * 2^-14
 
@@ -250,7 +252,7 @@ def _finalize_kernel(y_ptr, row_of_pair_ptr, tw_ptr, nw_ptr, out_ptr, eps,
         y = y * tl.rsqrt(ms + eps)
         g = tl.load(tw_ptr + t * TOPK + s)
         acc += tl.where(ok, g, 0.0) * y
-    tl.store(out_ptr + t * H + d, acc.to(tl.bfloat16))
+    tl.store(out_ptr + t * H + d, acc.to(out_ptr.dtype.element_ty))
 
 
 # ----------------------------------------------------------------------------------------------
@@ -267,7 +269,7 @@ def _gemm_config(bs: int):
     return 64, 128, 64, 4, 3
 
 
-def prepare(weights: Weights):
+def _moe_state(weights) -> dict:
     dev = weights["w13"].device
     state = {
         "w13": weights["w13"].contiguous(), "w13_sf": weights["w13_sf"].contiguous(),
@@ -296,20 +298,18 @@ def prepare(weights: Weights):
     return state
 
 
-def kernel_fn(data: Inputs, state) -> torch.Tensor:
-    cfg = data["config"]
-    x = data["hidden_states"]
+def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
+    """x [M, H] (bf16), ids [M, 8] global expert ids, tw [M, 8] fp32: the local experts'
+    weighted post-normed outputs summed per token, bf16 [M, H]. Experts local_start .. +31 use
+    w13[0..31]."""
     M, H = x.shape
-    I = cfg["d_expert"]
-    ids = data["topk_ids"]
-    tw = data["topk_weights"]
     if ids.dtype != torch.int32:
         ids = ids.to(torch.int32)
     if not ids.is_contiguous():
         ids = ids.contiguous()
     tw = tw.contiguous()
     dev = x.device
-    out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+    out = torch.empty((M, H), dtype=MOE_OUT_DTYPE, device=dev)
 
     BM, BN, BK, nw, ns = _gemm_config(M)
     NP = max(16, triton.next_power_of_2(M * TOPK))
@@ -321,7 +321,7 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     _route_kernel[grid0](
         ids, x, x16,
         state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-        M, cfg["local_start"], n_elems,
+        M, local_start, n_elems,
         NP=NP, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, num_warps=8,
     )
     w13, w13_sf, w2, w2_sf = state["w13"], state["w13_sf"], state["w2"], state["w2_sf"]
@@ -350,3 +350,14 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
         H=H, TOPK=TOPK, num_warps=4,
     )
     return out
+# == END SHARED moe ==
+
+
+def prepare(weights: Weights):
+    return _moe_state(weights)
+
+
+def kernel_fn(data: Inputs, state) -> torch.Tensor:
+    cfg = data["config"]
+    return _moe_forward(data["hidden_states"], data["topk_ids"], data["topk_weights"], cfg["local_start"],
+                        cfg["d_expert"], state)

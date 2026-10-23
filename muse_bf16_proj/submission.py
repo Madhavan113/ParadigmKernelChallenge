@@ -41,6 +41,7 @@ class Inputs(TypedDict):
     config: Config
 
 
+# == BEGIN SHARED proj ==
 # ----------------------------------------------------------------------------------------------
 # Triton kernel
 # ----------------------------------------------------------------------------------------------
@@ -394,9 +395,8 @@ def _pack_tiles(w: torch.Tensor, bn: int, bk: int) -> torch.Tensor:
     return w.view(n // bn, bn, k // bk, bk).permute(0, 2, 1, 3).reshape(-1, bk).contiguous()
 
 
-def prepare(weights: Weights, warm: bool = True):
-    """Called once, untimed. Contiguous copies, the router's hi/lo split, and the split-K
-    workspace; then every scored shape is run once so the judge never compiles under capture."""
+def _proj_state(weights) -> dict:
+    """Contiguous copies, the router's hi/lo split, the packed tiles and the split-K workspace."""
     state = {name: w.contiguous() for name, w in weights.items()}
     router = state["router"]
     hi = router.to(torch.bfloat16)
@@ -411,7 +411,38 @@ def prepare(weights: Weights, warm: bool = True):
     state["router_lo_tiled"] = _pack_tiles(state["router_lo"], *TILE_SHAPE["router"])
     state["counters"] = torch.zeros((COUNTERS,), dtype=torch.int32, device=device)
     state["partials"] = torch.empty((PARTIALS_FLOATS,), dtype=torch.float32, device=device)
+    return state
 
+
+def _proj_forward(x, layer: str, n: int, state) -> torch.Tensor:
+    """x @ W[:n].T for one of the dense weights: bf16 out (fp32 for the router)."""
+    if x.stride(1) != 1:
+        x = x.contiguous()
+    m, k = x.shape
+    if layer == "router":
+        cfg = _config(layer, m, n, k)
+        if _usable(cfg, m, n, k):
+            out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+            return _launch(x, state["router_hi"], state["router_lo"], out, state, cfg, m, n, k, layer)
+        # one GEMM: [x | x] @ [hi | lo]^T == x @ hi^T + x @ lo^T, fp32 accumulation
+        x2 = torch.cat((x, x), dim=1)
+        return torch.mm(x2, state["router_hilo_t"], out_dtype=torch.float32)
+    w = state[layer]
+    if w.shape[0] != n:
+        w = w[:n]
+    cfg = _config(layer, m, n, k)
+    if _usable(cfg, m, n, k):
+        out = torch.empty((m, n), dtype=x.dtype, device=x.device)
+        return _launch(x, w, None, out, state, cfg, m, n, k, layer)
+    return torch.matmul(x, w.t())
+# == END SHARED proj ==
+
+
+def prepare(weights: Weights, warm: bool = True):
+    """Called once, untimed; then every scored shape is run once so the judge never compiles
+    under capture."""
+    state = _proj_state(weights)
+    device = state["router"].device
     if not warm:
         return state
     # Warm-up / compile for the shapes the judge will run (tests and scored), with throwaway x.
@@ -484,27 +515,5 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 
 
 def kernel_fn(data: Inputs, state) -> torch.Tensor:
-    x = data["x"]
     cfg_in = data["config"]
-    layer, n = cfg_in["layer"], cfg_in["n"]
-    m, k = x.shape
-    if x.stride(1) != 1:
-        x = x.contiguous()
-
-    if layer == "router":
-        cfg = _config(layer, m, n, k)
-        if _usable(cfg, m, n, k):
-            out = torch.empty((m, n), dtype=torch.float32, device=x.device)
-            return _launch(x, state["router_hi"], state["router_lo"], out, state, cfg, m, n, k, layer)
-        # one GEMM: [x | x] @ [hi | lo]^T == x @ hi^T + x @ lo^T, fp32 accumulation
-        x2 = torch.cat((x, x), dim=1)
-        return torch.mm(x2, state["router_hilo_t"], out_dtype=torch.float32)
-
-    w = state[layer]
-    if w.shape[0] != n:
-        w = w[:n]
-    cfg = _config(layer, m, n, k)
-    if _usable(cfg, m, n, k):
-        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-        return _launch(x, w, None, out, state, cfg, m, n, k, layer)
-    return torch.matmul(x, w.t())
+    return _proj_forward(data["x"], cfg_in["layer"], cfg_in["n"], state)

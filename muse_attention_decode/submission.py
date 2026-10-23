@@ -55,6 +55,7 @@ class Inputs(TypedDict):
     config: Config
 
 
+# == BEGIN SHARED attn ==
 RMS_EPS = tl.constexpr(1e-5)
 OUT_DTYPE = torch.bfloat16
 ACT_DTYPE = tl.float16    # the dots' operand dtype: exact for the E4M3 cache values and finer than BF16
@@ -283,7 +284,7 @@ def _plan(cfg):
     return splits, block_t, rb, lb
 
 
-def kernel_fn(data: Inputs) -> torch.Tensor:
+def _attention_forward(data) -> torch.Tensor:
     cfg = data["config"]
     B, L = cfg["batch"], cfg["q_len"]
     HQ, HKV, D = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
@@ -310,3 +311,8 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         num_warps=4, num_stages=3,
     )
     return out
+# == END SHARED attn ==
+
+
+def kernel_fn(data: Inputs) -> torch.Tensor:
+    return _attention_forward(data)
