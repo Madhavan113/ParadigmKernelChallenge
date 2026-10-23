@@ -761,56 +761,59 @@ SCALE_FIX = 2.0 ** 14       # folded into the global scales: the placement trick
 def _route_kernel(
     ids_ptr, x_ptr, x16_ptr,
     sorted_tok_ptr, row_of_pair_ptr, blk_e_ptr, blk_row0_ptr, blk_end_ptr, nblk_ptr,
-    M, local_start, n_elems,
-    NP: tl.constexpr, BM: tl.constexpr, MAXB: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
-    XBLOCK: tl.constexpr,
+    M, local_start, n_elems, n_route_ctas,
+    PB: tl.constexpr, CH: tl.constexpr, BM: tl.constexpr, MAXB: tl.constexpr, E: tl.constexpr,
+    TOPK: tl.constexpr, XBLOCK: tl.constexpr,
 ):
+    """Sort-free routing. CTA c < n_route_ctas owns pairs [c*PB, (c+1)*PB): each pair's rank among
+    the pairs of its expert (how many earlier pairs route there) gives its padded row; every CTA
+    recounts the per-expert totals (cheap), CTA 0 also writes the block list. The remaining
+    CTAs convert x to fp16 (exact for BF16 values)."""
     pid = tl.program_id(0)
-    if pid > 0:
-        # x -> fp16 (exact for BF16 values)
-        offs = (pid - 1) * XBLOCK + tl.arange(0, XBLOCK)
+    if pid >= n_route_ctas:
+        offs = (pid - n_route_ctas) * XBLOCK + tl.arange(0, XBLOCK)
         m = offs < n_elems
         v = tl.load(x_ptr + offs, mask=m, other=0.0)
         tl.store(x16_ptr + offs, v.to(tl.float16), mask=m)
         return
     npairs = M * TOPK
-    i = tl.arange(0, NP)
+    ex = tl.arange(0, E)
+    i = pid * PB + tl.arange(0, PB)
     valid = i < npairs
     e = tl.load(ids_ptr + i, mask=valid, other=0) - local_start
     is_local = valid & (e >= 0) & (e < E)
-    e_key = tl.where(is_local, e, E)            # pairs that aren't local sort last
-    key = e_key * NP + i
-    skey = tl.sort(key, 0)
-    es = skey // NP
-    isrt = skey % NP
-    ex = tl.arange(0, E)
-    counts = tl.sum((e_key[:, None] == ex[None, :]).to(tl.int32), 0)          # [E]
+    e_key = tl.where(is_local, e, E)                       # E: not this GPU's
+    counts = tl.zeros((E,), dtype=tl.int32)
+    rank = tl.zeros((PB,), dtype=tl.int32)
+    for c0 in range(0, npairs, CH):
+        ci = c0 + tl.arange(0, CH)
+        cv = ci < npairs
+        ce = tl.load(ids_ptr + ci, mask=cv, other=0) - local_start
+        cl = cv & (ce >= 0) & (ce < E)
+        ce_key = tl.where(cl, ce, E)
+        counts += tl.sum((ce_key[None, :] == ex[:, None]).to(tl.int32), 1)
+        rank += tl.sum(((ce_key[None, :] == e_key[:, None]) & (ci[None, :] < i[:, None])).to(tl.int32), 1)
     padded = (counts + BM - 1) // BM * BM
-    pad_off = tl.cumsum(padded, 0) - padded                                   # padded row offset per expert
-    cnt_off = tl.cumsum(counts, 0) - counts                                   # sorted position offset per expert
-    p = tl.arange(0, NP)
-    onehot = (es[:, None] == ex[None, :]).to(tl.int32)                        # [NP, E]
-    cex = tl.sum(onehot * cnt_off[None, :], 1)
-    pox = tl.sum(onehot * pad_off[None, :], 1)
-    row = pox + (p - cex)
-    loc = es < E
-    tl.store(sorted_tok_ptr + row, isrt // TOPK, mask=loc)
-    tl.store(row_of_pair_ptr + isrt, tl.where(loc, row, -1), mask=isrt < npairs)
-    # block list
-    nb = padded // BM
-    blk_off = tl.cumsum(nb, 0) - nb
-    total = tl.sum(nb, 0)
-    j = tl.arange(0, MAXB)
-    ej = tl.sum(((blk_off + nb)[None, :] <= j[:, None]).to(tl.int32), 1)     # expert of block j
-    jm = j < total
-    oh = (ej[:, None] == ex[None, :]).to(tl.int32)
-    bo = tl.sum(oh * blk_off[None, :], 1)
-    po = tl.sum(oh * pad_off[None, :], 1)
-    ce = tl.sum(oh * counts[None, :], 1)
-    tl.store(blk_e_ptr + j, ej + local_start, mask=jm)
-    tl.store(blk_row0_ptr + j, po + (j - bo) * BM, mask=jm)
-    tl.store(blk_end_ptr + j, po + ce, mask=jm)
-    tl.store(nblk_ptr, total)
+    pad_off = tl.cumsum(padded, 0) - padded                 # padded row offset per expert
+    onehot = (e_key[:, None] == ex[None, :]).to(tl.int32)   # [PB, E]
+    row = tl.sum(onehot * pad_off[None, :], 1) + rank
+    tl.store(sorted_tok_ptr + row, i // TOPK, mask=is_local)
+    tl.store(row_of_pair_ptr + i, tl.where(is_local, row, -1), mask=valid)
+    if pid == 0:
+        nb = padded // BM
+        blk_off = tl.cumsum(nb, 0) - nb
+        total = tl.sum(nb, 0)
+        j = tl.arange(0, MAXB)
+        ej = tl.sum(((blk_off + nb)[None, :] <= j[:, None]).to(tl.int32), 1)     # expert of block j
+        jm = j < total
+        oh = (ej[:, None] == ex[None, :]).to(tl.int32)
+        bo = tl.sum(oh * blk_off[None, :], 1)
+        po = tl.sum(oh * pad_off[None, :], 1)
+        ce2 = tl.sum(oh * counts[None, :], 1)
+        tl.store(blk_e_ptr + j, ej + local_start, mask=jm)
+        tl.store(blk_row0_ptr + j, po + (j - bo) * BM, mask=jm)
+        tl.store(blk_end_ptr + j, po + ce2, mask=jm)
+        tl.store(nblk_ptr, total)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1005,12 +1008,15 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
     x16 = state["x16"][:M]
     XBLOCK = 4096
     n_elems = M * H
-    grid0 = (1 + triton.cdiv(n_elems, XBLOCK),)
+    PB = min(NP, 64)                      # pairs per routing CTA
+    CH = min(NP, 256)                     # pairs scanned per step
+    n_route = triton.cdiv(M * TOPK, PB)
+    grid0 = (n_route + triton.cdiv(n_elems, XBLOCK),)
     _route_kernel[grid0](
         ids, x, x16,
         state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-        M, local_start, n_elems,
-        NP=NP, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, num_warps=8,
+        M, local_start, n_elems, n_route,
+        PB=PB, CH=CH, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, num_warps=4,
     )
     w13, w13_sf, w2, w2_sf = state["w13"], state["w13_sf"], state["w2"], state["w2_sf"]
     max_items = (NP // BM + LOCAL) * (max(I, H) // BN)
