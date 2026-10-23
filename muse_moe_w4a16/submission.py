@@ -267,8 +267,21 @@ def _finalize_kernel(y_ptr, row_of_pair_ptr, tw_ptr, nw_ptr, out_ptr, eps,
 # ----------------------------------------------------------------------------------------------
 
 
+# Sweep (one hypothesis per scored shape): (BM, BN, BK, num_warps, num_stages)
+GEMM_SWEEP = {
+    1: (16, 64, 128, 4, 6),      # deeper pipeline, half the n-tiles
+    8: (16, 32, 256, 8, 4),      # more warps per tile
+    16: (16, 64, 64, 4, 8),      # small K steps, deep pipeline
+    32: (16, 128, 128, 8, 4),    # wide tile
+    128: (64, 128, 64, 8, 4),    # wgmma, wide
+    256: (64, 64, 128, 4, 4),    # wgmma, narrower
+}
+
+
 def _gemm_config(bs: int):
     """(BM, BN, BK, num_warps, num_stages) by tokens per step."""
+    if bs in GEMM_SWEEP:
+        return GEMM_SWEEP[bs]
     if bs <= 8:
         return 16, 32, 256, 4, 4
     if bs <= 64:

@@ -31,7 +31,7 @@ gsig = {"a_ptr": "*fp16", "w_ptr": "*u8", "sf_ptr": "*fp8e4nv", "gs_ptr": "*fp32
         "blk_e_ptr": "*i32", "blk_row0_ptr": "*i32", "blk_end_ptr": "*i32", "nblk_ptr": "*i32", "stride_am": "i32", "stride_om": "i32",
         "K": "i32", "N": "i32", "stride_we": "i64", "stride_wn": "i32", "stride_se": "i64", "stride_sn": "i32", "up_rows": "i32",
         "NUM_CTAS": "i32", "n_tiles": "i32", "GATHER": "constexpr", "GATED": "constexpr", "ASM": "constexpr", "BM": "constexpr", "BN": "constexpr", "BK": "constexpr"}
-for asm in (True, False):
+for asm in (True,):
     build(S._moe_gemm_kernel, gsig, {"GATHER": True, "GATED": True, "ASM": asm, "BM": BM, "BN": BN, "BK": BK}, NW, NS, f"gemm1_bs{bs}_asm{int(asm)}")
 gsig2 = dict(gsig, out_ptr="*bf16")
 build(S._moe_gemm_kernel, gsig2, {"GATHER": False, "GATED": False, "ASM": True, "BM": BM, "BN": BN, "BK": BK}, NW, NS, f"gemm2_bs{bs}_asm1")

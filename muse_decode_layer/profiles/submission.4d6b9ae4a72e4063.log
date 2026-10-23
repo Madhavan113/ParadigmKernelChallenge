@@ -1,0 +1,56 @@
+Traceback (most recent call last):
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/worker.py", line 415, in <lambda>
+    return functools.partial(lambda k, p, d: k(d, p), fn, state["prep"])
+                                             ^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/submission.py", line 1141, in kernel_fn
+    a = _proj_forward(attn.view(T, Q_SIZE), "o", HIDDEN, state)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/submission.py", line 431, in _proj_forward
+    return _launch(x, w, None, out, state, cfg, m, n, k, layer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/submission.py", line 455, in _launch
+    _tiled_gemm_kernel[grid](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 778, in run
+    launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 496, in launch_metadata
+    self._init_handles()
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 468, in _init_handles
+    raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 460, in raise_
+    raise err
+triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 262144, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
+Traceback (most recent call last):
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/worker.py", line 484, in child_main
+    out = kernel()(state.get("data"))
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/worker.py", line 415, in <lambda>
+    return functools.partial(lambda k, p, d: k(d, p), fn, state["prep"])
+                                             ^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/submission.py", line 1141, in kernel_fn
+    a = _proj_forward(attn.view(T, Q_SIZE), "o", HIDDEN, state)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/submission.py", line 431, in _proj_forward
+    return _launch(x, w, None, out, state, cfg, m, n, k, layer)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/muse_decode_layer-qvtdcj3q/run/submission.py", line 455, in _launch
+    _tiled_gemm_kernel[grid](
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 374, in <lambda>
+    return lambda *args, **kwargs: self.run(grid=grid, warmup=False, *args, **kwargs)
+                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/runtime/jit.py", line 778, in run
+    launch_metadata = kernel.launch_metadata(grid, stream, *bound_args.values())
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 496, in launch_metadata
+    self._init_handles()
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 468, in _init_handles
+    raise_(OutOfResources(self.metadata.shared, max_shared, "shared memory"))
+  File "/opt/sglang/lib/python3.12/site-packages/triton/compiler/compiler.py", line 460, in raise_
+    raise err
+triton.runtime.errors.OutOfResources: out of resource: shared memory, Required: 262144, Hardware limit: 232448. Reducing block sizes or `num_stages` may help.
