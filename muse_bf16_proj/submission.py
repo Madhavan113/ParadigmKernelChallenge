@@ -337,7 +337,14 @@ def _config(layer: str, m: int, n: int, k: int):
     elif USE_TMA:
         cfg["tma"] = True
         cfg["BLOCK_K"] = min(cfg["BLOCK_K"], 256)
+    # shared memory: stages x (x tile + weight tiles), within the H200's 227 KB
+    streams = 2 if layer == "router" else 1
+    per_stage = (cfg["BLOCK_M"] + streams * cfg["BLOCK_N"]) * cfg["BLOCK_K"] * 2
+    cfg["num_stages"] = max(1, min(cfg["num_stages"], SMEM_BUDGET // per_stage))
     return cfg
+
+
+SMEM_BUDGET = 200 * 1024
 
 
 # sweep: which m-slots fetch with TMA (the m <= 32 shapes cost the same bytes)
