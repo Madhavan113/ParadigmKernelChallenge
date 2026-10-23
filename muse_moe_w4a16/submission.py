@@ -278,8 +278,14 @@ GEMM_SWEEP = {
 }
 
 
+_GEMM_OVERRIDE = None   # (BM, BN, BK, num_warps, num_stages) during in-prepare benchmarking
+_CTAS_PER_SM = 2
+
+
 def _gemm_config(bs: int):
     """(BM, BN, BK, num_warps, num_stages) by tokens per step."""
+    if _GEMM_OVERRIDE is not None:
+        return _GEMM_OVERRIDE
     if bs in GEMM_SWEEP:
         return GEMM_SWEEP[bs]
     if bs <= 8:
@@ -349,7 +355,7 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
     )
     w13, w13_sf, w2, w2_sf = state["w13"], state["w13_sf"], state["w2"], state["w2_sf"]
     max_items = (NP // BM + LOCAL) * (max(I, H) // BN)
-    num_ctas = min(2 * NUM_SMS, max_items)
+    num_ctas = min(_CTAS_PER_SM * NUM_SMS, max_items)
     common = dict(GATHER=True, GATED=True, ASM=DEQUANT_ASM, BM=BM, BN=BN, BK=BK, num_warps=nw, num_stages=ns)
     # gate/up GEMM + SiLU: A = x16 [M, H], W13[e] rows [0, I) gate and [I, 2I) up, K = H, N = I
     _moe_gemm_kernel[(num_ctas,)](
@@ -376,8 +382,85 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
 # == END SHARED moe ==
 
 
+BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH_BUDGET_S = 170
+
+
+def _bench_inputs(bs, device, local_frac=0.35, hot=4, seed=0):
+    """Synthetic routing: each token picks 8 distinct experts; a few hot local experts take
+    most of the local routes, like the judge's skewed routers."""
+    g = torch.Generator(device=device).manual_seed(seed)
+    x = torch.randn((bs, 4096), generator=g, device=device).to(torch.bfloat16)
+    scores = torch.rand((bs, 256), generator=g, device=device)
+    heat = torch.zeros((256,), device=device)
+    heat[:hot] = 2.0                      # hot local experts
+    heat[32:] -= 0.3                      # the other GPUs' experts a little colder
+    ids = (scores + heat).topk(8, dim=-1).indices.to(torch.int32)
+    w = torch.rand((bs, 8), generator=g, device=device)
+    return x, ids, (w / w.sum(-1, keepdim=True)).float()
+
+
+def _bench(state):
+    import time
+    global _GEMM_OVERRIDE, _CTAS_PER_SM
+    t_start = time.time()
+    dev = state["w13"].device
+    data = {bs: _bench_inputs(bs, dev) for bs in (1, 8, 16, 32, 128, 256)}
+
+    def timeit(fn, reps=10):
+        for _ in range(2):
+            fn()
+        torch.cuda.synchronize()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(reps):
+            fn()
+        e1.record()
+        torch.cuda.synchronize()
+        return e0.elapsed_time(e1) * 1000.0 / reps
+
+    print("BENCH moe: per-kernel breakdown with the default configs")
+    for bs, (x, ids, tw) in data.items():
+        nloc = int((ids < 32).sum()); ndist = int(torch.unique(ids[ids < 32]).numel())
+        full = timeit(lambda: _moe_forward(x, ids, tw, 0, 4096, state))
+        print(f"  bs={bs:4d} local routes={nloc:4d} distinct={ndist:2d}  total {full:8.1f} us")
+    cands = [(16, 32, 256, 4, 4), (16, 32, 256, 4, 3), (16, 32, 256, 4, 6), (16, 32, 128, 4, 4), (16, 64, 128, 4, 4),
+             (16, 32, 256, 2, 4), (16, 16, 256, 4, 4), (16, 64, 256, 4, 3), (32, 32, 256, 4, 4), (16, 32, 512, 4, 3)]
+    big = [(64, 64, 128, 4, 4), (64, 128, 64, 8, 4), (64, 64, 64, 4, 6), (64, 128, 128, 8, 3), (128, 64, 64, 4, 4), (32, 64, 128, 4, 4)]
+    for ctas in (2, 4):
+        _CTAS_PER_SM = ctas
+        for cfg in cands:
+            if time.time() - t_start > BENCH_BUDGET_S:
+                break
+            _GEMM_OVERRIDE = cfg
+            try:
+                r = [timeit(lambda bs=bs: _moe_forward(*data[bs][:3], 0, 4096, state)) for bs in (1, 8, 16, 32)]
+                print(f"  ctas/sm={ctas} cfg={cfg}  bs1 {r[0]:7.1f}  bs8 {r[1]:7.1f}  bs16 {r[2]:7.1f}  bs32 {r[3]:7.1f}")
+            except Exception as e:
+                print(f"  ctas/sm={ctas} cfg={cfg}  failed: {str(e)[:80]}")
+        for cfg in big:
+            if time.time() - t_start > BENCH_BUDGET_S:
+                break
+            _GEMM_OVERRIDE = cfg
+            try:
+                r = [timeit(lambda bs=bs: _moe_forward(*data[bs][:3], 0, 4096, state)) for bs in (128, 256)]
+                print(f"  ctas/sm={ctas} cfg={cfg}  bs128 {r[0]:7.1f}  bs256 {r[1]:7.1f}")
+            except Exception as e:
+                print(f"  ctas/sm={ctas} cfg={cfg}  failed: {str(e)[:80]}")
+    _GEMM_OVERRIDE = None
+    _CTAS_PER_SM = 2
+    print(f"BENCH moe done in {time.time() - t_start:.0f}s")
+
+
 def prepare(weights: Weights):
-    return _moe_state(weights)
+    state = _moe_state(weights)
+    if BENCH:
+        try:
+            _bench(state)
+        except Exception as e:
+            print("BENCH failed:", repr(e))
+        torch.cuda.synchronize()
+    return state
 
 
 def kernel_fn(data: Inputs, state) -> torch.Tensor:
