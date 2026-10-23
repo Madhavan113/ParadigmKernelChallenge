@@ -17,6 +17,7 @@ S.FP8_ASM = False
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"
 dev = "cpu"
 cases = [  # batch, ctx, heads, layer, q_len, spread, dist, page, kv_scale
+    (33, 200, "tp8", "full", 1, "fixed", "normal", 1, 1.0),      # 66 CTAs: a non-power-of-two split count
     (1, 10, "tp8", "sliding", 1, "fixed", "normal", 64, 1.0),
     (2, 300, "tp8", "full", 1, "fixed", "normal", 1, 1.0),
     (2, 2100, "tp8", "sliding", 8, "mixed", "edges", 1, 1.0),

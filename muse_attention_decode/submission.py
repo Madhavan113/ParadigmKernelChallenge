@@ -285,6 +285,7 @@ def _plan(cfg):
         splits = max(1, min(16, 512 // ctas))
     else:
         splits = max(1, min(cap, 1024 // ctas))
+    splits = 1 << (splits.bit_length() - 1)   # a power of two: the combine merges CH splits at a time
     block_t = 64   # smaller tiles: less shared memory per CTA, more CTAs resident per SM
     lb = 16
     return splits, block_t, rb, lb

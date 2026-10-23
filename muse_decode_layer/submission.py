@@ -265,6 +265,55 @@ def _tiled_gemm_tma_kernel(
             tl.atomic_xchg(cnt_ptr + tile, 0)
 
 
+@triton.jit
+def _tiled_gemv_kernel(
+    x_ptr, w_ptr, w2_ptr, out_ptr, part_ptr, cnt_ptr,
+    N, K,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr, TWO_W: tl.constexpr,
+):
+    """M == 1: out[n] = sum_k W[n, k] x[k] on the FMA pipe (no tensor cores, no operand layout
+    conversions), over the packed [N/BLOCK_N, K/BLOCK_K, BLOCK_N, BLOCK_K] tiles."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    n_tiles = tl.num_programs(0)
+    KT = K // BLOCK_K
+    kt_chunk = KT // SPLIT_K
+    TILE: tl.constexpr = BLOCK_N * BLOCK_K
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    k0 = tl.multiple_of(pid_k * kt_chunk * BLOCK_K, BLOCK_K)
+    x_ptrs = x_ptr + k0 + offs_k
+    tile0 = (pid_n * KT + pid_k * kt_chunk) * TILE
+    w_ptrs = w_ptr + tile0 + tl.arange(0, BLOCK_N)[:, None] * BLOCK_K + offs_k[None, :]
+    if TWO_W:
+        w2_ptrs = w2_ptr + tile0 + tl.arange(0, BLOCK_N)[:, None] * BLOCK_K + offs_k[None, :]
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for _ in range(0, kt_chunk):
+        x = tl.load(x_ptrs).to(tl.float32)
+        w = tl.load(w_ptrs).to(tl.float32)
+        acc += tl.sum(w * x[None, :], 1)
+        if TWO_W:
+            w2 = tl.load(w2_ptrs).to(tl.float32)
+            acc += tl.sum(w2 * x[None, :], 1)
+            w2_ptrs += TILE
+        x_ptrs += BLOCK_K
+        w_ptrs += TILE
+    out_ptrs = out_ptr + offs_n
+    if SPLIT_K == 1:
+        tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty))
+    else:
+        tl.store(part_ptr + pid_k * N + offs_n, acc)
+        tl.debug_barrier()
+        ticket = tl.atomic_add(cnt_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+        tl.debug_barrier()
+        if ticket == SPLIT_K - 1:
+            total = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for s in tl.static_range(SPLIT_K):
+                total += tl.load(part_ptr + s * N + offs_n, cache_modifier=".cg")
+            tl.store(out_ptrs, total.to(out_ptr.dtype.element_ty))
+            tl.atomic_xchg(cnt_ptr + pid_n, 0)
+
+
 # ----------------------------------------------------------------------------------------------
 # Configs
 # ----------------------------------------------------------------------------------------------
@@ -291,27 +340,27 @@ def _block_m(m: int) -> int:
 # shapes move the same bytes, so giving each m a different configuration measures four
 # pipeline shapes per layer in one run.
 SWEEP = {
-    # (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages); with USE_TILED the tile shape is TILE_SHAPE[layer]
-    ("pooler", 4096, 1):   (32, 256, 1, 4, 4),
-    ("pooler", 4096, 8):   (32, 256, 1, 4, 6),
-    ("pooler", 4096, 16):  (32, 256, 1, 4, 6),
-    ("pooler", 4096, 32):  (32, 256, 1, 4, 5),
-    ("unpooler", 8192, 16): (32, 256, 1, 4, 6),
-    ("unpooler", 8192, 32): (32, 256, 1, 4, 5),
-    ("unpooler", 1024, 1): (32, 256, 4, 4, 4),
-    ("unpooler", 1024, 8): (32, 256, 4, 4, 6),
-    ("o", 8192, 1):   (64, 256, 1, 4, 4),
-    ("o", 8192, 8):   (64, 256, 1, 4, 4),
-    ("o", 8192, 16):  (64, 256, 1, 4, 4),
-    ("o", 8192, 32):  (64, 256, 1, 4, 4),
-    ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 6),
-    ("qkv_gate", 2304, 16): (32, 256, 2, 4, 6),
-    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 5),
-    ("router", 256, 1):   (32, 256, 16, 4, 3),
-    ("router", 256, 8):   (32, 256, 16, 4, 3),
-    ("router", 256, 16):  (32, 256, 16, 4, 4),
-    ("router", 256, 32):  (32, 256, 8, 4, 4),
+    # (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma); with USE_TILED the tile shape is TILE_SHAPE[layer]
+    ("pooler", 4096, 1):   (32, 256, 1, 4, 8, True),
+    ("pooler", 4096, 8):   (32, 256, 1, 4, 6, True),      # 18.9 us in run 13180174
+    ("pooler", 4096, 16):  (32, 256, 1, 2, 6, True),
+    ("pooler", 4096, 32):  (32, 256, 1, 8, 6, True),
+    ("unpooler", 8192, 16): (32, 256, 1, 4, 8, True),
+    ("unpooler", 8192, 32): (32, 256, 1, 2, 6, True),
+    ("unpooler", 1024, 1): (32, 256, 4, 4, 4, True),
+    ("unpooler", 1024, 8): (32, 256, 4, 4, 6, True),
+    ("o", 8192, 1):   (64, 256, 1, 4, 4, True),
+    ("o", 8192, 8):   (64, 256, 1, 4, 6, True),
+    ("o", 8192, 16):  (64, 256, 1, 2, 4, False),
+    ("o", 8192, 32):  (64, 256, 1, 4, 5, True),
+    ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4, True),
+    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 6, True),
+    ("qkv_gate", 2304, 16): (32, 256, 2, 2, 4, False),
+    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 6, True),
+    ("router", 256, 1):   (32, 256, 16, 4, 3, False),
+    ("router", 256, 8):   (32, 256, 16, 4, 3, True),      # 6.4 us in run 78c2f421
+    ("router", 256, 16):  (32, 256, 16, 4, 4, True),
+    ("router", 256, 32):  (32, 256, 8, 4, 4, True),
 }
 
 
@@ -328,7 +377,9 @@ def _config(layer: str, m: int, n: int, k: int):
     if USE_TILED:
         cfg["tiled"] = True
         cfg["BLOCK_N"], cfg["BLOCK_K"] = TILE_SHAPE[layer]
-        cfg["tma"] = bool(TMA_BY_M.get(m, USE_TMA))
+        if cfg.get("tma") is None:
+            cfg["tma"] = bool(TMA_BY_M.get(m, USE_TMA))
+        cfg["gemv"] = GEMV_M1 and m == 1
     elif USE_TMA:
         cfg["tma"] = True
         cfg["BLOCK_K"] = min(cfg["BLOCK_K"], 256)
@@ -343,15 +394,23 @@ SMEM_BUDGET = 200 * 1024
 
 
 # sweep: which m-slots fetch with TMA (the m <= 32 shapes cost the same bytes)
-TMA_BY_M = {1: False, 8: True, 16: False, 32: True}
+TMA_BY_M = {1: False, 8: True, 16: True, 32: True}
+GEMV_M1 = False  # m == 1: plain-FMA GEMV instead of the tensor-core path
 
 
 def _config_table(layer: str, m: int, n: int, k: int):
+    cfg = _config_table_(layer, m, n, k)
+    if cfg is not None:
+        cfg["tma"] = SWEEP.get((layer, n, m), (None,) * 6)[5]
+    return cfg
+
+
+def _config_table_(layer: str, m: int, n: int, k: int):
     bm = _block_m(m)
     if layer == "router":
         if m > 64:
             return None   # cuBLAS, one GEMM over [hi | lo]
-        bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), (16, 256, 8, 4, 4))
+        bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), (16, 256, 8, 4, 4, None))[:5]
         return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns)
     if m > MAX_TRITON_M:
         return None
@@ -361,7 +420,7 @@ def _config_table(layer: str, m: int, n: int, k: int):
         "pooler": (32, 256, 1, 4, 4),
         "unpooler": (32, 256, 1, 4, 4) if n > 1024 else (32, 256, 4, 4, 4),
     }[layer]
-    bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), default)
+    bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), default + (None,))[:5]
     if bm > 32 and bk > 256:   # keep shared memory in budget for the 64-row tiles
         bk = 256
     return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns)
@@ -447,6 +506,13 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
             wt, w2t = state["router_hi_tiled"], state["router_lo_tiled"]
         else:
             wt, w2t = state[layer + "_tiled"], None
+        if cfg.get("gemv") and m == 1:
+            _tiled_gemv_kernel[(n_tiles, cfg["SPLIT_K"])](
+                x, wt, w2t if w2t is not None else wt, out, state["partials"], state["counters"],
+                n, k,
+                BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"], SPLIT_K=cfg["SPLIT_K"], TWO_W=w2t is not None,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+            return out
         if cfg.get("tma"):
             from triton.tools.tensor_descriptor import TensorDescriptor
             x_desc = TensorDescriptor.from_tensor(x, [cfg["BLOCK_M"], cfg["BLOCK_K"]])
@@ -718,10 +784,10 @@ def _plan(cfg):
     cap = 128 if rb <= 16 else 32
     if cfg["window"]:
         splits = max(1, min(16, 512 // ctas))
-        block_t = 64 if cfg["window"] <= 2048 else 128
     else:
         splits = max(1, min(cap, 1024 // ctas))
-        block_t = 128
+    splits = 1 << (splits.bit_length() - 1)   # a power of two: the combine merges CH splits at a time
+    block_t = 64   # smaller tiles: less shared memory per CTA, more CTAs resident per SM
     lb = 16
     return splits, block_t, rb, lb
 
@@ -743,7 +809,7 @@ def _attention_forward(data) -> torch.Tensor:
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
     ch = min(splits, 8 if rb <= 16 else 4)        # splits merged per load group
-    nw = 4 if rb <= 16 else 8
+    nw = 4
     _attn_decode_kernel[grid](
         qkv, data["cache_loc"], data["seq_lens"], page_table,
         data["k_cache"], data["v_cache"], data["k_scale"], data["v_scale"],
@@ -752,7 +818,7 @@ def _attention_forward(data) -> torch.Tensor:
         math.log2(theta) if theta else 0.0,
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
         ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t, ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
-        CH=ch, num_warps=nw, num_stages=3,
+        CH=ch, num_warps=nw, num_stages=4,
     )
     return out
 
@@ -971,8 +1037,21 @@ def _finalize_kernel(y_ptr, row_of_pair_ptr, tw_ptr, nw_ptr, out_ptr, eps,
 # ----------------------------------------------------------------------------------------------
 
 
+# Sweep (one hypothesis per scored shape): (BM, BN, BK, num_warps, num_stages)
+GEMM_SWEEP = {
+    1: (16, 64, 128, 4, 6),      # deeper pipeline, half the n-tiles
+    8: (16, 32, 256, 8, 4),      # more warps per tile
+    16: (16, 64, 64, 4, 8),      # small K steps, deep pipeline
+    32: (16, 128, 128, 8, 4),    # wide tile
+    128: (64, 128, 64, 8, 4),    # wgmma, wide
+    256: (64, 64, 128, 4, 4),    # wgmma, narrower
+}
+
+
 def _gemm_config(bs: int):
     """(BM, BN, BK, num_warps, num_stages) by tokens per step."""
+    if bs in GEMM_SWEEP:
+        return GEMM_SWEEP[bs]
     if bs <= 8:
         return 16, 32, 256, 4, 4
     if bs <= 64:
