@@ -61,8 +61,10 @@ def _skinny_gemm_kernel(
     n_tiles = tl.num_programs(0)
     m_tiles = tl.num_programs(2)
 
-    k_chunk = K // SPLIT_K
-    k0 = pid_k * k_chunk
+    # Each split's K range is a multiple of BLOCK_K (the host checks it): say so, or the
+    # pointer alignment is unknown and the loads degrade to scalar 2-byte copies (no cp.async).
+    k_chunk = tl.multiple_of(K // SPLIT_K, BLOCK_K)
+    k0 = tl.multiple_of(pid_k * k_chunk, BLOCK_K)
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -142,30 +144,30 @@ def _block_m(m: int) -> int:
 SWEEP = {
     # pooler: N 4096, K 8192
     ("pooler", 4096, 1):   (32, 256, 1, 4, 4),
-    ("pooler", 4096, 8):   (16, 256, 1, 4, 4),
-    ("pooler", 4096, 16):  (32, 1024, 1, 8, 2),
-    ("pooler", 4096, 32):  (32, 256, 1, 4, 6),
+    ("pooler", 4096, 8):   (32, 256, 2, 4, 4),
+    ("pooler", 4096, 16):  (64, 128, 2, 4, 4),
+    ("pooler", 4096, 32):  (32, 256, 1, 4, 5),
     # unpooler, whole weight: N 8192, K 4096
-    ("unpooler", 8192, 16): (64, 512, 1, 8, 2),
-    ("unpooler", 8192, 32): (32, 512, 1, 4, 3),
+    ("unpooler", 8192, 16): (32, 256, 1, 4, 4),
+    ("unpooler", 8192, 32): (32, 256, 2, 4, 4),
     # unpooler, this GPU's slice: N 1024, K 4096
     ("unpooler", 1024, 1): (32, 256, 4, 4, 4),
-    ("unpooler", 1024, 8): (16, 256, 8, 4, 4),
+    ("unpooler", 1024, 8): (16, 256, 4, 4, 4),
     # o: N 8192, K 1024
     ("o", 8192, 1):   (32, 256, 1, 4, 4),
-    ("o", 8192, 8):   (64, 1024, 1, 8, 1),
-    ("o", 8192, 16):  (16, 512, 1, 4, 2),
-    ("o", 8192, 32):  (32, 512, 1, 8, 2),
+    ("o", 8192, 8):   (64, 256, 1, 4, 4),
+    ("o", 8192, 16):  (32, 512, 1, 4, 2),
+    ("o", 8192, 32):  (32, 256, 1, 8, 4),
     # qkv_gate: N 2304, K 8192
-    ("qkv_gate", 2304, 1):  (16, 256, 1, 4, 4),
-    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 16): (16, 512, 2, 4, 3),
-    ("qkv_gate", 2304, 32): (16, 1024, 1, 8, 2),
+    ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4),
+    ("qkv_gate", 2304, 8):  (32, 256, 2, 4, 4),
+    ("qkv_gate", 2304, 16): (16, 256, 4, 4, 4),
+    ("qkv_gate", 2304, 32): (32, 256, 8, 4, 4),
     # router: N 256, K 8192, hi + lo (two weight streams)
     ("router", 256, 1):   (16, 256, 8, 4, 4),
     ("router", 256, 8):   (32, 256, 16, 4, 3),
-    ("router", 256, 16):  (32, 512, 8, 8, 2),
-    ("router", 256, 32):  (16, 512, 4, 4, 3),
+    ("router", 256, 16):  (16, 256, 16, 4, 4),
+    ("router", 256, 32):  (16, 256, 8, 4, 4),
 }
 
 
@@ -173,7 +175,7 @@ def _config(layer: str, m: int, n: int, k: int):
     bm = _block_m(m)
     if layer == "router":
         if m > 64:
-            return dict(BLOCK_M=128, BLOCK_N=32, BLOCK_K=128, SPLIT_K=8, num_warps=4, num_stages=3)
+            return None   # cuBLAS, one GEMM over [hi | lo]
         bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), (16, 256, 8, 4, 4))
         return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns)
     if m > MAX_TRITON_M:
@@ -221,8 +223,7 @@ def prepare(weights: Weights, warm: bool = True):
     lo = (router - hi.float()).to(torch.bfloat16)
     state["router_hi"] = hi.contiguous()
     state["router_lo"] = lo.contiguous()
-    state["router_hi_t"] = hi.t().contiguous()
-    state["router_lo_t"] = lo.t().contiguous()
+    state["router_hilo_t"] = torch.cat((hi, lo), dim=1).t().contiguous()   # [2K, N]
     device = router.device
     state["counters"] = torch.zeros((COUNTERS,), dtype=torch.int32, device=device)
     state["partials"] = torch.empty((PARTIALS_FLOATS,), dtype=torch.float32, device=device)
@@ -273,9 +274,9 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
         if _usable(cfg, m, n, k):
             out = torch.empty((m, n), dtype=torch.float32, device=x.device)
             return _launch(x, state["router_hi"], state["router_lo"], out, state, cfg, m, n, k)
-        acc = torch.mm(x, state["router_hi_t"], out_dtype=torch.float32)
-        acc += torch.mm(x, state["router_lo_t"], out_dtype=torch.float32)
-        return acc
+        # one GEMM: [x | x] @ [hi | lo]^T == x @ hi^T + x @ lo^T, fp32 accumulation
+        x2 = torch.cat((x, x), dim=1)
+        return torch.mm(x2, state["router_hilo_t"], out_dtype=torch.float32)
 
     w = state[layer]
     if w.shape[0] != n:

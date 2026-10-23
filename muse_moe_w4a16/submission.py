@@ -1,72 +1,352 @@
 # okc: problem=muse_moe_w4a16
-"""Starter: the MoE experts in plain PyTorch, correct but slow. Every local expert runs on
-every token, kept by the token's routing weight (zero where it wasn't routed there), and
-the NVFP4 weights are expanded to BF16 on every call.
+"""Routed NVFP4 experts (W4A16) for Muse Spark Open: four launches, no host sync.
 
-Implement kernel_fn, and prepare to repack the weights (called once, untimed)."""
+  1. _route_kernel      one CTA sorts the (token, slot) pairs by local expert (tl.sort), pads
+                        each expert's rows to BLOCK_M and writes the block list; the other CTAs
+                        convert x to fp16 once (exact for BF16 values).
+  2. _moe_gemm_kernel   gate/up GEMM + SiLU: persistent CTAs walk (block, n-tile) work items,
+                        gather the block's x rows, stream the expert's packed E2M1 tile and
+                        dequantize it in registers, tensor-core dot with fp32 accumulation.
+  3. _moe_gemm_kernel   down GEMM: inter @ W2^T -> y (BF16).
+  4. _finalize_kernel   per token: RMSNorm(y * (1 + w)) per local route, weighted sum.
+
+Dequantization: an E2M1 nibble c = (s, e1, e0, m) placed into an fp16 as
+  bits = s << 15 | (e1 e0) << 10 | m << 9
+is exactly value(c) * 2^-14 for every code (subnormals included), so the 2^14 is folded into the
+expert's global scale once in prepare() and the tile needs only integer ops and one fp16
+multiply per element. Weights are used at their stored precision (E2M1 x E4M3 block scale x FP32
+global scale); only the fp16 product rounds (11 bits, finer than BF16).
+"""
 
 from typing import TypedDict
 
 import torch
-
-from nvfp4 import dequantize
+import triton
+import triton.language as tl
 
 
 class Weights(TypedDict):
-    w13: torch.Tensor          # uint8 [256, 2I, H/2], gate rows [0, I) then up rows [I, 2I), packed E2M1
-    w13_sf: torch.Tensor       # float8_e4m3fn [256, 2I, H/16]
-    w13_gs: torch.Tensor       # float32 [256]
-    w2: torch.Tensor           # uint8 [256, H, I/2]
-    w2_sf: torch.Tensor        # float8_e4m3fn [256, H, I/16]
-    w2_gs: torch.Tensor        # float32 [256]
-    post_norm_w: torch.Tensor  # bfloat16 [H], the post-expert RMSNorm's weight (applied as 1 + w)
+    w13: torch.Tensor
+    w13_sf: torch.Tensor
+    w13_gs: torch.Tensor
+    w2: torch.Tensor
+    w2_sf: torch.Tensor
+    w2_gs: torch.Tensor
+    post_norm_w: torch.Tensor
 
 
 class Config(TypedDict):
-    bs: int           # tokens, M
-    d_hidden: int     # H = 4096, the width the MoE block runs its experts at
-    d_expert: int     # I = 4096
-    n_experts: int    # 256 experts in the model
-    local_start: int  # this GPU computes experts [local_start, local_start + local_count)
-    local_count: int  # 32: one GPU under 8-way expert parallelism
-    top_k: int        # 8
-    sharding: str     # "ep8"
+    bs: int
+    d_hidden: int
+    d_expert: int
+    n_experts: int
+    local_start: int
+    local_count: int
+    top_k: int
+    sharding: str
 
 
 class Inputs(TypedDict):
-    hidden_states: torch.Tensor  # bfloat16 [M, H]
-    topk_ids: torch.Tensor       # int32 [M, 8], global expert ids (0-255)
-    topk_weights: torch.Tensor   # float32 [M, 8]
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
     config: Config
 
 
-def prepare(weights: Weights) -> Weights:
-    """Called once, untimed, before any case. Repack the weights as you like."""
-    return weights
+TOPK = 8
+LOCAL = 32
+POST_NORM_EPS = 1e-8
+MAX_M = 1024
+NUM_SMS = 132
+DEQUANT_ASM = True          # inline PTX for the nibble -> fp16 placement (False: plain Triton ops)
+SCALE_FIX = 2.0 ** 14       # folded into the global scales: the placement trick yields value * 2^-14
 
 
-def post_expert_norm(y, w, eps=1e-8):
-    """Scale by (1 + w), round to BF16, then RMSNorm."""
-    y = (y.float() * (1.0 + w.float())).to(torch.bfloat16).float()
-    return y * torch.rsqrt(y.pow(2).mean(-1, keepdim=True) + eps)
+# ----------------------------------------------------------------------------------------------
+# 1. routing
+# ----------------------------------------------------------------------------------------------
 
 
-def kernel_fn(data: Inputs, weights: Weights) -> torch.Tensor:
-    """This GPU's share of the MoE output, bfloat16 [M, H]: for each token, the sum over its
-    experts that are local of weight * post_expert_norm(expert(x)). Rows whose experts are
-    all elsewhere are zero."""
+@triton.jit
+def _route_kernel(
+    ids_ptr, x_ptr, x16_ptr,
+    sorted_tok_ptr, row_of_pair_ptr, blk_e_ptr, blk_row0_ptr, blk_end_ptr, nblk_ptr,
+    M, local_start, n_elems,
+    NP: tl.constexpr, BM: tl.constexpr, MAXB: tl.constexpr, E: tl.constexpr, TOPK: tl.constexpr,
+    XBLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    if pid > 0:
+        # x -> fp16 (exact for BF16 values)
+        offs = (pid - 1) * XBLOCK + tl.arange(0, XBLOCK)
+        m = offs < n_elems
+        v = tl.load(x_ptr + offs, mask=m, other=0.0)
+        tl.store(x16_ptr + offs, v.to(tl.float16), mask=m)
+        return
+    npairs = M * TOPK
+    i = tl.arange(0, NP)
+    valid = i < npairs
+    e = tl.load(ids_ptr + i, mask=valid, other=0) - local_start
+    is_local = valid & (e >= 0) & (e < E)
+    e_key = tl.where(is_local, e, E)            # pairs that aren't local sort last
+    key = e_key * NP + i
+    skey = tl.sort(key, 0)
+    es = skey // NP
+    isrt = skey % NP
+    ex = tl.arange(0, E)
+    counts = tl.sum((e_key[:, None] == ex[None, :]).to(tl.int32), 0)          # [E]
+    padded = (counts + BM - 1) // BM * BM
+    pad_off = tl.cumsum(padded, 0) - padded                                   # padded row offset per expert
+    cnt_off = tl.cumsum(counts, 0) - counts                                   # sorted position offset per expert
+    p = tl.arange(0, NP)
+    onehot = (es[:, None] == ex[None, :]).to(tl.int32)                        # [NP, E]
+    cex = tl.sum(onehot * cnt_off[None, :], 1)
+    pox = tl.sum(onehot * pad_off[None, :], 1)
+    row = pox + (p - cex)
+    loc = es < E
+    tl.store(sorted_tok_ptr + row, isrt // TOPK, mask=loc)
+    tl.store(row_of_pair_ptr + isrt, tl.where(loc, row, -1), mask=isrt < npairs)
+    # block list
+    nb = padded // BM
+    blk_off = tl.cumsum(nb, 0) - nb
+    total = tl.sum(nb, 0)
+    j = tl.arange(0, MAXB)
+    ej = tl.sum(((blk_off + nb)[None, :] <= j[:, None]).to(tl.int32), 1)     # expert of block j
+    jm = j < total
+    oh = (ej[:, None] == ex[None, :]).to(tl.int32)
+    bo = tl.sum(oh * blk_off[None, :], 1)
+    po = tl.sum(oh * pad_off[None, :], 1)
+    ce = tl.sum(oh * counts[None, :], 1)
+    tl.store(blk_e_ptr + j, ej + local_start, mask=jm)
+    tl.store(blk_row0_ptr + j, po + (j - bo) * BM, mask=jm)
+    tl.store(blk_end_ptr + j, po + ce, mask=jm)
+    tl.store(nblk_ptr, total)
+
+
+# ----------------------------------------------------------------------------------------------
+# 2./3. dequantizing GEMM
+# ----------------------------------------------------------------------------------------------
+
+# 4 packed bytes (8 nibbles) -> 8 fp16 (x 2^-14): $0,$1 = elements 0,2,4,6 (low nibbles),
+# $2,$3 = elements 1,3,5,7 (high nibbles). Magnitude bits (e1 e0 m) land at fp16 bits [11:9],
+# the sign at bit 15. Shifts per byte position: low nibble of bytes 0/2 -> << 9 (<< 12 sign),
+# bytes 1/3 -> << 1 (<< 4); high nibble of bytes 0/2 -> << 5 (<< 8), bytes 1/3 -> >> 3 (none).
+_NIBBLE_ASM = """
+{
+    .reg .b32 t, u;
+    shl.b32 t, $4, 9;   and.b32 t, t, 0x0E000E00;
+    shl.b32 u, $4, 12;  and.b32 u, u, 0x80008000;  or.b32 $0, t, u;
+    shl.b32 t, $4, 1;   and.b32 t, t, 0x0E000E00;
+    shl.b32 u, $4, 4;   and.b32 u, u, 0x80008000;  or.b32 $1, t, u;
+    shl.b32 t, $4, 5;   and.b32 t, t, 0x0E000E00;
+    shl.b32 u, $4, 8;   and.b32 u, u, 0x80008000;  or.b32 $2, t, u;
+    shr.b32 t, $4, 3;   and.b32 t, t, 0x0E000E00;
+    and.b32 u, $4, 0x80008000;                      or.b32 $3, t, u;
+}
+"""
+
+
+@triton.jit
+def _dequant(wq, sf, gs, ASM: tl.constexpr):
+    """wq uint8 [BN, BK/2] packed E2M1, sf fp8 [BN, BK/16], gs fp32 (x 2^14) -> fp16 [BN, BK]."""
+    if ASM:
+        lo, hi = tl.inline_asm_elementwise(
+            asm=_NIBBLE_ASM, constraints="=r,=r,=r,=r,r", args=[wq],
+            dtype=(tl.float16, tl.float16), is_pure=True, pack=4)
+    else:
+        lo = (wq & 0x0F).to(tl.int16)
+        hi = (wq >> 4).to(tl.int16)
+        lo = (((lo & 7) << 9) | ((lo & 8) << 12)).to(tl.float16, bitcast=True)
+        hi = (((hi & 7) << 9) | ((hi & 8) << 12)).to(tl.float16, bitcast=True)
+    w = tl.interleave(lo, hi)                                   # [BN, BK]
+    s = (sf.to(tl.float32) * gs).to(tl.float16)                 # [BN, BK/16]
+    s = tl.interleave(s, s)
+    s = tl.interleave(s, s)
+    s = tl.interleave(s, s)
+    s = tl.interleave(s, s)                                     # [BN, BK]: each scale x16
+    return w * s
+
+
+@triton.jit
+def _moe_gemm_kernel(
+    a_ptr, w_ptr, sf_ptr, gs_ptr, out_ptr,
+    sorted_tok_ptr, blk_e_ptr, blk_row0_ptr, blk_end_ptr, nblk_ptr,
+    stride_am, stride_om, K, N, stride_we, stride_wn, stride_se, stride_sn, up_rows,
+    NUM_CTAS, n_tiles,
+    GATHER: tl.constexpr, GATED: tl.constexpr, ASM: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    nblk = tl.load(nblk_ptr)
+    total = nblk * n_tiles
+    offs_m = tl.arange(0, BM)
+    offs_k = tl.arange(0, BK)
+    offs_kb = tl.arange(0, BK // 2)
+    offs_ks = tl.arange(0, BK // 16)
+    for item in range(pid, total, NUM_CTAS):
+        j = item // n_tiles
+        nt = item % n_tiles
+        e = tl.load(blk_e_ptr + j)
+        row0 = tl.load(blk_row0_ptr + j)
+        end = tl.load(blk_end_ptr + j)
+        rows = row0 + offs_m
+        rmask = rows < end
+        if GATHER:
+            arow = tl.load(sorted_tok_ptr + rows, mask=rmask, other=0)
+        else:
+            arow = rows
+        offs_n = nt * BN + tl.arange(0, BN)
+        gs = tl.load(gs_ptr + e)
+        a_ptrs = a_ptr + arow[:, None] * stride_am + offs_k[None, :]
+        w_ptrs = w_ptr + e * stride_we + offs_n[:, None] * stride_wn + offs_kb[None, :]
+        s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + offs_ks[None, :]
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if GATED:
+            w2_ptrs = w_ptrs + up_rows * stride_wn
+            s2_ptrs = s_ptrs + up_rows * stride_sn
+            acc2 = tl.zeros((BM, BN), dtype=tl.float32)
+        for _ in range(0, K, BK):
+            a = tl.load(a_ptrs, mask=rmask[:, None], other=0.0)
+            wq = tl.load(w_ptrs)
+            sf = tl.load(s_ptrs)
+            w = _dequant(wq, sf, gs, ASM)
+            acc = tl.dot(a, tl.trans(w), acc)
+            if GATED:
+                wq2 = tl.load(w2_ptrs)
+                sf2 = tl.load(s2_ptrs)
+                w2 = _dequant(wq2, sf2, gs, ASM)
+                acc2 = tl.dot(a, tl.trans(w2), acc2)
+                w2_ptrs += BK // 2
+                s2_ptrs += BK // 16
+            a_ptrs += BK
+            w_ptrs += BK // 2
+            s_ptrs += BK // 16
+        o_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :]
+        if GATED:
+            h = acc * tl.sigmoid(acc) * acc2
+            # SiLU(gate) * up kept at BF16 precision (as SGLang's path does), stored in fp16
+            tl.store(o_ptrs, h.to(tl.bfloat16).to(tl.float16), mask=rmask[:, None])
+        else:
+            tl.store(o_ptrs, acc.to(out_ptr.dtype.element_ty), mask=rmask[:, None])
+
+
+# ----------------------------------------------------------------------------------------------
+# 4. post-expert norm and weighted sum
+# ----------------------------------------------------------------------------------------------
+
+
+@triton.jit
+def _finalize_kernel(y_ptr, row_of_pair_ptr, tw_ptr, nw_ptr, out_ptr, eps,
+                     H: tl.constexpr, TOPK: tl.constexpr):
+    t = tl.program_id(0)
+    d = tl.arange(0, H)
+    nw = tl.load(nw_ptr + d)
+    acc = tl.zeros((H,), dtype=tl.float32)
+    for s in tl.static_range(TOPK):
+        r = tl.load(row_of_pair_ptr + t * TOPK + s)
+        ok = r >= 0
+        y = tl.load(y_ptr + r * H + d, mask=ok & (d < H), other=0.0).to(tl.float32) * nw
+        ms = tl.sum(y * y, 0) / H
+        y = y * tl.rsqrt(ms + eps)
+        g = tl.load(tw_ptr + t * TOPK + s)
+        acc += tl.where(ok, g, 0.0) * y
+    tl.store(out_ptr + t * H + d, acc.to(tl.bfloat16))
+
+
+# ----------------------------------------------------------------------------------------------
+# host side
+# ----------------------------------------------------------------------------------------------
+
+
+def _gemm_config(bs: int):
+    """(BM, BN, BK, num_warps, num_stages) by tokens per step."""
+    if bs <= 8:
+        return 16, 32, 256, 4, 4
+    if bs <= 64:
+        return 16, 64, 128, 4, 4
+    return 64, 128, 64, 4, 3
+
+
+def prepare(weights: Weights):
+    dev = weights["w13"].device
+    state = {
+        "w13": weights["w13"].contiguous(), "w13_sf": weights["w13_sf"].contiguous(),
+        "w2": weights["w2"].contiguous(), "w2_sf": weights["w2_sf"].contiguous(),
+        # the 2^14 of the fp16 placement trick, folded in (an exact power-of-two scaling)
+        "w13_gs": (weights["w13_gs"].float() * SCALE_FIX).contiguous(),
+        "w2_gs": (weights["w2_gs"].float() * SCALE_FIX).contiguous(),
+        "norm_w": (weights["post_norm_w"].float() + 1.0).contiguous(),
+    }
+    H = weights["w2"].shape[1]
+    I = weights["w2"].shape[2] * 2
+    NP = MAX_M * TOPK
+    rows_max = NP + LOCAL * 64
+    maxb = NP // 16 + LOCAL
+    state.update({
+        "x16": torch.empty((MAX_M, H), dtype=torch.float16, device=dev),
+        "sorted_tok": torch.zeros((rows_max,), dtype=torch.int32, device=dev),
+        "row_of_pair": torch.full((NP,), -1, dtype=torch.int32, device=dev),
+        "blk_e": torch.zeros((maxb,), dtype=torch.int32, device=dev),
+        "blk_row0": torch.zeros((maxb,), dtype=torch.int32, device=dev),
+        "blk_end": torch.zeros((maxb,), dtype=torch.int32, device=dev),
+        "nblk": torch.zeros((1,), dtype=torch.int32, device=dev),
+        "inter": torch.empty((rows_max, I), dtype=torch.float16, device=dev),
+        "y": torch.empty((rows_max, H), dtype=torch.bfloat16, device=dev),
+    })
+    return state
+
+
+def kernel_fn(data: Inputs, state) -> torch.Tensor:
     cfg = data["config"]
     x = data["hidden_states"]
-    d_expert = cfg["d_expert"]
-    ids = data["topk_ids"].long()
-    out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
-    for e in range(cfg["local_start"], cfg["local_start"] + cfg["local_count"]):
-        # Each token's routing weight for expert e: zero unless e is among its top 8.
-        g = (data["topk_weights"] * (ids == e)).sum(-1)
-        w13 = dequantize(weights["w13"][e], weights["w13_sf"][e], weights["w13_gs"][e]).to(torch.bfloat16)
-        h = x @ w13.T
-        inter = torch.nn.functional.silu(h[:, :d_expert]) * h[:, d_expert:]
-        w2 = dequantize(weights["w2"][e], weights["w2_sf"][e], weights["w2_gs"][e]).to(torch.bfloat16)
-        y = post_expert_norm(inter @ w2.T, weights["post_norm_w"])
-        out += g[:, None] * y
-    return out.to(torch.bfloat16)
+    M, H = x.shape
+    I = cfg["d_expert"]
+    ids = data["topk_ids"]
+    tw = data["topk_weights"]
+    if ids.dtype != torch.int32:
+        ids = ids.to(torch.int32)
+    if not ids.is_contiguous():
+        ids = ids.contiguous()
+    tw = tw.contiguous()
+    dev = x.device
+    out = torch.empty((M, H), dtype=torch.bfloat16, device=dev)
+
+    BM, BN, BK, nw, ns = _gemm_config(M)
+    NP = max(16, triton.next_power_of_2(M * TOPK))
+    MAXB = triton.next_power_of_2(NP // BM + LOCAL)
+    x16 = state["x16"][:M]
+    XBLOCK = 4096
+    n_elems = M * H
+    grid0 = (1 + triton.cdiv(n_elems, XBLOCK),)
+    _route_kernel[grid0](
+        ids, x, x16,
+        state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
+        M, cfg["local_start"], n_elems,
+        NP=NP, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, num_warps=8,
+    )
+    w13, w13_sf, w2, w2_sf = state["w13"], state["w13_sf"], state["w2"], state["w2_sf"]
+    max_items = (NP // BM + LOCAL) * (max(I, H) // BN)
+    num_ctas = min(2 * NUM_SMS, max_items)
+    common = dict(GATHER=True, GATED=True, ASM=DEQUANT_ASM, BM=BM, BN=BN, BK=BK, num_warps=nw, num_stages=ns)
+    # gate/up GEMM + SiLU: A = x16 [M, H], W13[e] rows [0, I) gate and [I, 2I) up, K = H, N = I
+    _moe_gemm_kernel[(num_ctas,)](
+        x16, w13, w13_sf, state["w13_gs"], state["inter"],
+        state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
+        x16.stride(0), state["inter"].stride(0), H, I,
+        w13.stride(0), w13.stride(1), w13_sf.stride(0), w13_sf.stride(1), I,
+        num_ctas, I // BN, **common,
+    )
+    # down GEMM: A = inter [rows, I], W2[e] [H, I/2], K = I, N = H
+    common.update(GATHER=False, GATED=False)
+    _moe_gemm_kernel[(num_ctas,)](
+        state["inter"], w2, w2_sf, state["w2_gs"], state["y"],
+        state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
+        state["inter"].stride(0), state["y"].stride(0), I, H,
+        w2.stride(0), w2.stride(1), w2_sf.stride(0), w2_sf.stride(1), 0,
+        num_ctas, H // BN, **common,
+    )
+    _finalize_kernel[(M,)](
+        state["y"], state["row_of_pair"], tw, state["norm_w"], out, POST_NORM_EPS,
+        H=H, TOPK=TOPK, num_warps=4,
+    )
+    return out
