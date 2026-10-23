@@ -189,36 +189,37 @@ def _block_m(m: int) -> int:
 # shapes move the same bytes, so giving each m a different configuration measures four
 # pipeline shapes per layer in one run.
 SWEEP = {
-    # pooler: N 4096, K 8192
+    # best measured with cp.async (run e5ae1975): (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages)
+    # pooler: N 4096, K 8192 -> 19.5 us (SGLang 21.8)
     ("pooler", 4096, 1):   (32, 256, 1, 4, 4),
-    ("pooler", 4096, 8):   (32, 256, 1, 4, 6),
-    ("pooler", 4096, 16):  (64, 128, 2, 4, 4),
-    ("pooler", 4096, 32):  (32, 256, 2, 4, 4),
-    # unpooler, whole weight: N 8192, K 4096
+    ("pooler", 4096, 8):   (32, 256, 1, 4, 4),
+    ("pooler", 4096, 16):  (32, 256, 1, 4, 4),
+    ("pooler", 4096, 32):  (32, 256, 1, 4, 4),
+    # unpooler, whole weight: N 8192, K 4096 -> 18.8 us (SGLang 18.6)
     ("unpooler", 8192, 16): (32, 256, 1, 4, 4),
-    ("unpooler", 8192, 32): (64, 128, 1, 4, 6),
-    # unpooler, this GPU's slice: N 1024, K 4096
+    ("unpooler", 8192, 32): (32, 256, 1, 4, 4),
+    # unpooler, this GPU's slice: N 1024, K 4096 -> 6.6 us (SGLang 6.8)
     ("unpooler", 1024, 1): (32, 256, 4, 4, 4),
-    ("unpooler", 1024, 8): (16, 256, 4, 4, 4),
-    # o: N 8192, K 1024
-    ("o", 8192, 1):   (32, 256, 1, 4, 4),
+    ("unpooler", 1024, 8): (32, 256, 4, 4, 4),
+    # o: N 8192, K 1024 -> 6.8 us (SGLang 6.8)
+    ("o", 8192, 1):   (64, 256, 1, 4, 4),
     ("o", 8192, 8):   (64, 256, 1, 4, 4),
-    ("o", 8192, 16):  (32, 256, 1, 8, 4),
-    ("o", 8192, 32):  (32, 256, 1, 4, 2),
-    # qkv_gate: N 2304, K 8192
+    ("o", 8192, 16):  (64, 256, 1, 4, 4),
+    ("o", 8192, 32):  (64, 256, 1, 4, 4),
+    # qkv_gate: N 2304, K 8192 -> 14.8 us (SGLang 14.4)
     ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 8):  (32, 256, 2, 4, 4),
-    ("qkv_gate", 2304, 16): (16, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 32): (32, 256, 8, 4, 4),
-    # router: N 256, K 8192, hi + lo (two weight streams)
-    ("router", 256, 1):   (16, 256, 8, 4, 4),
+    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 4),
+    ("qkv_gate", 2304, 16): (32, 256, 4, 4, 4),
+    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 4),
+    # router: N 256, K 8192, hi + lo -> 6.7 us (SGLang 10.6 to 26.2)
+    ("router", 256, 1):   (32, 256, 16, 4, 3),
     ("router", 256, 8):   (32, 256, 16, 4, 3),
-    ("router", 256, 16):  (16, 256, 16, 4, 4),
-    ("router", 256, 32):  (16, 256, 8, 4, 4),
+    ("router", 256, 16):  (32, 256, 16, 4, 3),
+    ("router", 256, 32):  (32, 256, 16, 4, 3),
 }
 
 
-USE_TMA = True   # fetch tiles with TMA descriptors (box inner dim <= 256 elements)
+USE_TMA = False  # fetch tiles with TMA descriptors (box inner dim <= 256 elements)
 
 
 def _config(layer: str, m: int, n: int, k: int):
