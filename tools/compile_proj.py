@@ -6,8 +6,9 @@ import triton
 from triton.compiler import ASTSource
 from triton.backends.compiler import GPUTarget
 import submission as S
+KERNEL = S._tiled_gemm_kernel if "--tiled" in sys.argv else S._skinny_gemm_kernel
+a = [x for x in sys.argv[1:] if x != "--tiled"]
 
-a = sys.argv[1:]
 BM, BN, BK, SK, TW, NW, NS, MSPEC = [int(x) for x in (a + ["16", "32", "256", "1", "0", "4", "4", "0"][len(a):])]
 sig = {"x_ptr": "*bf16", "w_ptr": "*bf16", "w2_ptr": "*bf16", "out_ptr": "*bf16", "part_ptr": "*fp32",
        "cnt_ptr": "*i32", "M": "i32", "N": "i32", "K": "i32", "stride_xm": "i32", "stride_wn": "i32",
@@ -22,7 +23,10 @@ if MSPEC == 1:       # the JIT folds M == 1 into a constexpr
     sig["M"] = "constexpr"; consts["M"] = 1
 elif MSPEC == 16:    # M divisible by 16
     attrs[(names.index("M"),)] = [["tt.divisibility", 16]]
-src = ASTSource(fn=S._skinny_gemm_kernel, signature=sig, constexprs=consts, attrs=attrs)
+if KERNEL is S._tiled_gemm_kernel:
+    sig.pop("stride_wn"); names = list(sig)
+    attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if sig[n].startswith("*") or n.startswith("stride") or n in ("N", "K")}
+src = ASTSource(fn=KERNEL, signature=sig, constexprs=consts, attrs=attrs)
 k = triton.compile(src, target=GPUTarget("cuda", 90, 32), options={"num_warps": NW, "num_stages": NS})
 ttgir = k.asm["ttgir"]; ptx = k.asm["ptx"]
 def count(pat, s): return len(re.findall(pat, s))

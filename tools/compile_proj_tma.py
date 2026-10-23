@@ -4,7 +4,8 @@ import triton
 from triton.compiler import ASTSource
 from triton.backends.compiler import GPUTarget
 import submission as S
-a = sys.argv[1:]
+KERNEL = S._tiled_gemm_tma_kernel if "--tiled" in sys.argv else S._skinny_gemm_tma_kernel
+a = [x for x in sys.argv[1:] if x != "--tiled"]
 BM, BN, BK, SK, TW, NW, NS = [int(x) for x in (a + ["16", "32", "256", "1", "0", "4", "4"][len(a):])]
 sig = {"x_desc": f"tensordesc<bf16[{BM}, {BK}]>", "w_desc": f"tensordesc<bf16[{BN}, {BK}]>", "w2_desc": f"tensordesc<bf16[{BN}, {BK}]>",
        "out_ptr": "*bf16", "part_ptr": "*fp32", "cnt_ptr": "*i32", "M": "i32", "N": "i32", "K": "i32", "stride_om": "i32",
@@ -12,7 +13,7 @@ sig = {"x_desc": f"tensordesc<bf16[{BM}, {BK}]>", "w_desc": f"tensordesc<bf16[{B
 consts = {"BLOCK_M": BM, "BLOCK_N": BN, "BLOCK_K": BK, "SPLIT_K": SK, "TWO_W": bool(TW)}
 names = list(sig)
 attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if sig[n].startswith("*") or n in ("N", "K", "stride_om")}
-k = triton.compile(ASTSource(fn=S._skinny_gemm_tma_kernel, signature=sig, constexprs=consts, attrs=attrs),
+k = triton.compile(ASTSource(fn=KERNEL, signature=sig, constexprs=consts, attrs=attrs),
                    target=GPUTarget("cuda", 90, 32), options={"num_warps": NW, "num_stages": NS})
 ttgir, ptx = k.asm["ttgir"], k.asm["ptx"]
 def count(pat, s): return len(re.findall(pat, s))

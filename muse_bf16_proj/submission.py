@@ -163,6 +163,112 @@ def _skinny_gemm_tma_kernel(
             tl.atomic_xchg(cnt_ptr + tile, 0)
 
 
+@triton.jit
+def _tiled_gemm_kernel(
+    x_ptr, w_ptr, w2_ptr, out_ptr, part_ptr, cnt_ptr,
+    M, N, K, stride_xm, stride_om,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr, TWO_W: tl.constexpr,
+):
+    """W repacked in prepare() as [N/BLOCK_N, K/BLOCK_K, BLOCK_N, BLOCK_K]: every stage reads one
+    contiguous tile (DRAM-friendly) instead of BLOCK_N rows that sit 2K bytes apart."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_m = tl.program_id(2)
+    n_tiles = tl.num_programs(0)
+    m_tiles = tl.num_programs(2)
+    KT = K // BLOCK_K
+    kt_chunk = KT // SPLIT_K
+    TILE: tl.constexpr = BLOCK_N * BLOCK_K
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    k0 = tl.multiple_of(pid_k * kt_chunk * BLOCK_K, BLOCK_K)
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + (k0 + offs_k)[None, :]
+    tile0 = (pid_n * KT + pid_k * kt_chunk) * TILE
+    w_ptrs = w_ptr + tile0 + tl.arange(0, BLOCK_N)[:, None] * BLOCK_K + offs_k[None, :]
+    if TWO_W:
+        w2_ptrs = w2_ptr + tile0 + tl.arange(0, BLOCK_N)[:, None] * BLOCK_K + offs_k[None, :]
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, kt_chunk):
+        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        w = tl.load(w_ptrs)
+        acc = tl.dot(x, tl.trans(w), acc)
+        if TWO_W:
+            w2 = tl.load(w2_ptrs)
+            acc = tl.dot(x, tl.trans(w2), acc)
+            w2_ptrs += TILE
+        x_ptrs += BLOCK_K
+        w_ptrs += TILE
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
+    if SPLIT_K == 1:
+        tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+    else:
+        m_pad = m_tiles * BLOCK_M
+        part_ptrs = part_ptr + (pid_k * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+        tl.store(part_ptrs, acc)
+        tl.debug_barrier()
+        tile = pid_m * n_tiles + pid_n
+        ticket = tl.atomic_add(cnt_ptr + tile, 1, sem="acq_rel", scope="gpu")
+        tl.debug_barrier()
+        if ticket == SPLIT_K - 1:
+            total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for s in tl.static_range(SPLIT_K):
+                p = part_ptr + (s * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+                total += tl.load(p, cache_modifier=".cg")
+            tl.store(out_ptrs, total.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+            tl.atomic_xchg(cnt_ptr + tile, 0)
+
+
+@triton.jit
+def _tiled_gemm_tma_kernel(
+    x_desc, w_desc, w2_desc, out_ptr, part_ptr, cnt_ptr,
+    M, N, K, stride_om,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr, TWO_W: tl.constexpr,
+):
+    """The tiled layout seen as a 2-D [N/BLOCK_N * K/BLOCK_K * BLOCK_N, BLOCK_K] matrix: tile
+    (n, kt) is rows (n * KT + kt) * BLOCK_N onward, fetched by TMA."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_m = tl.program_id(2)
+    n_tiles = tl.num_programs(0)
+    m_tiles = tl.num_programs(2)
+    KT = K // BLOCK_K
+    kt_chunk = KT // SPLIT_K
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    kt0 = pid_k * kt_chunk
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for kt in range(kt0, kt0 + kt_chunk):
+        x = x_desc.load([pid_m * BLOCK_M, kt * BLOCK_K])
+        w = w_desc.load([(pid_n * KT + kt) * BLOCK_N, 0])
+        acc = tl.dot(x, w.T, acc)
+        if TWO_W:
+            w2 = w2_desc.load([(pid_n * KT + kt) * BLOCK_N, 0])
+            acc = tl.dot(x, w2.T, acc)
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
+    if SPLIT_K == 1:
+        tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+    else:
+        m_pad = m_tiles * BLOCK_M
+        part_ptrs = part_ptr + (pid_k * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+        tl.store(part_ptrs, acc)
+        tl.debug_barrier()
+        tile = pid_m * n_tiles + pid_n
+        ticket = tl.atomic_add(cnt_ptr + tile, 1, sem="acq_rel", scope="gpu")
+        tl.debug_barrier()
+        if ticket == SPLIT_K - 1:
+            total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for s in tl.static_range(SPLIT_K):
+                p = part_ptr + (s * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+                total += tl.load(p, cache_modifier=".cg")
+            tl.store(out_ptrs, total.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+            tl.atomic_xchg(cnt_ptr + tile, 0)
+
+
 # ----------------------------------------------------------------------------------------------
 # Configs
 # ----------------------------------------------------------------------------------------------
@@ -189,45 +295,52 @@ def _block_m(m: int) -> int:
 # shapes move the same bytes, so giving each m a different configuration measures four
 # pipeline shapes per layer in one run.
 SWEEP = {
-    # best measured with cp.async (run e5ae1975): (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages)
-    # pooler: N 4096, K 8192 -> 19.5 us (SGLang 21.8)
+    # (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages); with USE_TILED the tile shape is TILE_SHAPE[layer]
     ("pooler", 4096, 1):   (32, 256, 1, 4, 4),
-    ("pooler", 4096, 8):   (32, 256, 1, 4, 4),
-    ("pooler", 4096, 16):  (32, 256, 1, 4, 4),
-    ("pooler", 4096, 32):  (32, 256, 1, 4, 4),
-    # unpooler, whole weight: N 8192, K 4096 -> 18.8 us (SGLang 18.6)
-    ("unpooler", 8192, 16): (32, 256, 1, 4, 4),
-    ("unpooler", 8192, 32): (32, 256, 1, 4, 4),
-    # unpooler, this GPU's slice: N 1024, K 4096 -> 6.6 us (SGLang 6.8)
+    ("pooler", 4096, 8):   (32, 256, 1, 4, 6),
+    ("pooler", 4096, 16):  (32, 256, 1, 4, 6),
+    ("pooler", 4096, 32):  (32, 256, 1, 4, 5),
+    ("unpooler", 8192, 16): (32, 256, 1, 4, 6),
+    ("unpooler", 8192, 32): (32, 256, 1, 4, 5),
     ("unpooler", 1024, 1): (32, 256, 4, 4, 4),
-    ("unpooler", 1024, 8): (32, 256, 4, 4, 4),
-    # o: N 8192, K 1024 -> 6.8 us (SGLang 6.8)
+    ("unpooler", 1024, 8): (32, 256, 4, 4, 6),
     ("o", 8192, 1):   (64, 256, 1, 4, 4),
     ("o", 8192, 8):   (64, 256, 1, 4, 4),
     ("o", 8192, 16):  (64, 256, 1, 4, 4),
     ("o", 8192, 32):  (64, 256, 1, 4, 4),
-    # qkv_gate: N 2304, K 8192 -> 14.8 us (SGLang 14.4)
     ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 16): (32, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 4),
-    # router: N 256, K 8192, hi + lo -> 6.7 us (SGLang 10.6 to 26.2)
+    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 6),
+    ("qkv_gate", 2304, 16): (32, 256, 2, 4, 6),
+    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 5),
     ("router", 256, 1):   (32, 256, 16, 4, 3),
     ("router", 256, 8):   (32, 256, 16, 4, 3),
-    ("router", 256, 16):  (32, 256, 16, 4, 3),
-    ("router", 256, 32):  (32, 256, 16, 4, 3),
+    ("router", 256, 16):  (32, 256, 16, 4, 4),
+    ("router", 256, 32):  (32, 256, 8, 4, 4),
 }
 
 
+# Packed tile shape per weight: (BLOCK_N, BLOCK_K). Configs for the tiled kernels use these.
+TILE_SHAPE = {"qkv_gate": (32, 256), "o": (64, 256), "pooler": (32, 256), "unpooler": (32, 256), "router": (32, 256)}
+USE_TILED = True
 USE_TMA = False  # fetch tiles with TMA descriptors (box inner dim <= 256 elements)
 
 
 def _config(layer: str, m: int, n: int, k: int):
     cfg = _config_table(layer, m, n, k)
-    if cfg is not None and USE_TMA:
+    if cfg is None:
+        return None
+    if USE_TILED:
+        cfg["tiled"] = True
+        cfg["BLOCK_N"], cfg["BLOCK_K"] = TILE_SHAPE[layer]
+        cfg["tma"] = bool(TMA_BY_M.get(m, USE_TMA))
+    elif USE_TMA:
         cfg["tma"] = True
         cfg["BLOCK_K"] = min(cfg["BLOCK_K"], 256)
     return cfg
+
+
+# sweep: which m-slots fetch with TMA (the m <= 32 shapes cost the same bytes)
+TMA_BY_M = {1: False, 8: True, 16: False, 32: True}
 
 
 def _config_table(layer: str, m: int, n: int, k: int):
@@ -259,6 +372,8 @@ def _usable(cfg, m: int, n: int, k: int) -> bool:
     chunk = k // cfg["SPLIT_K"]
     if chunk % cfg["BLOCK_K"]:
         return False
+    if cfg.get("tiled") and (n % cfg["BLOCK_N"] or k % cfg["BLOCK_K"]):
+        return False
     m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
     n_tiles = n // cfg["BLOCK_N"]
     if m_tiles * n_tiles > COUNTERS:
@@ -273,6 +388,12 @@ def _usable(cfg, m: int, n: int, k: int) -> bool:
 # ----------------------------------------------------------------------------------------------
 
 
+def _pack_tiles(w: torch.Tensor, bn: int, bk: int) -> torch.Tensor:
+    """[N, K] -> [N/bn * K/bk * bn, bk]: tile (n, kt) contiguous, n-major. Same values, bf16."""
+    n, k = w.shape
+    return w.view(n // bn, bn, k // bk, bk).permute(0, 2, 1, 3).reshape(-1, bk).contiguous()
+
+
 def prepare(weights: Weights, warm: bool = True):
     """Called once, untimed. Contiguous copies, the router's hi/lo split, and the split-K
     workspace; then every scored shape is run once so the judge never compiles under capture."""
@@ -284,6 +405,10 @@ def prepare(weights: Weights, warm: bool = True):
     state["router_lo"] = lo.contiguous()
     state["router_hilo_t"] = torch.cat((hi, lo), dim=1).t().contiguous()   # [2K, N]
     device = router.device
+    for name in ("qkv_gate", "o", "pooler", "unpooler"):
+        state[name + "_tiled"] = _pack_tiles(state[name], *TILE_SHAPE[name])
+    state["router_hi_tiled"] = _pack_tiles(state["router_hi"], *TILE_SHAPE["router"])
+    state["router_lo_tiled"] = _pack_tiles(state["router_lo"], *TILE_SHAPE["router"])
     state["counters"] = torch.zeros((COUNTERS,), dtype=torch.int32, device=device)
     state["partials"] = torch.empty((PARTIALS_FLOATS,), dtype=torch.float32, device=device)
 
@@ -305,10 +430,35 @@ def prepare(weights: Weights, warm: bool = True):
     return state
 
 
-def _launch(x, w, w2, out, state, cfg, m, n, k):
+def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
     m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
     n_tiles = n // cfg["BLOCK_N"]
     grid = (n_tiles, cfg["SPLIT_K"], m_tiles)
+    if cfg.get("tiled"):
+        # the packed weight: n-major tiles, so the unpooler's first 1024 rows are its first tiles
+        if layer == "router":
+            wt, w2t = state["router_hi_tiled"], state["router_lo_tiled"]
+        else:
+            wt, w2t = state[layer + "_tiled"], None
+        if cfg.get("tma"):
+            from triton.tools.tensor_descriptor import TensorDescriptor
+            x_desc = TensorDescriptor.from_tensor(x, [cfg["BLOCK_M"], cfg["BLOCK_K"]])
+            w_desc = TensorDescriptor.from_tensor(wt, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+            w2_desc = TensorDescriptor.from_tensor(w2t if w2t is not None else wt, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+            _tiled_gemm_tma_kernel[grid](
+                x_desc, w_desc, w2_desc, out, state["partials"], state["counters"],
+                m, n, k, out.stride(0),
+                BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+                SPLIT_K=cfg["SPLIT_K"], TWO_W=w2t is not None,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        else:
+            _tiled_gemm_kernel[grid](
+                x, wt, w2t if w2t is not None else wt, out, state["partials"], state["counters"],
+                m, n, k, x.stride(0), out.stride(0),
+                BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+                SPLIT_K=cfg["SPLIT_K"], TWO_W=w2t is not None,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        return out
     if cfg.get("tma"):
         from triton.tools.tensor_descriptor import TensorDescriptor
         x_desc = TensorDescriptor.from_tensor(x, [cfg["BLOCK_M"], cfg["BLOCK_K"]])
@@ -345,7 +495,7 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
         cfg = _config(layer, m, n, k)
         if _usable(cfg, m, n, k):
             out = torch.empty((m, n), dtype=torch.float32, device=x.device)
-            return _launch(x, state["router_hi"], state["router_lo"], out, state, cfg, m, n, k)
+            return _launch(x, state["router_hi"], state["router_lo"], out, state, cfg, m, n, k, layer)
         # one GEMM: [x | x] @ [hi | lo]^T == x @ hi^T + x @ lo^T, fp32 accumulation
         x2 = torch.cat((x, x), dim=1)
         return torch.mm(x2, state["router_hilo_t"], out_dtype=torch.float32)
@@ -356,5 +506,5 @@ def kernel_fn(data: Inputs, state) -> torch.Tensor:
     cfg = _config(layer, m, n, k)
     if _usable(cfg, m, n, k):
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-        return _launch(x, w, None, out, state, cfg, m, n, k)
+        return _launch(x, w, None, out, state, cfg, m, n, k, layer)
     return torch.matmul(x, w.t())
