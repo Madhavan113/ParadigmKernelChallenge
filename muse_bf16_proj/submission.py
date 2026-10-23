@@ -104,11 +104,11 @@ def _skinny_gemm_kernel(
         tl.debug_barrier()
         if ticket == SPLIT_K - 1:
             # Last CTA of this tile: every other split's partial is visible (acquire). Read
-            # them straight from L2 (volatile: never from a stale L1 line).
+            # them from L2 (.cg bypasses L1, so no stale line, and the loads still vectorize).
             total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
             for s in tl.static_range(SPLIT_K):
                 p = part_ptr + (s * m_pad + offs_m)[:, None] * N + offs_n[None, :]
-                total += tl.load(p, volatile=True)
+                total += tl.load(p, cache_modifier=".cg")
             tl.store(out_ptrs, total.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
             # Reset the ticket for the next launch (graph replays reuse the counters).
             tl.atomic_xchg(cnt_ptr + tile, 0)
@@ -136,27 +136,58 @@ def _block_m(m: int) -> int:
     return 128
 
 
+# Sweep table: (BLOCK_N, BLOCK_K, SPLIT_K, num_warps, num_stages) per (layer, n, m). The m <= 32
+# shapes move the same bytes, so giving each m a different configuration measures four
+# pipeline shapes per layer in one run.
+SWEEP = {
+    # pooler: N 4096, K 8192
+    ("pooler", 4096, 1):   (32, 256, 1, 4, 4),
+    ("pooler", 4096, 8):   (16, 256, 1, 4, 4),
+    ("pooler", 4096, 16):  (32, 1024, 1, 8, 2),
+    ("pooler", 4096, 32):  (32, 256, 1, 4, 6),
+    # unpooler, whole weight: N 8192, K 4096
+    ("unpooler", 8192, 16): (64, 512, 1, 8, 2),
+    ("unpooler", 8192, 32): (32, 512, 1, 4, 3),
+    # unpooler, this GPU's slice: N 1024, K 4096
+    ("unpooler", 1024, 1): (32, 256, 4, 4, 4),
+    ("unpooler", 1024, 8): (16, 256, 8, 4, 4),
+    # o: N 8192, K 1024
+    ("o", 8192, 1):   (32, 256, 1, 4, 4),
+    ("o", 8192, 8):   (64, 1024, 1, 8, 1),
+    ("o", 8192, 16):  (16, 512, 1, 4, 2),
+    ("o", 8192, 32):  (32, 512, 1, 8, 2),
+    # qkv_gate: N 2304, K 8192
+    ("qkv_gate", 2304, 1):  (16, 256, 1, 4, 4),
+    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 4),
+    ("qkv_gate", 2304, 16): (16, 512, 2, 4, 3),
+    ("qkv_gate", 2304, 32): (16, 1024, 1, 8, 2),
+    # router: N 256, K 8192, hi + lo (two weight streams)
+    ("router", 256, 1):   (16, 256, 8, 4, 4),
+    ("router", 256, 8):   (32, 256, 16, 4, 3),
+    ("router", 256, 16):  (32, 512, 8, 8, 2),
+    ("router", 256, 32):  (16, 512, 4, 4, 3),
+}
+
+
 def _config(layer: str, m: int, n: int, k: int):
     bm = _block_m(m)
-    bk = 256 if bm <= 32 else 128   # keeps the pipeline's shared memory under ~128 KB
     if layer == "router":
-        # N = 256, K = 8192, two BF16 weights (hi + lo).
-        if m <= 64:
-            return dict(BLOCK_M=bm, BLOCK_N=32, BLOCK_K=bk, SPLIT_K=16, num_warps=4, num_stages=3)
-        return dict(BLOCK_M=128, BLOCK_N=64, BLOCK_K=64, SPLIT_K=16, num_warps=4, num_stages=3)
+        if m > 64:
+            return dict(BLOCK_M=128, BLOCK_N=32, BLOCK_K=128, SPLIT_K=8, num_warps=4, num_stages=3)
+        bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), (16, 256, 8, 4, 4))
+        return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns)
     if m > MAX_TRITON_M:
         return None
-    if layer == "qkv_gate":      # N 2304, K 8192
-        return dict(BLOCK_M=bm, BLOCK_N=32, BLOCK_K=bk, SPLIT_K=4, num_warps=4, num_stages=4)
-    if layer == "o":             # N 8192, K 1024
-        return dict(BLOCK_M=bm, BLOCK_N=32, BLOCK_K=bk, SPLIT_K=1, num_warps=4, num_stages=4)
-    if layer == "pooler":        # N 4096, K 8192
-        return dict(BLOCK_M=bm, BLOCK_N=32, BLOCK_K=bk, SPLIT_K=2, num_warps=4, num_stages=4)
-    if layer == "unpooler":
-        if n <= 1024:            # N 1024, K 4096 (this GPU's slice, m <= 8)
-            return dict(BLOCK_M=bm, BLOCK_N=32, BLOCK_K=bk, SPLIT_K=4, num_warps=4, num_stages=4)
-        return dict(BLOCK_M=bm, BLOCK_N=32, BLOCK_K=bk, SPLIT_K=1, num_warps=4, num_stages=4)
-    return None
+    default = {
+        "qkv_gate": (16, 256, 1, 4, 4),
+        "o": (32, 256, 1, 4, 4),
+        "pooler": (32, 256, 1, 4, 4),
+        "unpooler": (32, 256, 1, 4, 4) if n > 1024 else (32, 256, 4, 4, 4),
+    }[layer]
+    bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), default)
+    if bm > 32 and bk > 256:   # keep shared memory in budget for the 64-row tiles
+        bk = 256
+    return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns)
 
 
 def _usable(cfg, m: int, n: int, k: int) -> bool:
