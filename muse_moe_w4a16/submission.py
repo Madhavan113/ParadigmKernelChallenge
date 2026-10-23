@@ -131,7 +131,7 @@ def _route_kernel(
 # $2,$3 = elements 1,3,5,7 (high nibbles). Magnitude bits (e1 e0 m) land at fp16 bits [11:9],
 # the sign at bit 15. Shifts per byte position: low nibble of bytes 0/2 -> << 9 (<< 12 sign),
 # bytes 1/3 -> << 1 (<< 4); high nibble of bytes 0/2 -> << 5 (<< 8), bytes 1/3 -> >> 3 (none).
-_NIBBLE_ASM = """
+_NIBBLE_ASM = tl.constexpr("""
 {
     .reg .b32 t, u;
     shl.b32 t, $4, 9;   and.b32 t, t, 0x0E000E00;
@@ -143,7 +143,7 @@ _NIBBLE_ASM = """
     shr.b32 t, $4, 3;   and.b32 t, t, 0x0E000E00;
     and.b32 u, $4, 0x80008000;                      or.b32 $3, t, u;
 }
-"""
+""")
 
 
 @triton.jit

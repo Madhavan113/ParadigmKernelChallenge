@@ -116,6 +116,53 @@ def _skinny_gemm_kernel(
             tl.atomic_xchg(cnt_ptr + tile, 0)
 
 
+@triton.jit
+def _skinny_gemm_tma_kernel(
+    x_desc, w_desc, w2_desc, out_ptr, part_ptr, cnt_ptr,
+    M, N, K, stride_om,
+    BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
+    SPLIT_K: tl.constexpr, TWO_W: tl.constexpr,
+):
+    """Same computation, with the tiles fetched by TMA (bulk tensor copies; rows past M are
+    zero-filled by the hardware)."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_m = tl.program_id(2)
+    n_tiles = tl.num_programs(0)
+    m_tiles = tl.num_programs(2)
+    k_chunk = tl.multiple_of(K // SPLIT_K, BLOCK_K)
+    k0 = tl.multiple_of(pid_k * k_chunk, BLOCK_K)
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    m_mask = offs_m < M
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for k in range(k0, k0 + k_chunk, BLOCK_K):
+        x = x_desc.load([pid_m * BLOCK_M, k])
+        w = w_desc.load([pid_n * BLOCK_N, k])
+        acc = tl.dot(x, w.T, acc)
+        if TWO_W:
+            w2 = w2_desc.load([pid_n * BLOCK_N, k])
+            acc = tl.dot(x, w2.T, acc)
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
+    if SPLIT_K == 1:
+        tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+    else:
+        m_pad = m_tiles * BLOCK_M
+        part_ptrs = part_ptr + (pid_k * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+        tl.store(part_ptrs, acc)
+        tl.debug_barrier()
+        tile = pid_m * n_tiles + pid_n
+        ticket = tl.atomic_add(cnt_ptr + tile, 1, sem="acq_rel", scope="gpu")
+        tl.debug_barrier()
+        if ticket == SPLIT_K - 1:
+            total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+            for s in tl.static_range(SPLIT_K):
+                p = part_ptr + (s * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+                total += tl.load(p, cache_modifier=".cg")
+            tl.store(out_ptrs, total.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+            tl.atomic_xchg(cnt_ptr + tile, 0)
+
+
 # ----------------------------------------------------------------------------------------------
 # Configs
 # ----------------------------------------------------------------------------------------------
@@ -144,20 +191,20 @@ def _block_m(m: int) -> int:
 SWEEP = {
     # pooler: N 4096, K 8192
     ("pooler", 4096, 1):   (32, 256, 1, 4, 4),
-    ("pooler", 4096, 8):   (32, 256, 2, 4, 4),
+    ("pooler", 4096, 8):   (32, 256, 1, 4, 6),
     ("pooler", 4096, 16):  (64, 128, 2, 4, 4),
-    ("pooler", 4096, 32):  (32, 256, 1, 4, 5),
+    ("pooler", 4096, 32):  (32, 256, 2, 4, 4),
     # unpooler, whole weight: N 8192, K 4096
     ("unpooler", 8192, 16): (32, 256, 1, 4, 4),
-    ("unpooler", 8192, 32): (32, 256, 2, 4, 4),
+    ("unpooler", 8192, 32): (64, 128, 1, 4, 6),
     # unpooler, this GPU's slice: N 1024, K 4096
     ("unpooler", 1024, 1): (32, 256, 4, 4, 4),
     ("unpooler", 1024, 8): (16, 256, 4, 4, 4),
     # o: N 8192, K 1024
     ("o", 8192, 1):   (32, 256, 1, 4, 4),
     ("o", 8192, 8):   (64, 256, 1, 4, 4),
-    ("o", 8192, 16):  (32, 512, 1, 4, 2),
-    ("o", 8192, 32):  (32, 256, 1, 8, 4),
+    ("o", 8192, 16):  (32, 256, 1, 8, 4),
+    ("o", 8192, 32):  (32, 256, 1, 4, 2),
     # qkv_gate: N 2304, K 8192
     ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4),
     ("qkv_gate", 2304, 8):  (32, 256, 2, 4, 4),
@@ -171,7 +218,18 @@ SWEEP = {
 }
 
 
+USE_TMA = True   # fetch tiles with TMA descriptors (box inner dim <= 256 elements)
+
+
 def _config(layer: str, m: int, n: int, k: int):
+    cfg = _config_table(layer, m, n, k)
+    if cfg is not None and USE_TMA:
+        cfg["tma"] = True
+        cfg["BLOCK_K"] = min(cfg["BLOCK_K"], 256)
+    return cfg
+
+
+def _config_table(layer: str, m: int, n: int, k: int):
     bm = _block_m(m)
     if layer == "router":
         if m > 64:
@@ -250,6 +308,19 @@ def _launch(x, w, w2, out, state, cfg, m, n, k):
     m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
     n_tiles = n // cfg["BLOCK_N"]
     grid = (n_tiles, cfg["SPLIT_K"], m_tiles)
+    if cfg.get("tma"):
+        from triton.tools.tensor_descriptor import TensorDescriptor
+        x_desc = TensorDescriptor.from_tensor(x, [cfg["BLOCK_M"], cfg["BLOCK_K"]])
+        w_desc = TensorDescriptor.from_tensor(w, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+        w2_desc = TensorDescriptor.from_tensor(w2 if w2 is not None else w, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+        _skinny_gemm_tma_kernel[grid](
+            x_desc, w_desc, w2_desc, out, state["partials"], state["counters"],
+            m, n, k, out.stride(0),
+            BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+            SPLIT_K=cfg["SPLIT_K"], TWO_W=w2 is not None,
+            num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
+        )
+        return out
     _skinny_gemm_kernel[grid](
         x, w, w2 if w2 is not None else w, out, state["partials"], state["counters"],
         m, n, k,
