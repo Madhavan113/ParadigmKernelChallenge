@@ -55,10 +55,10 @@ class Inputs(TypedDict):
     config: Config
 
 
-RMS_EPS = 1e-5
+RMS_EPS = tl.constexpr(1e-5)
 OUT_DTYPE = torch.bfloat16
 ACT_DTYPE = tl.bfloat16   # the dots' operand precision (BF16, as SGLang's FA3 path keeps activations)
-NEG = -1.0e30  # finite "minus infinity" for masked logits (keeps every exp2 finite)
+NEG = tl.constexpr(-1.0e30)  # finite "minus infinity" for masked logits (keeps every exp2 finite)
 LOG2E = 1.4426950408889634
 
 
