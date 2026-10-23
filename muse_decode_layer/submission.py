@@ -430,6 +430,57 @@ def _proj_forward(x, layer: str, n: int, state) -> torch.Tensor:
         out = torch.empty((m, n), dtype=x.dtype, device=x.device)
         return _launch(x, w, None, out, state, cfg, m, n, k, layer)
     return torch.matmul(x, w.t())
+def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
+    m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
+    n_tiles = n // cfg["BLOCK_N"]
+    grid = (n_tiles, cfg["SPLIT_K"], m_tiles)
+    if cfg.get("tiled"):
+        # the packed weight: n-major tiles, so the unpooler's first 1024 rows are its first tiles
+        if layer == "router":
+            wt, w2t = state["router_hi_tiled"], state["router_lo_tiled"]
+        else:
+            wt, w2t = state[layer + "_tiled"], None
+        if cfg.get("tma"):
+            from triton.tools.tensor_descriptor import TensorDescriptor
+            x_desc = TensorDescriptor.from_tensor(x, [cfg["BLOCK_M"], cfg["BLOCK_K"]])
+            w_desc = TensorDescriptor.from_tensor(wt, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+            w2_desc = TensorDescriptor.from_tensor(w2t if w2t is not None else wt, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+            _tiled_gemm_tma_kernel[grid](
+                x_desc, w_desc, w2_desc, out, state["partials"], state["counters"],
+                m, n, k, out.stride(0),
+                BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+                SPLIT_K=cfg["SPLIT_K"], TWO_W=w2t is not None,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        else:
+            _tiled_gemm_kernel[grid](
+                x, wt, w2t if w2t is not None else wt, out, state["partials"], state["counters"],
+                m, n, k, x.stride(0), out.stride(0),
+                BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+                SPLIT_K=cfg["SPLIT_K"], TWO_W=w2t is not None,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        return out
+    if cfg.get("tma"):
+        from triton.tools.tensor_descriptor import TensorDescriptor
+        x_desc = TensorDescriptor.from_tensor(x, [cfg["BLOCK_M"], cfg["BLOCK_K"]])
+        w_desc = TensorDescriptor.from_tensor(w, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+        w2_desc = TensorDescriptor.from_tensor(w2 if w2 is not None else w, [cfg["BLOCK_N"], cfg["BLOCK_K"]])
+        _skinny_gemm_tma_kernel[grid](
+            x_desc, w_desc, w2_desc, out, state["partials"], state["counters"],
+            m, n, k, out.stride(0),
+            BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+            SPLIT_K=cfg["SPLIT_K"], TWO_W=w2 is not None,
+            num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
+        )
+        return out
+    _skinny_gemm_kernel[grid](
+        x, w, w2 if w2 is not None else w, out, state["partials"], state["counters"],
+        m, n, k,
+        x.stride(0), w.stride(0), out.stride(0),
+        BLOCK_M=cfg["BLOCK_M"], BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"],
+        SPLIT_K=cfg["SPLIT_K"], TWO_W=w2 is not None,
+        num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
+    )
+    return out
 
 
 # ---- shared: attn (muse_attention_decode/submission.py) ----

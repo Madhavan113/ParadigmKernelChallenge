@@ -435,32 +435,6 @@ def _proj_forward(x, layer: str, n: int, state) -> torch.Tensor:
         out = torch.empty((m, n), dtype=x.dtype, device=x.device)
         return _launch(x, w, None, out, state, cfg, m, n, k, layer)
     return torch.matmul(x, w.t())
-# == END SHARED proj ==
-
-
-def prepare(weights: Weights, warm: bool = True):
-    """Called once, untimed; then every scored shape is run once so the judge never compiles
-    under capture."""
-    state = _proj_state(weights)
-    device = state["router"].device
-    if not warm:
-        return state
-    # Warm-up / compile for the shapes the judge will run (tests and scored), with throwaway x.
-    layers = {"qkv_gate": 8192, "o": 1024, "pooler": 8192, "unpooler": 4096, "router": 8192}
-    try:
-        for m in (1, 5, 7, 8, 9, 16, 32, 33, 128, 130, 256):
-            for layer, k in layers.items():
-                n = state[layer].shape[0]
-                if layer == "unpooler" and m <= 8:
-                    n = 1024
-                x = torch.randn((m, k), device=device).to(torch.bfloat16)
-                kernel_fn({"x": x, "config": {"m": m, "n": n, "k": k, "layer": layer}}, state)
-        torch.cuda.synchronize()
-    except Exception as e:  # never let warm-up sink the run
-        print("warm-up failed:", repr(e))
-    return state
-
-
 def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
     m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
     n_tiles = n // cfg["BLOCK_N"]
@@ -512,6 +486,30 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
         num_warps=cfg["num_warps"], num_stages=cfg["num_stages"],
     )
     return out
+# == END SHARED proj ==
+
+
+def prepare(weights: Weights, warm: bool = True):
+    """Called once, untimed; then every scored shape is run once so the judge never compiles
+    under capture."""
+    state = _proj_state(weights)
+    device = state["router"].device
+    if not warm:
+        return state
+    # Warm-up / compile for the shapes the judge will run (tests and scored), with throwaway x.
+    layers = {"qkv_gate": 8192, "o": 1024, "pooler": 8192, "unpooler": 4096, "router": 8192}
+    try:
+        for m in (1, 5, 7, 8, 9, 16, 32, 33, 128, 130, 256):
+            for layer, k in layers.items():
+                n = state[layer].shape[0]
+                if layer == "unpooler" and m <= 8:
+                    n = 1024
+                x = torch.randn((m, k), device=device).to(torch.bfloat16)
+                kernel_fn({"x": x, "config": {"m": m, "n": n, "k": k, "layer": layer}}, state)
+        torch.cuda.synchronize()
+    except Exception as e:  # never let warm-up sink the run
+        print("warm-up failed:", repr(e))
+    return state
 
 
 def kernel_fn(data: Inputs, state) -> torch.Tensor:
