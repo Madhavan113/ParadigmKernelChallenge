@@ -42,7 +42,10 @@ for m, layer in cases:
         data = R.generate_input(m, layer, seed=123 + m, dist=dist, device=dev)
         data["x"] = data["x"].to(torch.float16)
         t = time.time()
-        out = S.kernel_fn(data, state)
+        try:
+            out = S.kernel_fn(data, state)
+        except NotImplementedError as e:   # cuBLAS fallbacks (out_dtype) have no CPU kernel
+            print(f"m={m:4d} {layer:9s} {dist:8s} skipped on CPU: {str(e)[:60]}"); continue
         ok, msg = check(data, out)
         print(f"m={m:4d} {layer:9s} {dist:8s} {time.time()-t:6.1f}s -> {ok} {msg}", flush=True)
         # run twice: the ticket counters must have been reset
