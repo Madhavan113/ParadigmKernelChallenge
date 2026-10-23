@@ -820,21 +820,25 @@ def _route_kernel(
 # 2./3. dequantizing GEMM
 # ----------------------------------------------------------------------------------------------
 
-# 4 packed bytes (8 nibbles) -> 8 fp16 (x 2^-14): $0,$1 = elements 0,2,4,6 (low nibbles),
-# $2,$3 = elements 1,3,5,7 (high nibbles). Magnitude bits (e1 e0 m) land at fp16 bits [11:9],
-# the sign at bit 15. Shifts per byte position: low nibble of bytes 0/2 -> << 9 (<< 12 sign),
-# bytes 1/3 -> << 1 (<< 4); high nibble of bytes 0/2 -> << 5 (<< 8), bytes 1/3 -> >> 3 (none).
+# 4 packed bytes (8 nibbles) -> 8 fp16 (x 2^-14). Byte j holds elements 2j (low nibble) and
+# 2j+1 (high nibble). Outputs, as Triton packs 4 fp16 into 2 registers in element order:
+#   $0 = (e0, e2)  $1 = (e4, e6)   [low nibbles]     $2 = (e1, e3)  $3 = (e5, e7)   [high nibbles]
+# prmt first spreads bytes (0, 1) and (2, 3) into the two 16-bit halves of a word, so one shift
+# serves both halves: magnitude bits (e1 e0 m) land at fp16 bits [11:9], the sign at bit 15.
 _NIBBLE_ASM = tl.constexpr("""
 {
-    .reg .b32 t, u;
-    shl.b32 t, $4, 9;   and.b32 t, t, 0x0E000E00;
-    shl.b32 u, $4, 12;  and.b32 u, u, 0x80008000;  or.b32 $0, t, u;
-    shl.b32 t, $4, 1;   and.b32 t, t, 0x0E000E00;
-    shl.b32 u, $4, 4;   and.b32 u, u, 0x80008000;  or.b32 $1, t, u;
-    shl.b32 t, $4, 5;   and.b32 t, t, 0x0E000E00;
-    shl.b32 u, $4, 8;   and.b32 u, u, 0x80008000;  or.b32 $2, t, u;
-    shr.b32 t, $4, 3;   and.b32 t, t, 0x0E000E00;
-    and.b32 u, $4, 0x80008000;                      or.b32 $3, t, u;
+    .reg .b32 a, b, t, u, z;
+    mov.b32 z, 0;
+    prmt.b32 a, $4, z, 0x4140;
+    prmt.b32 b, $4, z, 0x4342;
+    shl.b32 t, a, 9;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, a, 12;   and.b32 u, u, 0x80008000;  or.b32 $0, t, u;
+    shl.b32 t, b, 9;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, b, 12;   and.b32 u, u, 0x80008000;  or.b32 $1, t, u;
+    shl.b32 t, a, 5;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, a, 8;    and.b32 u, u, 0x80008000;  or.b32 $2, t, u;
+    shl.b32 t, b, 5;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, b, 8;    and.b32 u, u, 0x80008000;  or.b32 $3, t, u;
 }
 """)
 
