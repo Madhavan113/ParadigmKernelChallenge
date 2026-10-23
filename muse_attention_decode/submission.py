@@ -283,10 +283,9 @@ def _plan(cfg):
     cap = 128 if rb <= 16 else 32
     if cfg["window"]:
         splits = max(1, min(16, 512 // ctas))
-        block_t = 64 if cfg["window"] <= 2048 else 128
     else:
         splits = max(1, min(cap, 1024 // ctas))
-        block_t = 128
+    block_t = 64   # smaller tiles: less shared memory per CTA, more CTAs resident per SM
     lb = 16
     return splits, block_t, rb, lb
 
@@ -308,7 +307,7 @@ def _attention_forward(data) -> torch.Tensor:
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
     ch = min(splits, 8 if rb <= 16 else 4)        # splits merged per load group
-    nw = 4 if rb <= 16 else 8
+    nw = 4
     _attn_decode_kernel[grid](
         qkv, data["cache_loc"], data["seq_lens"], page_table,
         data["k_cache"], data["v_cache"], data["k_scale"], data["v_scale"],
@@ -317,7 +316,7 @@ def _attention_forward(data) -> torch.Tensor:
         math.log2(theta) if theta else 0.0,
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
         ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t, ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
-        CH=ch, num_warps=nw, num_stages=3,
+        CH=ch, num_warps=nw, num_stages=4,
     )
     return out
 # == END SHARED attn ==

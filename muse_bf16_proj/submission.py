@@ -270,6 +270,55 @@ def _tiled_gemm_tma_kernel(
             tl.atomic_xchg(cnt_ptr + tile, 0)
 
 
+@triton.jit
+def _tiled_gemv_kernel(
+    x_ptr, w_ptr, w2_ptr, out_ptr, part_ptr, cnt_ptr,
+    N, K,
+    BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr, SPLIT_K: tl.constexpr, TWO_W: tl.constexpr,
+):
+    """M == 1: out[n] = sum_k W[n, k] x[k] on the FMA pipe (no tensor cores, no operand layout
+    conversions), over the packed [N/BLOCK_N, K/BLOCK_K, BLOCK_N, BLOCK_K] tiles."""
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    n_tiles = tl.num_programs(0)
+    KT = K // BLOCK_K
+    kt_chunk = KT // SPLIT_K
+    TILE: tl.constexpr = BLOCK_N * BLOCK_K
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    k0 = tl.multiple_of(pid_k * kt_chunk * BLOCK_K, BLOCK_K)
+    x_ptrs = x_ptr + k0 + offs_k
+    tile0 = (pid_n * KT + pid_k * kt_chunk) * TILE
+    w_ptrs = w_ptr + tile0 + tl.arange(0, BLOCK_N)[:, None] * BLOCK_K + offs_k[None, :]
+    if TWO_W:
+        w2_ptrs = w2_ptr + tile0 + tl.arange(0, BLOCK_N)[:, None] * BLOCK_K + offs_k[None, :]
+    acc = tl.zeros((BLOCK_N,), dtype=tl.float32)
+    for _ in range(0, kt_chunk):
+        x = tl.load(x_ptrs).to(tl.float32)
+        w = tl.load(w_ptrs).to(tl.float32)
+        acc += tl.sum(w * x[None, :], 1)
+        if TWO_W:
+            w2 = tl.load(w2_ptrs).to(tl.float32)
+            acc += tl.sum(w2 * x[None, :], 1)
+            w2_ptrs += TILE
+        x_ptrs += BLOCK_K
+        w_ptrs += TILE
+    out_ptrs = out_ptr + offs_n
+    if SPLIT_K == 1:
+        tl.store(out_ptrs, acc.to(out_ptr.dtype.element_ty))
+    else:
+        tl.store(part_ptr + pid_k * N + offs_n, acc)
+        tl.debug_barrier()
+        ticket = tl.atomic_add(cnt_ptr + pid_n, 1, sem="acq_rel", scope="gpu")
+        tl.debug_barrier()
+        if ticket == SPLIT_K - 1:
+            total = tl.zeros((BLOCK_N,), dtype=tl.float32)
+            for s in tl.static_range(SPLIT_K):
+                total += tl.load(part_ptr + s * N + offs_n, cache_modifier=".cg")
+            tl.store(out_ptrs, total.to(out_ptr.dtype.element_ty))
+            tl.atomic_xchg(cnt_ptr + pid_n, 0)
+
+
 # ----------------------------------------------------------------------------------------------
 # Configs
 # ----------------------------------------------------------------------------------------------
@@ -334,6 +383,7 @@ def _config(layer: str, m: int, n: int, k: int):
         cfg["tiled"] = True
         cfg["BLOCK_N"], cfg["BLOCK_K"] = TILE_SHAPE[layer]
         cfg["tma"] = bool(TMA_BY_M.get(m, USE_TMA))
+        cfg["gemv"] = GEMV_M1 and m == 1
     elif USE_TMA:
         cfg["tma"] = True
         cfg["BLOCK_K"] = min(cfg["BLOCK_K"], 256)
@@ -348,7 +398,8 @@ SMEM_BUDGET = 200 * 1024
 
 
 # sweep: which m-slots fetch with TMA (the m <= 32 shapes cost the same bytes)
-TMA_BY_M = {1: False, 8: True, 16: False, 32: True}
+TMA_BY_M = {1: False, 8: True, 16: True, 32: True}
+GEMV_M1 = True   # m == 1: plain-FMA GEMV instead of the tensor-core path
 
 
 def _config_table(layer: str, m: int, n: int, k: int):
@@ -452,6 +503,13 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
             wt, w2t = state["router_hi_tiled"], state["router_lo_tiled"]
         else:
             wt, w2t = state[layer + "_tiled"], None
+        if cfg.get("gemv") and m == 1:
+            _tiled_gemv_kernel[(n_tiles, cfg["SPLIT_K"])](
+                x, wt, w2t if w2t is not None else wt, out, state["partials"], state["counters"],
+                n, k,
+                BLOCK_N=cfg["BLOCK_N"], BLOCK_K=cfg["BLOCK_K"], SPLIT_K=cfg["SPLIT_K"], TWO_W=w2t is not None,
+                num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+            return out
         if cfg.get("tma"):
             from triton.tools.tensor_descriptor import TensorDescriptor
             x_desc = TensorDescriptor.from_tensor(x, [cfg["BLOCK_M"], cfg["BLOCK_K"]])
