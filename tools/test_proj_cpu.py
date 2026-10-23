@@ -16,6 +16,23 @@ torch.manual_seed(0)
 # but limit the cases.
 weights = R.generate_weights(R.WEIGHTS_SEED, device=dev)
 state = S.prepare(weights, warm=False)
+# numpy has no bfloat16, so the interpreter can't run BF16 tensors: exercise the kernel's
+# indexing / masking / split-K ticket logic in float16 instead, against a float32 matmul.
+for k in list(state):
+    if isinstance(state[k], torch.Tensor) and state[k].dtype == torch.bfloat16:
+        state[k] = state[k].to(torch.float16)
+ref_w = {k: (state[k].float() if k != "router" else state["router"]) for k in ("qkv_gate", "o", "pooler", "unpooler", "router")}
+
+
+def check(data, out):
+    layer, n = data["config"]["layer"], data["config"]["n"]
+    ref = data["x"].float() @ ref_w[layer][:n].T
+    if layer == "router":
+        hi = state["router_hi"].float(); lo = state["router_lo"].float()
+        ref = data["x"].float() @ (hi + lo)[:n].T
+    err = float((out.float() - ref).norm() / ref.norm())
+    return err < (1e-3 if layer == "router" else 1e-2), f"rel L2 {err:.3e}"
+
 
 cases = [(1, "router"), (8, "router"), (9, "router"), (1, "o"), (5, "unpooler"), (33, "o")]
 if not fast:
@@ -23,9 +40,10 @@ if not fast:
 for m, layer in cases:
     for dist in (("normal", "outliers") if layer == "router" else ("normal",)):
         data = R.generate_input(m, layer, seed=123 + m, dist=dist, device=dev)
+        data["x"] = data["x"].to(torch.float16)
         t = time.time()
         out = S.kernel_fn(data, state)
-        ok, msg = R.check_implementation(data, out, weights)
+        ok, msg = check(data, out)
         print(f"m={m:4d} {layer:9s} {dist:8s} {time.time()-t:6.1f}s -> {ok} {msg}", flush=True)
         # run twice: the ticket counters must have been reset
         out2 = S.kernel_fn(data, state)

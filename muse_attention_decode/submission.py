@@ -56,6 +56,8 @@ class Inputs(TypedDict):
 
 
 RMS_EPS = 1e-5
+OUT_DTYPE = torch.bfloat16
+ACT_DTYPE = tl.bfloat16   # the dots' operand precision (BF16, as SGLang's FA3 path keeps activations)
 NEG = -1.0e30  # finite "minus infinity" for masked logits (keeps every exp2 finite)
 LOG2E = 1.4426950408889634
 
@@ -83,7 +85,7 @@ def _attn_decode_kernel(
     max_pages, qk_scale, sm_scale_log2, log2_theta,
     L: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
     PS: tl.constexpr, WINDOW: tl.constexpr, ROPE: tl.constexpr, SPLITS: tl.constexpr,
-    RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr,
+    RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr, ACT: tl.constexpr,
 ):
     GROUP: tl.constexpr = HQ // HKV
     R: tl.constexpr = L * GROUP
@@ -113,7 +115,7 @@ def _attn_decode_kernel(
     qe = tl.load(qp, mask=rmask[:, None], other=0.0).to(tl.float32)
     qo = tl.load(qp + 1, mask=rmask[:, None], other=0.0).to(tl.float32)
     qe, qo = _rms_rope(qe, qo, rmask, seq + j, inv_freq, qk_scale, ROPE, D)
-    q = tl.interleave(qe, qo).to(tl.bfloat16)   # [RB, D]
+    q = tl.interleave(qe, qo).to(ACT)   # [RB, D]
 
     # ---- the block's new keys and values for this KV head: [LB, D] (rows >= L masked) ----
     kj = tl.arange(0, LB)
@@ -133,8 +135,8 @@ def _attn_decode_kernel(
         tl.store(kc_ptr + cp, k_new8, mask=kmask[:, None])
         tl.store(vc_ptr + cp, v_new8, mask=kmask[:, None])
     # Attend to the entries as stored (what the reference checks against).
-    k_new = (k_new8.to(tl.float32) * k_scale).to(tl.bfloat16)   # [LB, D]
-    v_newb = (v_new8.to(tl.float32) * v_scale).to(tl.bfloat16)  # [LB, D]
+    k_new = (k_new8.to(tl.float32) * k_scale).to(ACT)   # [LB, D]
+    v_newb = (v_new8.to(tl.float32) * v_scale).to(ACT)  # [LB, D]
 
     # ---- online softmax over this split's slice of the past keys ----
     m_i = tl.full((RB,), NEG, tl.float32)
@@ -156,7 +158,7 @@ def _attn_decode_kernel(
         row = page.to(tl.int64) * PS + (t % PS).to(tl.int64)
         cp = row[:, None] * ROW_W + h * D + d[None, :]
         k8 = tl.load(kc_ptr + cp, mask=valid[:, None], other=0.0)
-        kt = (k8.to(tl.float32) * k_scale).to(tl.bfloat16)        # [BLOCK_T, D]
+        kt = (k8.to(tl.float32) * k_scale).to(ACT)        # [BLOCK_T, D]
         sc = tl.dot(q, tl.trans(kt)) * sm_scale_log2              # [RB, BLOCK_T]
         if WINDOW > 0:
             ok = valid[None, :] & (t[None, :] >= first[:, None])
@@ -168,8 +170,8 @@ def _attn_decode_kernel(
         p = tl.exp2(sc - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
         v8 = tl.load(vc_ptr + cp, mask=valid[:, None], other=0.0)
-        vt = (v8.to(tl.float32) * v_scale).to(tl.bfloat16)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), vt)
+        vt = (v8.to(tl.float32) * v_scale).to(ACT)
+        acc = acc * alpha[:, None] + tl.dot(p.to(ACT), vt)
         m_i = m_new
 
     # ---- split 0: the block's own tokens (causal inside the block) ----
@@ -181,7 +183,7 @@ def _attn_decode_kernel(
         alpha = tl.exp2(m_i - m_new)
         p = tl.exp2(sc - m_new[:, None])
         l_i = l_i * alpha + tl.sum(p, 1)
-        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v_newb)
+        acc = acc * alpha[:, None] + tl.dot(p.to(ACT), v_newb)
         m_i = m_new
 
     # ---- merge the splits (last CTA of this (b, h)), then the gated norm ----
@@ -272,7 +274,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
     if qkv.stride(-1) != 1:
         qkv = qkv.contiguous()
     device = qkv.device
-    out = torch.empty((B, L, HQ * D), dtype=torch.bfloat16, device=device)
+    out = torch.empty((B, L, HQ * D), dtype=OUT_DTYPE, device=device)
 
     splits, block_t, rb, lb = _plan(cfg)
     ctas = B * HKV
@@ -287,7 +289,7 @@ def kernel_fn(data: Inputs) -> torch.Tensor:
         page_table.shape[1], cfg["qk_scale_factor"], cfg["sm_scale"] * LOG2E,
         math.log2(theta) if theta else 0.0,
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
-        ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t,
+        ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t, ACT=ACT_DTYPE,
         num_warps=4, num_stages=3,
     )
     return out

@@ -9,6 +9,9 @@ import torch
 import reference as R
 R._fa3_scheduler_metadata = lambda *a, **k: None   # FA3 isn't available on CPU
 import submission as S
+S.OUT_DTYPE = torch.float16   # numpy has no bfloat16
+import triton.language as tl
+S.ACT_DTYPE = tl.float16
 
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"
 dev = "cpu"
@@ -29,7 +32,14 @@ for i, (batch, ctx, heads, layer, q_len, spread, dist, page, kv_scale) in enumer
     data = R.generate_input(batch, ctx, heads, layer, seed=1000 + i, q_len=q_len, spread=spread,
                             dist=dist, page=page, kv_scale=kv_scale, device=dev)
     t = time.time()
-    out = S.kernel_fn(data)
+    # The interpreter's FP8 cast truncates and it can't hold BF16: run the kernel on float16
+    # views (exact for the existing FP8 entries), then let torch round the new entries to E4M3.
+    fp8 = {k: data[k] for k in ("k_cache", "v_cache")}
+    run = dict(data, qkv=data["qkv"].to(torch.float16),
+               k_cache=fp8["k_cache"].float().half(), v_cache=fp8["v_cache"].float().half())
+    out = S.kernel_fn(run).to(torch.bfloat16)
+    fp8["k_cache"].copy_(run["k_cache"].to(R.FP8))
+    fp8["v_cache"].copy_(run["v_cache"].to(R.FP8))
     raw = R.collect(data, out)
     ok, msg = R.check_implementation(data, raw)
     print(f"b={batch} ctx={ctx} {heads} {layer:7s} L={q_len} {spread:6s} {dist:8s} page={page:2d} "
