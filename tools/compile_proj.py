@@ -25,10 +25,11 @@ elif MSPEC == 16:    # M divisible by 16
     attrs[(names.index("M"),)] = [["tt.divisibility", 16]]
 if KERNEL is S._tiled_gemv_kernel:
     for kk in ("M", "stride_xm", "stride_wn", "stride_om", "BLOCK_M"): sig.pop(kk)
-    consts.pop("BLOCK_M"); names = list(sig)
+    consts.pop("BLOCK_M")
 if KERNEL is S._tiled_gemm_kernel:
-    sig.pop("stride_wn"); names = list(sig)
-    attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if sig[n].startswith("*") or n.startswith("stride") or n in ("N", "K")}
+    sig.pop("stride_wn")
+names = list(sig)
+attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if sig[n].startswith("*") or n.startswith("stride") or n in ("N", "K")}
 src = ASTSource(fn=KERNEL, signature=sig, constexprs=consts, attrs=attrs)
 k = triton.compile(src, target=GPUTarget("cuda", 90, 32), options={"num_warps": NW, "num_stages": NS})
 ttgir = k.asm["ttgir"]; ptx = k.asm["ptx"]

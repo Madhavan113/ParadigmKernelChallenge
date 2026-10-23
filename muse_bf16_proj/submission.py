@@ -345,27 +345,27 @@ def _block_m(m: int) -> int:
 # shapes move the same bytes, so giving each m a different configuration measures four
 # pipeline shapes per layer in one run.
 SWEEP = {
-    # (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages); with USE_TILED the tile shape is TILE_SHAPE[layer]
-    ("pooler", 4096, 1):   (32, 256, 1, 4, 4),
-    ("pooler", 4096, 8):   (32, 256, 1, 4, 6),
-    ("pooler", 4096, 16):  (32, 256, 1, 4, 6),
-    ("pooler", 4096, 32):  (32, 256, 1, 4, 5),
-    ("unpooler", 8192, 16): (32, 256, 1, 4, 6),
-    ("unpooler", 8192, 32): (32, 256, 1, 4, 5),
-    ("unpooler", 1024, 1): (32, 256, 4, 4, 4),
-    ("unpooler", 1024, 8): (32, 256, 4, 4, 6),
-    ("o", 8192, 1):   (64, 256, 1, 4, 4),
-    ("o", 8192, 8):   (64, 256, 1, 4, 4),
-    ("o", 8192, 16):  (64, 256, 1, 4, 4),
-    ("o", 8192, 32):  (64, 256, 1, 4, 4),
-    ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4),
-    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 6),
-    ("qkv_gate", 2304, 16): (32, 256, 2, 4, 6),
-    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 5),
-    ("router", 256, 1):   (32, 256, 16, 4, 3),
-    ("router", 256, 8):   (32, 256, 16, 4, 3),
-    ("router", 256, 16):  (32, 256, 16, 4, 4),
-    ("router", 256, 32):  (32, 256, 8, 4, 4),
+    # (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma); with USE_TILED the tile shape is TILE_SHAPE[layer]
+    ("pooler", 4096, 1):   (32, 256, 1, 4, 8, True),
+    ("pooler", 4096, 8):   (32, 256, 1, 4, 6, True),      # 18.9 us in run 13180174
+    ("pooler", 4096, 16):  (32, 256, 1, 2, 6, True),
+    ("pooler", 4096, 32):  (32, 256, 1, 8, 6, True),
+    ("unpooler", 8192, 16): (32, 256, 1, 4, 8, True),
+    ("unpooler", 8192, 32): (32, 256, 1, 2, 6, True),
+    ("unpooler", 1024, 1): (32, 256, 4, 4, 4, True),
+    ("unpooler", 1024, 8): (32, 256, 4, 4, 6, True),
+    ("o", 8192, 1):   (64, 256, 1, 4, 4, True),
+    ("o", 8192, 8):   (64, 256, 1, 4, 6, True),
+    ("o", 8192, 16):  (64, 256, 1, 2, 4, False),
+    ("o", 8192, 32):  (64, 256, 1, 4, 5, True),
+    ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4, True),
+    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 6, True),
+    ("qkv_gate", 2304, 16): (32, 256, 2, 2, 4, False),
+    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 6, True),
+    ("router", 256, 1):   (32, 256, 16, 4, 3, False),
+    ("router", 256, 8):   (32, 256, 16, 4, 3, True),      # 6.4 us in run 78c2f421
+    ("router", 256, 16):  (32, 256, 16, 4, 4, True),
+    ("router", 256, 32):  (32, 256, 8, 4, 4, True),
 }
 
 
@@ -382,7 +382,8 @@ def _config(layer: str, m: int, n: int, k: int):
     if USE_TILED:
         cfg["tiled"] = True
         cfg["BLOCK_N"], cfg["BLOCK_K"] = TILE_SHAPE[layer]
-        cfg["tma"] = bool(TMA_BY_M.get(m, USE_TMA))
+        if cfg.get("tma") is None:
+            cfg["tma"] = bool(TMA_BY_M.get(m, USE_TMA))
         cfg["gemv"] = GEMV_M1 and m == 1
     elif USE_TMA:
         cfg["tma"] = True
@@ -399,15 +400,22 @@ SMEM_BUDGET = 200 * 1024
 
 # sweep: which m-slots fetch with TMA (the m <= 32 shapes cost the same bytes)
 TMA_BY_M = {1: False, 8: True, 16: True, 32: True}
-GEMV_M1 = True   # m == 1: plain-FMA GEMV instead of the tensor-core path
+GEMV_M1 = False  # m == 1: plain-FMA GEMV instead of the tensor-core path
 
 
 def _config_table(layer: str, m: int, n: int, k: int):
+    cfg = _config_table_(layer, m, n, k)
+    if cfg is not None:
+        cfg["tma"] = SWEEP.get((layer, n, m), (None,) * 6)[5]
+    return cfg
+
+
+def _config_table_(layer: str, m: int, n: int, k: int):
     bm = _block_m(m)
     if layer == "router":
         if m > 64:
             return None   # cuBLAS, one GEMM over [hi | lo]
-        bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), (16, 256, 8, 4, 4))
+        bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), (16, 256, 8, 4, 4, None))[:5]
         return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns)
     if m > MAX_TRITON_M:
         return None
@@ -417,7 +425,7 @@ def _config_table(layer: str, m: int, n: int, k: int):
         "pooler": (32, 256, 1, 4, 4),
         "unpooler": (32, 256, 1, 4, 4) if n > 1024 else (32, 256, 4, 4, 4),
     }[layer]
-    bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), default)
+    bn, bk, sk, nw, ns = SWEEP.get((layer, n, m), default + (None,))[:5]
     if bm > 32 and bk > 256:   # keep shared memory in budget for the 64-row tiles
         bk = 256
     return dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns)
