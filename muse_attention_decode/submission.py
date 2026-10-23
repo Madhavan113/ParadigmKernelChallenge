@@ -70,9 +70,10 @@ def _cache_to_act(x8, ACT: tl.constexpr, FP8_ASM: tl.constexpr):
     pair (exact); Triton's generic cast would spend three conversions per element."""
     if FP8_ASM:
         b = x8.to(tl.uint8, bitcast=True)
+        # 4 bytes in one register -> 4 fp16 in two (elements 0,1 then 2,3): no repacking
         return tl.inline_asm_elementwise(
-            asm="cvt.rn.f16x2.e4m3x2 $0, $1;", constraints="=r,h", args=[b],
-            dtype=tl.float16, is_pure=True, pack=2)
+            asm="{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $2; cvt.rn.f16x2.e4m3x2 $0, lo; cvt.rn.f16x2.e4m3x2 $1, hi; }",
+            constraints="=r,=r,r", args=[b], dtype=tl.float16, is_pure=True, pack=4)
     else:
         return x8.to(ACT)
 
@@ -101,6 +102,7 @@ def _attn_decode_kernel(
     L: tl.constexpr, HQ: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr,
     PS: tl.constexpr, WINDOW: tl.constexpr, ROPE: tl.constexpr, SPLITS: tl.constexpr,
     RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr, ACT: tl.constexpr, FP8_ASM: tl.constexpr,
+    CH: tl.constexpr,
 ):
     GROUP: tl.constexpr = HQ // HKV
     R: tl.constexpr = L * GROUP
@@ -214,20 +216,25 @@ def _attn_decode_kernel(
         ticket = tl.atomic_add(cnt_ptr + bh, 1, sem="acq_rel", scope="gpu")
         tl.debug_barrier()
         if ticket == SPLITS - 1:
+            # merge: max over splits, then weighted sums, CH splits per step (independent loads)
             m_all = tl.full((RB,), NEG, tl.float32)
-            for s2 in tl.static_range(SPLITS):
-                b2 = (bh * SPLITS + s2) * RB
-                m_all = tl.maximum(m_all, tl.load(ml_ptr + (b2 + rows) * 2, cache_modifier=".cg"))
+            for s0 in tl.static_range(0, SPLITS, CH):
+                sidx = s0 + tl.arange(0, CH)
+                b2 = (bh * SPLITS + sidx) * RB                                  # [CH]
+                m2 = tl.load(ml_ptr + (b2[:, None] + rows[None, :]) * 2, cache_modifier=".cg")   # [CH, RB]
+                m_all = tl.maximum(m_all, tl.max(m2, 0))
             l_all = tl.zeros((RB,), tl.float32)
             o = tl.zeros((RB, D), tl.float32)
-            for s2 in tl.static_range(SPLITS):
-                b2 = (bh * SPLITS + s2) * RB
-                m2 = tl.load(ml_ptr + (b2 + rows) * 2, cache_modifier=".cg")
-                l2 = tl.load(ml_ptr + (b2 + rows) * 2 + 1, cache_modifier=".cg")
-                a2 = tl.load(part_ptr + (b2 + rows)[:, None] * D + d[None, :], cache_modifier=".cg")
-                w = tl.exp2(m2 - m_all)
-                l_all += l2 * w
-                o += a2 * w[:, None]
+            for s0 in tl.static_range(0, SPLITS, CH):
+                sidx = s0 + tl.arange(0, CH)
+                b2 = (bh * SPLITS + sidx) * RB
+                m2 = tl.load(ml_ptr + (b2[:, None] + rows[None, :]) * 2, cache_modifier=".cg")
+                l2 = tl.load(ml_ptr + (b2[:, None] + rows[None, :]) * 2 + 1, cache_modifier=".cg")
+                a2 = tl.load(part_ptr + (b2[:, None, None] + rows[None, :, None]) * D + d[None, None, :],
+                             cache_modifier=".cg")                                 # [CH, RB, D]
+                w = tl.exp2(m2 - m_all[None, :])                                    # [CH, RB]
+                l_all += tl.sum(l2 * w, 0)
+                o += tl.sum(a2 * w[:, :, None], 0)
             o = o / l_all[:, None]
             ss = tl.sum(o * o, 1) / D
             o = o * tl.rsqrt(ss + RMS_EPS)[:, None]
@@ -275,7 +282,7 @@ def _plan(cfg):
     rb = max(16, triton.next_power_of_2(L * (cfg["num_q_heads"] // hkv)))   # dots need >= 16 rows
     cap = 128 if rb <= 16 else 32
     if cfg["window"]:
-        splits = max(1, min(16 if rb <= 16 else 8, 512 // ctas))
+        splits = max(1, min(16, 512 // ctas))
         block_t = 64 if cfg["window"] <= 2048 else 128
     else:
         splits = max(1, min(cap, 1024 // ctas))
@@ -300,6 +307,8 @@ def _attention_forward(data) -> torch.Tensor:
     page_table = data["page_table"]
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
+    ch = min(splits, 8 if rb <= 16 else 4)        # splits merged per load group
+    nw = 4 if rb <= 16 else 8
     _attn_decode_kernel[grid](
         qkv, data["cache_loc"], data["seq_lens"], page_table,
         data["k_cache"], data["v_cache"], data["k_scale"], data["v_scale"],
@@ -308,7 +317,7 @@ def _attention_forward(data) -> torch.Tensor:
         math.log2(theta) if theta else 0.0,
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
         ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t, ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
-        num_warps=4, num_stages=3,
+        CH=ch, num_warps=nw, num_stages=3,
     )
     return out
 # == END SHARED attn ==

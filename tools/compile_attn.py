@@ -14,9 +14,9 @@ sig = {"qkv_ptr": "*bf16", "loc_ptr": "*i64", "seq_ptr": "*i32", "pt_ptr": "*i32
        "kscale_ptr": "*fp32", "vscale_ptr": "*fp32", "out_ptr": "*bf16", "part_ptr": "*fp32", "ml_ptr": "*fp32", "cnt_ptr": "*i32",
        "max_pages": "i32", "qk_scale": "fp32", "sm_scale_log2": "fp32", "log2_theta": "fp32",
        "L": "constexpr", "HQ": "constexpr", "HKV": "constexpr", "D": "constexpr", "PS": "constexpr", "WINDOW": "constexpr",
-       "ROPE": "constexpr", "SPLITS": "constexpr", "RB": "constexpr", "LB": "constexpr", "BLOCK_T": "constexpr", "ACT": "constexpr", "FP8_ASM": "constexpr"}
+       "ROPE": "constexpr", "SPLITS": "constexpr", "RB": "constexpr", "LB": "constexpr", "BLOCK_T": "constexpr", "ACT": "constexpr", "FP8_ASM": "constexpr", "CH": "constexpr"}
 consts = {"L": L, "HQ": HQ, "HKV": HKV, "D": D, "PS": PS, "WINDOW": WINDOW, "ROPE": WINDOW > 0, "SPLITS": SPLITS,
-          "RB": RB, "LB": 16, "BLOCK_T": BLOCK_T, "ACT": tl.float16, "FP8_ASM": True}
+          "RB": RB, "LB": 16, "BLOCK_T": BLOCK_T, "ACT": tl.float16, "FP8_ASM": True, "CH": min(SPLITS, 8 if RB <= 16 else 4)}
 names = list(sig)
 attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if sig[n].startswith("*")}
 src = ASTSource(fn=S._attn_decode_kernel, signature=sig, constexprs=consts, attrs=attrs)
