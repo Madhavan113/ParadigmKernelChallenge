@@ -173,16 +173,16 @@ void skinny_gemm(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tens
     __nv_bfloat16* ob = out.scalar_type() == at::kBFloat16 ? reinterpret_cast<__nv_bfloat16*>(out.data_ptr()) : nullptr;
     float* of = out.scalar_type() == at::kFloat ? out.data_ptr<float>() : nullptr;
     const int ldx = (int)X.stride(0), ldw = (int)W.stride(0), ldo = (int)out.stride(0);
-    const int key = (int)bm * 100 + (int)bn * 10 + (two_w ? 1 : 0);
+    const int key = (int)bm * 100 + (int)bn + (two_w ? 10000 : 0);
     switch (key) {
-        case 1616 + 0: launch<16, 16, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
-        case 1616 + 1: launch<16, 16, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
-        case 1616 + 160: launch<16, 32, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
-        case 1616 + 161: launch<16, 32, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
-        case 3216 + 0: launch<32, 16, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
-        case 3216 + 1: launch<32, 16, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
-        case 3216 + 160: launch<32, 32, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
-        case 3216 + 161: launch<32, 32, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 1616:  launch<16, 16, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 11616: launch<16, 16, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 1632:  launch<16, 32, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 11632: launch<16, 32, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 3216:  launch<32, 16, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 13216: launch<32, 16, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 3232:  launch<32, 32, false>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
+        case 13232: launch<32, 32, true>(Xp, ldx, M, Wp, W2p, ldw, ob, of, ldo, K, N, stream); break;
         default: TORCH_CHECK(false, "unsupported (bm, bn)");
     }
 }
