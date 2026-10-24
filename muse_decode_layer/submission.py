@@ -579,7 +579,7 @@ USE_TMA = False  # fetch tiles with TMA descriptors (box inner dim <= 256 elemen
 _OVERRIDE = None   # a config dict, during in-prepare benchmarking
 
 
-CUDA_SHAPES = {}   # (layer, n, m) -> (BM, BN): use the CUDA skinny GEMM for this shape
+CUDA_SHAPES = {}   # (layer, n, m) -> (BM, BN): CUDA skinny GEMM; measured slower than the Triton kernel on every shape (run cuda2), so unused
 
 
 def _config(layer: str, m: int, n: int, k: int):
