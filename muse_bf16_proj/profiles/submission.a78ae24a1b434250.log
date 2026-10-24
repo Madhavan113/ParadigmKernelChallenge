@@ -1,0 +1,38 @@
+BENCH proj: us per call (warm L2), configs = (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)
+  pooler    (32, 256, 1, 4, 4, True)         m1   37.8 m8   37.0 m16   38.1 m32   37.7
+  pooler    (32, 256, 1, 4, 6, True)         m1   36.7 m8   36.9 m16   37.1 m32   37.6
+  pooler    (32, 256, 1, 4, 8, True)         m1   36.7 m8   39.8 m16   36.9 m32   37.2
+  pooler    (32, 256, 2, 4, 4, True)         m1   37.2 m8   37.8 m16   36.3 m32   37.4
+  pooler    (32, 256, 1, 4, 4, False)        m1   23.0 m8   23.1 m16   22.8 m32   24.8
+  pooler    (32, 256, 1, 4, 6, False)        m1   22.7 m8   22.6 m16   22.7 m32   24.4
+  pooler    (32, 256, 1, 2, 6, True)         m1   36.2 m8   37.3 m16   37.4 m32   37.6
+  pooler    (32, 256, 1, 8, 6, True)         m1   36.9 m8   37.5 m16   37.5 m32   37.1
+  unpooler  (32, 256, 1, 4, 4, True)         m1   36.2 m8   36.9 m16   34.6 m32   34.3
+  unpooler  (32, 256, 1, 4, 6, True)         m1   36.9 m8   36.7 m16   35.0 m32   34.9
+  unpooler  (32, 256, 1, 4, 8, True)         m1   36.2 m8   36.9 m16   34.7 m32   35.6
+  unpooler  (32, 256, 2, 4, 4, True)         m1   36.4 m8   36.9 m16   34.5 m32   35.2
+  unpooler  (32, 256, 1, 4, 6, False)        m1   21.9 m8   21.7 m16   23.4 m32   26.1
+  unpooler  (32, 256, 4, 4, 4, True)         m1   39.3 m8   38.6 m16   36.7 m32   37.6
+  unpooler  (32, 256, 4, 4, 6, True)         m1   39.8 m8   38.6 m16   41.5 m32   41.5
+  unpooler  (32, 256, 8, 4, 4, True)         m1   38.3 m8   38.6 m16   36.8 m32   38.5
+  o         (64, 256, 1, 4, 4, True)         m1   36.1 m8   36.5 m16   35.8 m32   36.7
+  o         (64, 256, 1, 4, 5, True)         m1   36.5 m8   36.3 m16   37.1 m32   39.2
+  o         (64, 256, 1, 4, 4, False)        m1   21.1 m8   21.2 m16   21.1 m32   21.6
+  o         (64, 256, 1, 2, 4, True)         m1   35.9 m8   36.3 m16   34.8 m32   35.7
+  o         (64, 256, 1, 8, 4, True)         m1   35.6 m8   36.4 m16   35.8 m32   36.2
+  o         (64, 256, 2, 4, 4, True)         m1   36.6 m8   37.0 m16   36.8 m32   36.4
+  qkv_gate  (32, 256, 4, 4, 4, True)         m1   35.2 m8   34.5 m16   33.2 m32   33.2
+  qkv_gate  (32, 256, 4, 4, 6, True)         m1   36.7 m8   34.6 m16   33.9 m32   34.7
+  qkv_gate  (32, 256, 2, 4, 6, True)         m1   36.1 m8   37.3 m16   37.8 m32   37.2
+  qkv_gate  (32, 256, 8, 4, 4, True)         m1   34.3 m8   36.6 m16   34.4 m32   34.0
+  qkv_gate  (32, 256, 4, 4, 4, False)        m1   21.9 m8   21.7 m16   21.0 m32   21.5
+  qkv_gate  (32, 256, 2, 4, 4, False)        m1   22.0 m8   21.9 m16   21.5 m32   22.0
+  qkv_gate  (32, 256, 1, 4, 6, True)         m1   34.0 m8   33.2 m16   33.4 m32   33.6
+  router    (32, 256, 16, 4, 3, True)        m1   35.3 m8   36.1 m16   36.0 m32   35.6
+  router    (32, 256, 16, 4, 3, False)       m1   21.0 m8   20.9 m16   22.1 m32   21.4
+  router    (32, 256, 8, 4, 4, True)         m1   35.8 m8   35.9 m16   36.8 m32   35.4
+    router (32, 256, 8, 4, 6, True) 32 out of resource: shared memory, Required: 245848, Hardware limit: 232448. Reducing block sizes or `n
+  router    (32, 256, 8, 4, 6, True)         m1   37.2 m8   37.0 m16   36.0 m32  fail
+  router    (32, 256, 16, 4, 4, True)        m1   35.9 m8   34.9 m16   36.2 m32   35.8
+  router    (32, 256, 32, 4, 3, True)        m1   35.6 m8   36.2 m16   36.2 m32   35.5
+BENCH proj done in 18s
