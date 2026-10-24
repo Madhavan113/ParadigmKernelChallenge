@@ -913,6 +913,7 @@ POST_NORM_EPS = 1e-8
 MAX_M = 1024
 NUM_SMS = 132
 MOE_OUT_DTYPE = torch.bfloat16
+MOE_BACKEND = "marlin"   # "marlin": SGLang's W4A16 GEMMs with this file's routing/finalize; "triton": this file's GEMMs
 DEQUANT_ASM = True          # inline PTX for the nibble -> fp16 placement (False: plain Triton ops)
 SCALE_3D = tl.constexpr(False)   # scale expansion: 3-D broadcast instead of 4 interleaves
 SCALE_VARIANT = tl.constexpr(4)  # scaled-asm dequant: 2 = interleave-expanded scales, 3 = broadcast-reshape
@@ -928,9 +929,10 @@ SCALE_FIX = 2.0 ** 14       # folded into the global scales: the placement trick
 def _route_kernel(
     ids_ptr, x_ptr, x16_ptr,
     sorted_tok_ptr, row_of_pair_ptr, blk_e_ptr, blk_row0_ptr, blk_end_ptr, nblk_ptr,
+    sorted_pair_ptr, lids_ptr, npad_ptr,
     M, local_start, n_elems, n_route_ctas,
     PB: tl.constexpr, CH: tl.constexpr, BM: tl.constexpr, MAXB: tl.constexpr, E: tl.constexpr,
-    TOPK: tl.constexpr, XBLOCK: tl.constexpr,
+    TOPK: tl.constexpr, XBLOCK: tl.constexpr, MARLIN: tl.constexpr,
 ):
     """Sort-free routing. CTA c < n_route_ctas owns pairs [c*PB, (c+1)*PB): each pair's rank among
     the pairs of its expert (how many earlier pairs route there) gives its padded row; every CTA
@@ -966,6 +968,10 @@ def _route_kernel(
     row = tl.sum(onehot * pad_off[None, :], 1) + rank
     tl.store(sorted_tok_ptr + row, i // TOPK, mask=is_local)
     tl.store(row_of_pair_ptr + i, tl.where(is_local, row, -1), mask=valid)
+    if MARLIN:
+        # Marlin's moe_align_block_size format: pair indices grouped by expert, padding = npairs
+        tl.store(sorted_pair_ptr + row, i, mask=is_local)
+        tl.store(lids_ptr + i, tl.where(is_local, e, -1), mask=valid)
     if pid == 0:
         nb = padded // BM
         blk_off = tl.cumsum(nb, 0) - nb
@@ -981,6 +987,12 @@ def _route_kernel(
         tl.store(blk_row0_ptr + j, po + (j - bo) * BM, mask=jm)
         tl.store(blk_end_ptr + j, po + ce2, mask=jm)
         tl.store(nblk_ptr, total)
+        if MARLIN:
+            tl.store(npad_ptr, total * BM)
+            pj = tl.arange(0, BM)
+            prow = (pad_off + counts)[:, None] + pj[None, :]                       # [E, BM]
+            pm = pj[None, :] < (padded - counts)[:, None]
+            tl.store(sorted_pair_ptr + prow, tl.full((E, BM), 0, tl.int32) + npairs, mask=pm)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1254,6 +1266,22 @@ def _finalize_kernel(y_ptr, row_of_pair_ptr, tw_ptr, nw_ptr, out_ptr, eps,
     tl.store(out_ptr + t * H + d, acc.to(out_ptr.dtype.element_ty))
 
 
+@triton.jit
+def _finalize_pairs_kernel(y_ptr, lids_ptr, tw_ptr, nw_ptr, out_ptr, eps, H: tl.constexpr, TOPK: tl.constexpr):
+    t = tl.program_id(0)
+    d = tl.arange(0, H)
+    nw = tl.load(nw_ptr + d)
+    acc = tl.zeros((H,), dtype=tl.float32)
+    for s in tl.static_range(TOPK):
+        ok = tl.load(lids_ptr + t * TOPK + s) >= 0
+        y = tl.load(y_ptr + (t * TOPK + s) * H + d, mask=ok & (d < H), other=0.0).to(tl.float32) * nw
+        ms = tl.sum(y * y, 0) / H
+        y = y * tl.rsqrt(ms + eps)
+        g = tl.load(tw_ptr + t * TOPK + s)
+        acc += tl.where(ok, g, 0.0) * y
+    tl.store(out_ptr + t * H + d, acc.to(out_ptr.dtype.element_ty))
+
+
 # ----------------------------------------------------------------------------------------------
 # host side
 # ----------------------------------------------------------------------------------------------
@@ -1318,11 +1346,123 @@ def _moe_state(weights) -> dict:
         "nblk": torch.zeros((1,), dtype=torch.int32, device=dev),
         "inter": torch.empty((rows_max, I), dtype=torch.float16, device=dev),
         "y": torch.empty((rows_max, H), dtype=torch.bfloat16, device=dev),
+        "sorted_pair": torch.zeros((rows_max,), dtype=torch.int32, device=dev),
+        "lids": torch.full((NP,), -1, dtype=torch.int32, device=dev),
+        "npad": torch.zeros((1,), dtype=torch.int32, device=dev),
     })
+    if MOE_BACKEND == "marlin":
+        try:
+            state["bank"] = _marlin_bank(weights)
+            state["cache13"] = torch.empty((MAX_M * TOPK * max(2 * I, H),), dtype=torch.bfloat16, device=dev)
+            state["cache2"] = torch.empty((MAX_M * TOPK * I,), dtype=torch.bfloat16, device=dev)
+        except Exception as e:   # not in the image: the Triton experts
+            print("marlin unavailable:", repr(e)[:120])
     return state
 
 
+def _marlin_bank(weights):
+    """The local experts in Marlin's layout, through SGLang's own loader step (the stock path)."""
+    import types
+    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace
+    from sglang.srt.layers.quantization.marlin_utils_fp4 import prepare_moe_nvfp4_layer_for_marlin
+    w13 = weights["w13"][:LOCAL]
+    layer = types.SimpleNamespace(
+        quant_config=types.SimpleNamespace(group_size=16),
+        moe_runner_config=types.SimpleNamespace(is_gated=True),
+        intermediate_size_per_partition=w13.shape[1] // 2,
+        params_dtype=torch.bfloat16,
+        w13_weight=w13.contiguous(), w2_weight=weights["w2"][:LOCAL].contiguous(),
+        w13_weight_scale=weights["w13_sf"][:LOCAL].contiguous(), w2_weight_scale=weights["w2_sf"][:LOCAL].contiguous(),
+        w13_weight_scale_2=weights["w13_gs"][:LOCAL].contiguous(), w2_weight_scale_2=weights["w2_gs"][:LOCAL].contiguous())
+    prepare_moe_nvfp4_layer_for_marlin(layer)
+    device = w13.device
+    torch.cuda.synchronize()
+    return {"w13": layer.w13_weight.data, "w13_s": layer.w13_weight_scale.data, "w13_gs": layer.w13_weight_scale_2.data,
+            "w2": layer.w2_weight.data, "w2_s": layer.w2_weight_scale.data, "w2_gs": layer.w2_weight_scale_2.data,
+            "size_n": layer.intermediate_size_per_partition,
+            "workspace": marlin_make_workspace(device, max_blocks_per_sm=4)}
+
+
+def _route(x, ids, local_start: int, BM: int, state, marlin: bool):
+    """Runs the routing kernel (plus the fp16 copy of x for the Triton GEMMs); returns (NP, MAXB)."""
+    M, H = x.shape
+    NP = max(16, triton.next_power_of_2(M * TOPK))
+    MAXB = triton.next_power_of_2(NP // BM + LOCAL)
+    x16 = state["x16"][:M]
+    XBLOCK = 4096
+    n_elems = M * H
+    PB = min(NP, 64)                      # pairs per routing CTA
+    CH = min(NP, 256)                     # pairs scanned per step
+    n_route = triton.cdiv(M * TOPK, PB)
+    grid0 = (n_route + (0 if marlin else triton.cdiv(n_elems, XBLOCK)),)
+    _route_kernel[grid0](
+        ids, x, x16,
+        state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
+        state["sorted_pair"], state["lids"], state["npad"],
+        M, local_start, n_elems, n_route,
+        PB=PB, CH=CH, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, MARLIN=marlin, num_warps=4,
+    )
+    return NP, MAXB
+
+
+MARLIN_BLOCK_M = (8, 16, 32, 48, 64)   # MuseSpark1xFp4Experts' candidates, smallest first
+
+
+def _marlin_block_m(num_tokens: int) -> int:
+    bm = MARLIN_BLOCK_M[0]
+    for b in MARLIN_BLOCK_M:
+        if num_tokens * TOPK / LOCAL / b < 0.9:
+            break
+        bm = b
+    return bm
+
+
+def _moe_forward_marlin(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
+    """Experts through SGLang's Marlin W4A16 GEMMs, with this file's routing (one launch, in
+    Marlin's sorted-ids format) and finalize."""
+    from sgl_kernel.scalar_type import scalar_types
+    from sglang.kernels.ops.activation.activation import silu_and_mul
+    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm
+    M, H = x.shape
+    bank = state["bank"]
+    x = x.contiguous()
+    if ids.dtype != torch.int32:
+        ids = ids.to(torch.int32)
+    ids = ids.contiguous()
+    tw = tw.contiguous()
+    BM = _marlin_block_m(M)
+    _route(x, ids, local_start, BM, state, marlin=True)
+    out = torch.empty((M, H), dtype=MOE_OUT_DTYPE, device=x.device)
+    size_n = bank["size_n"]
+    gemm1_n = 2 * size_n
+    lids = state["lids"][: M * TOPK].view(M, TOPK)
+    sorted_ids = state["sorted_pair"]
+    cache1 = state["cache13"][: M * TOPK * gemm1_n].view(-1, gemm1_n)
+    cache2 = state["cache2"][: M * TOPK * size_n].view(-1, size_n)
+    cache3 = state["cache13"][: M * TOPK * H].view(-1, H)
+    common = dict(moe_block_size=BM, mul_topk_weights=False, is_ep=True, b_q_type=scalar_types.float4_e2m1f,
+                  is_k_full=True, use_atomic_add=False, use_fp32_reduce=True, is_zp_float=False)
+    ws = bank["workspace"]
+    cache1 = moe_wna16_marlin_gemm(
+        x, cache1, bank["w13"], None, bank["w13_s"], bank["w13_gs"], None, None, None, ws,
+        sorted_ids, state["blk_e"], state["npad"], tw, top_k=TOPK,
+        size_m=M, size_n=gemm1_n, size_k=H, **common)
+    silu_and_mul(cache1.view(-1, gemm1_n), cache2, expert_ids=lids.view(-1), expert_step=1)
+    y = moe_wna16_marlin_gemm(
+        cache2, cache3, bank["w2"], None, bank["w2_s"], bank["w2_gs"], None, None, None, ws,
+        sorted_ids, state["blk_e"], state["npad"], tw, top_k=1,
+        size_m=M * TOPK, size_n=H, size_k=size_n, **common).view(M * TOPK, H)
+    _finalize_pairs_kernel[(M,)](y, lids, tw, state["norm_w"], out, POST_NORM_EPS, H=H, TOPK=TOPK, num_warps=4)
+    return out
+
+
 def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
+    if "bank" in state:
+        return _moe_forward_marlin(x, ids, tw, local_start, I, state)
+    return _moe_forward_triton(x, ids, tw, local_start, I, state)
+
+
+def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
     """x [M, H] (bf16), ids [M, 8] global expert ids, tw [M, 8] fp32: the local experts'
     weighted post-normed outputs summed per token, bf16 [M, H]. Experts local_start .. +31 use
     w13[0..31]."""
@@ -1336,21 +1476,8 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
     out = torch.empty((M, H), dtype=MOE_OUT_DTYPE, device=dev)
 
     BM, BN, BK, nw, ns = _gemm_config(M)
-    NP = max(16, triton.next_power_of_2(M * TOPK))
-    MAXB = triton.next_power_of_2(NP // BM + LOCAL)
+    NP, MAXB = _route(x, ids, local_start, BM, state, marlin=False)
     x16 = state["x16"][:M]
-    XBLOCK = 4096
-    n_elems = M * H
-    PB = min(NP, 64)                      # pairs per routing CTA
-    CH = min(NP, 256)                     # pairs scanned per step
-    n_route = triton.cdiv(M * TOPK, PB)
-    grid0 = (n_route + triton.cdiv(n_elems, XBLOCK),)
-    _route_kernel[grid0](
-        ids, x, x16,
-        state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-        M, local_start, n_elems, n_route,
-        PB=PB, CH=CH, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, num_warps=4,
-    )
     w13, w13_sf, w2, w2_sf = state["w13"], state["w13_sf"], state["w2"], state["w2_sf"]
     max_items = (NP // BM + LOCAL) * (max(I, H) // BN)
     num_ctas = min(_CTAS_PER_SM * NUM_SMS, max_items)
@@ -1381,75 +1508,6 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
         H=H, TOPK=TOPK, num_warps=4,
     )
     return out
-
-
-# ---- SGLang's own Marlin W4A16 expert path (as the stock layer runs it), selectable ----
-MOE_BACKEND = "marlin"   # "marlin": SGLang's moe_wna16_marlin_gemm; "triton": this repo's kernels
-try:
-    import types as _types
-    from sgl_kernel.scalar_type import scalar_types as _scalar_types
-    from sglang.kernels.ops.activation.activation import silu_and_mul as _silu_and_mul
-    from sglang.kernels.ops.moe.moe_wna16_marlin import moe_wna16_marlin_gemm as _marlin_gemm
-    from sglang.kernels.ops.muse_spark_v12.fused_post_expert_norm_weighted_sum_triton import (
-        fused_post_expert_norm_weighted_sum as _post_norm_sum)
-    from sglang.srt.layers.moe.fused_moe_triton import moe_align_block_size as _moe_align
-    from sglang.srt.layers.quantization.marlin_utils import marlin_make_workspace as _marlin_ws
-    from sglang.srt.layers.quantization.marlin_utils_fp4 import prepare_moe_nvfp4_layer_for_marlin as _marlin_prep
-    _HAVE_MARLIN = True
-except Exception:   # not in the image (or no CUDA): fall back to the Triton experts
-    _HAVE_MARLIN = False
-
-_MARLIN_BLOCK_M = (8, 16, 32, 48, 64)
-
-
-def _marlin_bank(weights):
-    device = weights["w13"].device
-    layer = _types.SimpleNamespace(
-        quant_config=_types.SimpleNamespace(group_size=16),
-        moe_runner_config=_types.SimpleNamespace(is_gated=True),
-        intermediate_size_per_partition=weights["w13"].shape[1] // 2,
-        params_dtype=torch.bfloat16,
-        w13_weight=weights["w13"].contiguous(), w2_weight=weights["w2"].contiguous(),
-        w13_weight_scale=weights["w13_sf"].contiguous(), w2_weight_scale=weights["w2_sf"].contiguous(),
-        w13_weight_scale_2=weights["w13_gs"].contiguous(), w2_weight_scale_2=weights["w2_gs"].contiguous())
-    _marlin_prep(layer)
-    expert_map = torch.full((N_EXPERTS,), -1, dtype=torch.int32, device=device)
-    expert_map[:LOCAL] = torch.arange(LOCAL, dtype=torch.int32, device=device)
-    return {"w13": layer.w13_weight.data, "w13_s": layer.w13_weight_scale.data, "w13_gs": layer.w13_weight_scale_2.data,
-            "w2": layer.w2_weight.data, "w2_s": layer.w2_weight_scale.data, "w2_gs": layer.w2_weight_scale_2.data,
-            "expert_map": expert_map, "size_n": layer.intermediate_size_per_partition,
-            "workspace": _marlin_ws(device, max_blocks_per_sm=4),
-            "post_w": (weights["post_expert_norm"].float() + 1.0).to(torch.bfloat16).contiguous()}
-
-
-def _experts_marlin(x, topk_weights, local_ids, bank):
-    """x bf16 [T, 4096], local_ids int32 [T, 8] (0-31 local, else another GPU's): the weighted,
-    post-normed local expert outputs, bf16 [T, 4096]."""
-    num_tokens, size_k = x.shape
-    size_n = bank["size_n"]
-    gemm1_n = 2 * size_n
-    ids = bank["expert_map"][local_ids].contiguous()
-    tw = topk_weights.to(torch.float32).contiguous()
-    for block_size_m in _MARLIN_BLOCK_M:
-        if num_tokens * TOP_K / LOCAL / block_size_m < 0.9:
-            break
-    sorted_ids, block_experts, n_padded = _moe_align(ids, block_size_m, N_EXPERTS)
-    cache2 = torch.empty((num_tokens * TOP_K, size_n), device=x.device, dtype=x.dtype)
-    cache13 = torch.empty((num_tokens * TOP_K * max(gemm1_n, size_k),), device=x.device, dtype=x.dtype)
-    cache1 = cache13[: num_tokens * TOP_K * gemm1_n].view(-1, gemm1_n)
-    cache3 = cache13[: num_tokens * TOP_K * size_k].view(-1, size_k)
-    common = dict(moe_block_size=block_size_m, mul_topk_weights=False, is_ep=True,
-                  b_q_type=_scalar_types.float4_e2m1f, is_k_full=True, use_atomic_add=False,
-                  use_fp32_reduce=True, is_zp_float=False)
-    ws = bank["workspace"]
-    cache1 = _marlin_gemm(x, cache1, bank["w13"], None, bank["w13_s"], bank["w13_gs"], None, None, None, ws,
-                          sorted_ids, block_experts, n_padded, tw, top_k=TOP_K,
-                          size_m=num_tokens, size_n=gemm1_n, size_k=size_k, **common)
-    _silu_and_mul(cache1.view(-1, gemm1_n), cache2, expert_ids=ids.view(-1), expert_step=1)
-    y = _marlin_gemm(cache2, cache3, bank["w2"], None, bank["w2_s"], bank["w2_gs"], None, None, None, ws,
-                     sorted_ids, block_experts, n_padded, tw, top_k=1,
-                     size_m=num_tokens * TOP_K, size_n=size_k, size_k=size_n, **common).view(num_tokens, TOP_K, size_k)
-    return _post_norm_sum(y, tw, norm_weight=bank["post_w"], eps=EPS_POST, weight_first=True, slot_expert_ids=ids)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -1535,9 +1593,6 @@ def prepare(weights):
                       ("next_pre_attn_norm", "next_gain"), ("pre_expert_norm", "pre_expert_gain")):
         state[key] = (1.0 + weights[name].float()).contiguous()
     state["router_bias"] = weights["router_bias"].float().contiguous()
-    if MOE_BACKEND == "marlin" and _HAVE_MARLIN:
-        state["bank"] = _marlin_bank(weights)
-        torch.cuda.synchronize()
     return state
 
 
@@ -1569,10 +1624,7 @@ def kernel_fn(data, state):
     pp = _proj_forward(h, "pooler", D_EXPERT, state)
     p = torch.empty((T, D_EXPERT), dtype=ACT_TORCH, device=dev)
     _rms_gain_kernel[(T,)](pp, state["pre_expert_gain"], p, EPS_RMS, N=D_EXPERT, num_warps=4)
-    if "bank" in state:
-        moe = _experts_marlin(p, tw, lids, state["bank"])
-    else:
-        moe = _moe_forward(p, lids, tw, 0, D_EXPERT, state)
+    moe = _moe_forward(p, lids, tw, 0, D_EXPERT, state)   # Marlin GEMMs with this file's routing (shared moe region)
     n_un = UNPOOL_SLICE if T <= SLICED_MAX_TOKENS else HIDDEN
     f = _proj_forward(moe, "unpooler", n_un, state)
     stream2 = torch.empty((T, HIDDEN), dtype=torch.float32, device=dev)

@@ -27,6 +27,30 @@ for k in ("w13_sf", "w2_sf"):
     state[k] = state[k].to(torch.float16)
 state["y"] = state["y"].to(torch.float16)
 
+# Marlin-format routing check (the GEMMs themselves need the GPU)
+for bs in (1, 9, 33):
+    data = R.generate_input(bs, "ep8", seed=5 + bs, dist="normal", device=dev)
+    ids = data["topk_ids"]
+    BM = S._marlin_block_m(bs)
+    S._route(data["hidden_states"].to(torch.float16), ids, 0, BM, state, marlin=True)
+    npairs = bs * 8
+    flat = ids.flatten().tolist()
+    exp_sorted, exp_blk = [], []
+    for e in range(32):
+        pairs = [i for i, v in enumerate(flat) if v == e]
+        if not pairs: continue
+        pad = (-len(pairs)) % BM
+        exp_sorted += sorted(pairs) + [npairs] * pad
+        exp_blk += [e] * ((len(pairs) + pad) // BM)
+    npad = int(state["npad"][0])
+    got_sorted = state["sorted_pair"][:npad].tolist()
+    got_blk = state["blk_e"][:len(exp_blk)].tolist()
+    # within an expert's run the order of pairs is by pair index (rank counting), padding last
+    ok = (npad == len(exp_sorted) and got_sorted == exp_sorted and got_blk == exp_blk
+          and state["lids"][:npairs].tolist() == [v if v < 32 else -1 for v in flat])
+    print(f"marlin routing bs={bs} BM={BM} npad={npad} -> {ok}", flush=True)
+    assert ok
+
 cases = [(1, "normal"), (4, "normal"), (9, "skewed")]
 if not fast:
     cases += [(33, "normal"), (17, "skewed")]
