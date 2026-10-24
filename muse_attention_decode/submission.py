@@ -286,12 +286,82 @@ def _plan(cfg):
     else:
         splits = max(1, min(cap, 1024 // ctas))
     splits = 1 << (splits.bit_length() - 1)   # a power of two: the combine merges CH splits at a time
-    block_t = 64   # smaller tiles: less shared memory per CTA, more CTAs resident per SM
+    block_t = 128
     lb = 16
     return splits, block_t, rb, lb
 
 
+_PLAN_OVERRIDE = None   # (splits, block_t, warps, stages) during benchmarking
+ATTN_BENCH = True       # one on-device sweep in the first eager call (never under graph capture)
+_BENCH_DONE = False
+
+
+def _attn_bench(data):
+    """Times kernel configurations on synthetic inputs shaped like the scored cases; prints."""
+    import time
+    global _PLAN_OVERRIDE
+    t0 = time.time()
+    dev = data["qkv"].device
+    cfg0 = dict(data["config"])
+    HQ, HKV, D = cfg0["num_q_heads"], cfg0["num_kv_heads"], cfg0["head_dim"]
+    g = torch.Generator(device=dev).manual_seed(0)
+
+    def make(B, L, window, ctx=80000):
+        pages = B * (ctx + 8)
+        k_cache = torch.randn((pages, 1, HKV, D), generator=g, device=dev).to(torch.float8_e4m3fn)
+        v_cache = torch.randn((pages, 1, HKV, D), generator=g, device=dev).to(torch.float8_e4m3fn)
+        seq = torch.full((B,), ctx, dtype=torch.int32, device=dev)
+        page_table = torch.randperm(pages, generator=g, device=dev).to(torch.int32).view(B, ctx + 8)
+        pos = (seq.long()[:, None] + torch.arange(L, device=dev)).reshape(-1)
+        loc = torch.gather(page_table.long(), 1, pos.view(B, L)).reshape(-1)
+        qkv = torch.randn((B, L, (2 * HQ + 2 * HKV) * D), generator=g, device=dev).to(torch.bfloat16)
+        c = dict(cfg0, batch=B, q_len=L, page_size=1, window=window, rope_theta=500000.0 if window else 0.0)
+        return {"qkv": qkv, "cache_loc": loc, "seq_lens": seq, "page_table": page_table, "k_cache": k_cache,
+                "v_cache": v_cache, "k_scale": data["k_scale"], "v_scale": data["v_scale"], "config": c}
+
+    def timeit(fn, reps=5):
+        fn(); fn()
+        torch.cuda.synchronize()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(reps):
+            fn()
+        e1.record()
+        torch.cuda.synchronize()
+        return e0.elapsed_time(e1) * 1000.0 / reps
+
+    print("BENCH attention: us per call (warm L2); config = (splits, block_t, warps, stages)")
+    cases = [("B16 L1 full", make(16, 1, 0)), ("B16 L8 full", make(16, 8, 0)), ("B32 L8 sliding", make(32, 8, 2048)),
+             ("B1 L8 full", make(1, 8, 0))]
+    plans = {
+        "B16 L1 full": [(32, 128, 4, 3), (32, 128, 4, 2), (32, 256, 4, 3), (32, 128, 2, 3), (16, 128, 4, 3), (64, 128, 4, 3), (32, 128, 4, 4)],
+        "B16 L8 full": [(32, 128, 4, 3), (32, 128, 4, 2), (32, 256, 4, 2), (32, 64, 4, 3), (16, 128, 4, 3), (32, 128, 8, 2), (64, 128, 4, 3)],
+        "B32 L8 sliding": [(8, 128, 4, 3), (8, 64, 4, 3), (4, 128, 4, 3), (16, 128, 4, 3), (8, 128, 8, 2), (8, 256, 4, 2)],
+        "B1 L8 full": [(32, 128, 4, 3), (64, 128, 4, 3), (128, 128, 4, 3), (32, 256, 4, 2), (64, 64, 4, 3)],
+    }
+    for name, d in cases:
+        for plan in plans[name]:
+            if time.time() - t0 > 150:
+                print("BENCH budget reached"); break
+            _PLAN_OVERRIDE = plan
+            try:
+                us = timeit(lambda: _attention_forward(d))
+                print(f"  {name:15s} {str(plan):20s} {us:9.1f} us")
+            except Exception as e:
+                print(f"  {name:15s} {str(plan):20s} failed: {str(e)[:90]}")
+        _PLAN_OVERRIDE = None
+    _PLAN_OVERRIDE = None
+    print(f"BENCH attention done in {time.time() - t0:.0f}s")
+
+
 def _attention_forward(data) -> torch.Tensor:
+    global _BENCH_DONE
+    if ATTN_BENCH and not _BENCH_DONE and not torch.cuda.is_current_stream_capturing():
+        _BENCH_DONE = True
+        try:
+            _attn_bench(data)
+        except Exception as e:
+            print("BENCH failed:", repr(e))
     cfg = data["config"]
     B, L = cfg["batch"], cfg["q_len"]
     HQ, HKV, D = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
@@ -302,13 +372,16 @@ def _attention_forward(data) -> torch.Tensor:
     out = torch.empty((B, L, HQ * D), dtype=OUT_DTYPE, device=device)
 
     splits, block_t, rb, lb = _plan(cfg)
+    nw, ns = 4, 3
+    if _PLAN_OVERRIDE is not None:
+        splits, block_t, nw, ns = _PLAN_OVERRIDE
+        splits = max(1, min(splits, 1 << (max(1, 1024 // (B * HKV)).bit_length() - 1)))
     ctas = B * HKV
     part, ml, cnt = _workspace(device, ctas * splits * rb * D, ctas * splits * rb * 2, max(ctas, 1024))
     page_table = data["page_table"]
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
     ch = min(splits, 8 if rb <= 16 else 4)        # splits merged per load group
-    nw = 4
     _attn_decode_kernel[grid](
         qkv, data["cache_loc"], data["seq_lens"], page_table,
         data["k_cache"], data["v_cache"], data["k_scale"], data["v_scale"],
@@ -317,7 +390,7 @@ def _attention_forward(data) -> torch.Tensor:
         math.log2(theta) if theta else 0.0,
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
         ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=block_t, ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
-        CH=ch, num_warps=nw, num_stages=4,
+        CH=ch, num_warps=nw, num_stages=ns,
     )
     return out
 # == END SHARED attn ==

@@ -39,6 +39,7 @@ ACT_TORCH = torch.bfloat16   # activations between the kernels (BF16, as SGLang 
 # {{SHARED proj}}
 
 # {{SHARED attn}}
+ATTN_BENCH = False
 
 # {{SHARED moe}}
 
