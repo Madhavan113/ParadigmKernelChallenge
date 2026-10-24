@@ -8,6 +8,7 @@ sys.path.insert(0, "/work/muse_bf16_proj")
 import torch
 import reference as R
 import submission as S
+S.BENCH = False
 
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"
 dev = "cpu"

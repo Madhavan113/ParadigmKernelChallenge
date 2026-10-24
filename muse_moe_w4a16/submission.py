@@ -457,7 +457,8 @@ def prepare(weights: Weights):
             _bench(state)
         except Exception as e:
             print("BENCH failed:", repr(e))
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     return state
 
 

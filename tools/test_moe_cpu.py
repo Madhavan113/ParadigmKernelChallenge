@@ -7,6 +7,7 @@ import torch
 import reference as R
 from nvfp4 import random_weights
 import submission as S
+S.BENCH = False
 
 S.DEQUANT_ASM = False   # the interpreter can't run inline PTX: use the plain-Triton placement
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"

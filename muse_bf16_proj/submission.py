@@ -641,7 +641,8 @@ def prepare(weights: Weights, warm: bool = True):
             _bench(state)
         except Exception as e:
             print("BENCH failed:", repr(e))
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     # Warm-up / compile for the shapes the judge will run (tests and scored), with throwaway x.
     layers = {"qkv_gate": 8192, "o": 1024, "pooler": 8192, "unpooler": 4096, "router": 8192}
     try:
