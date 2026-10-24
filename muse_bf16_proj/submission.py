@@ -381,10 +381,12 @@ _OVERRIDE = None   # a config dict, during in-prepare benchmarking
 
 def _config(layer: str, m: int, n: int, k: int):
     if _OVERRIDE is not None:
-        return dict(_OVERRIDE)
+        return None if _OVERRIDE.get("none") else dict(_OVERRIDE)
     cfg = _config_table(layer, m, n, k)
     if cfg is None:
         return None
+    if cfg.get("big"):
+        return cfg
     if USE_TILED:
         cfg["tiled"] = True
         cfg["BLOCK_N"], cfg["BLOCK_K"] = TILE_SHAPE[layer]
@@ -416,8 +418,22 @@ def _config_table(layer: str, m: int, n: int, k: int):
     return cfg
 
 
+# m >= 128: (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages) for the TMA wgmma kernel over the row-major
+# weight (None: cuBLAS). The judge's m=128/256 shapes are where cuBLAS sits at parity.
+BIG_M = {
+    ("qkv_gate", 128): (128, 64, 4, 8, 4), ("qkv_gate", 256): (128, 64, 4, 8, 4),
+    ("o", 128): (128, 64, 1, 8, 4), ("o", 256): (128, 64, 1, 8, 4),
+    ("pooler", 128): (128, 64, 4, 8, 4), ("pooler", 256): (128, 64, 2, 8, 4),
+    ("unpooler", 128): (128, 64, 2, 8, 4), ("unpooler", 256): (128, 64, 2, 8, 4),
+}
+USE_BIG_M = True
+
+
 def _config_table_(layer: str, m: int, n: int, k: int):
     bm = _block_m(m)
+    if layer != "router" and m > MAX_TRITON_M and USE_BIG_M and (layer, m) in BIG_M:
+        bn, bk, sk, nw, ns = BIG_M[(layer, m)]
+        return dict(BLOCK_M=128, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tma=True, big=True)
     if layer == "router":
         if m > 64:
             return None   # cuBLAS, one GEMM over [hi | lo]
@@ -568,7 +584,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 200
 
 
@@ -600,7 +616,7 @@ def _bench(state):
         return e0.elapsed_time(e1) * 1000.0 / (3 * reps)
 
     print("BENCH proj: us per call (warm L2), configs = (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
-    plan = {
+    plan = {} if True else {
         "pooler":   [(32, 256, 1, 4, 4, True), (32, 256, 1, 4, 6, True), (32, 256, 1, 4, 8, True), (32, 256, 2, 4, 4, True),
                      (32, 256, 1, 4, 4, False), (32, 256, 1, 4, 6, False), (32, 256, 1, 2, 6, True), (32, 256, 1, 8, 6, True)],
         "unpooler": [(32, 256, 1, 4, 4, True), (32, 256, 1, 4, 6, True), (32, 256, 1, 4, 8, True), (32, 256, 2, 4, 4, True),
@@ -612,6 +628,25 @@ def _bench(state):
         "router":   [(32, 256, 16, 4, 3, True), (32, 256, 16, 4, 3, False), (32, 256, 8, 4, 4, True), (32, 256, 8, 4, 6, True),
                      (32, 256, 16, 4, 4, True), (32, 256, 32, 4, 3, True)],
     }
+    print("BENCH proj large m: cuBLAS vs TMA wgmma split-K (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages)")
+    xbig = {(m, k): torch.randn((m, k), device=dev).to(torch.bfloat16) for m in (128, 256) for k in (8192, 1024, 4096)}
+    for layer in ("qkv_gate", "o", "pooler", "unpooler"):
+        N, K = layers[layer]
+        row = []
+        for m in (128, 256):
+            _OVERRIDE = {"none": True}
+            row.append(f"cuBLAS {timeit(lambda: torch.matmul(xbig[(m, K)], state[layer].t())):6.1f}")
+            for bn, bk, sk, nw, ns in ((128, 64, 1, 8, 4), (128, 64, 2, 8, 4), (128, 64, 4, 8, 4), (128, 64, 8, 8, 4),
+                                       (64, 64, 2, 4, 4), (64, 64, 4, 4, 4), (128, 128, 2, 8, 3), (256, 64, 2, 8, 3)):
+                _OVERRIDE = dict(BLOCK_M=128, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tma=True, big=True)
+                try:
+                    if not _usable(_OVERRIDE, m, N, K):
+                        row.append("n/a"); continue
+                    row.append(f"{(bn, bk, sk, nw, ns)} {timeit(lambda: _proj_forward(xbig[(m, K)], layer, N, state)):6.1f}")
+                except Exception as e:
+                    row.append(f"{(bn, bk, sk, nw, ns)} fail")
+            print(f"  {layer:9s} m={m}: " + " | ".join(row)); row = []
+        _OVERRIDE = None
     for layer, cfgs in plan.items():
         N, K = layers[layer]
         for bn, bk, sk, nw, ns, tma in cfgs:
