@@ -786,11 +786,11 @@ def _plan(cfg):
     b, hkv, L = cfg["batch"], cfg["num_kv_heads"], cfg["q_len"]
     ctas = b * hkv
     rb = max(16, triton.next_power_of_2(L * (cfg["num_q_heads"] // hkv)))   # dots need >= 16 rows
-    cap = 128 if rb <= 16 else 32
-    if cfg["window"]:
-        splits = max(1, min(16, 512 // ctas))
+    # measured on the H200 (attention run 2026-10-23): 64-row tiles want fewer splits
+    if rb <= 16:
+        splits = max(1, min(16 if cfg["window"] else 128, (512 if cfg["window"] else 1024) // ctas))
     else:
-        splits = max(1, min(cap, 1024 // ctas))
+        splits = max(1, min(16 if cfg["window"] else 32, (256 if cfg["window"] else 512) // ctas))
     splits = 1 << (splits.bit_length() - 1)   # a power of two: the combine merges CH splits at a time
     block_t = 128
     lb = 16
@@ -879,6 +879,8 @@ def _attention_forward(data) -> torch.Tensor:
 
     splits, block_t, rb, lb = _plan(cfg)
     nw, ns = 4, 3
+    if rb > 16 and B * HKV <= 8:
+        nw = 8   # latency-bound tiny batches: spread the 64 rows over more warps
     if _PLAN_OVERRIDE is not None:
         splits, block_t, nw, ns = _PLAN_OVERRIDE
         splits = max(1, min(splits, 1 << (max(1, 1024 // (B * HKV)).bit_length() - 1)))
