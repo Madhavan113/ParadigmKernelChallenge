@@ -1,0 +1,22 @@
+BENCH attention: us per call (warm L2); config = (splits, block_t, warps, stages)
+  B16 L1 full     FA3 (stock path)          271.5 us
+  B16 L8 full     FA3 (stock path)          253.6 us
+  B32 L8 sliding  FA3 (stock path)          260.1 us
+  B1 L8 full      FA3 (stock path)          219.4 us
+  B16 L1 full     (32, 128, 4, 3, 0)       151.1 us
+  B16 L1 full     (32, 128, 4, 3, 1)       154.3 us
+  B16 L8 full     (16, 128, 4, 3, 0)       229.8 us
+  B16 L8 full     (16, 128, 4, 3, 1)       207.0 us
+  B16 L8 full     (16, 256, 4, 2, 1)       199.3 us
+  B16 L8 full     (32, 128, 4, 3, 1)       224.6 us
+  B16 L8 full     (16, 128, 8, 2, 1)       271.5 us
+  B32 L8 sliding  (4, 128, 4, 3, 0)         48.1 us
+  B32 L8 sliding  (4, 128, 4, 3, 1)         47.8 us
+  B32 L8 sliding  (4, 128, 8, 2, 1)         49.7 us
+  B32 L8 sliding  (8, 128, 4, 3, 1)         49.4 us
+  B1 L8 full      (64, 128, 8, 3, 0)        58.7 us
+  B1 L8 full      (64, 128, 8, 3, 1)        52.0 us
+  B1 L8 full      (32, 128, 8, 3, 1)        62.7 us
+  B1 L8 full      (64, 128, 4, 3, 1)        58.7 us
+  B1 L8 full      (128, 128, 8, 3, 1)       73.6 us
+BENCH attention done in 47s
