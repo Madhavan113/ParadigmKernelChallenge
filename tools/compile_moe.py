@@ -33,6 +33,11 @@ gsig = {"a_ptr": "*fp16", "w_ptr": "*u8", "sf_ptr": "*fp8e4nv", "gs_ptr": "*fp32
         "NUM_CTAS": "i32", "n_tiles": "i32", "GATHER": "constexpr", "GATED": "constexpr", "ASM": "constexpr", "BM": "constexpr", "BN": "constexpr", "BK": "constexpr", "MODE": "constexpr"}
 for asm in (True,):
     build(S._moe_gemm_kernel, gsig, {"GATHER": True, "GATED": True, "ASM": asm, "BM": BM, "BN": BN, "BK": BK, "MODE": 0}, NW, NS, f"gemm1_bs{bs}_asm{int(asm)}")
+    build(S._moe_gemm_kernel, gsig, {"GATHER": True, "GATED": True, "ASM": asm, "BM": BM, "BN": BN, "BK": BK, "MODE": 6}, NW, NS, f"gemm1_bs{bs}_MODE6")
+    build(S._moe_gemm_kernel, gsig, {"GATHER": True, "GATED": True, "ASM": asm, "BM": BM, "BN": BN, "BK": BK, "MODE": 4}, NW, NS, f"gemm1_bs{bs}_MODE4")
+    build(S._moe_gemm_kernel, gsig, {"GATHER": True, "GATED": True, "ASM": asm, "BM": BM, "BN": BN, "BK": BK, "MODE": 7}, NW, NS, f"gemm1_bs{bs}_MODE7")
+    build(S._moe_gemm_kernel, gsig, {"GATHER": True, "GATED": True, "ASM": asm, "BM": BM, "BN": BN, "BK": BK, "MODE": 8}, NW, NS, f"gemm1_bs{bs}_MODE8")
+    build(S._moe_gemm_kernel, gsig, {"GATHER": True, "GATED": True, "ASM": asm, "BM": BM, "BN": BN, "BK": BK, "MODE": 10}, NW, NS, f"gemm1_bs{bs}_MODE10")
 gsig2 = dict(gsig, out_ptr="*bf16")
 build(S._moe_gemm_kernel, gsig2, {"GATHER": False, "GATED": False, "ASM": True, "BM": BM, "BN": BN, "BK": BK, "MODE": 0}, NW, NS, f"gemm2_bs{bs}_asm1")
 build(S._finalize_kernel, {"y_ptr": "*bf16", "row_of_pair_ptr": "*i32", "tw_ptr": "*fp32", "nw_ptr": "*fp32", "out_ptr": "*bf16", "eps": "fp32",

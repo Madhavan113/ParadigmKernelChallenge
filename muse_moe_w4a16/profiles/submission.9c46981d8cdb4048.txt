@@ -1,0 +1,59 @@
+okc run 9c46981d8cdb4048 on muse_moe_w4a16
+submission  /Users/madhavanp/kerneloptimizer/muse_moe_w4a16/submission.py
+status      ok
+passed      true
+speedup     0.593813338254261
+speedup_ci  [0.584906138180447 0.6068261545044846]
+score_us    22647.689321928934
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               77.66     100.70   0.771x      11.42  
+bs=16 load=decode 16 sharding=ep8                            189.22     380.93   0.497x      52.52  
+bs=32 load=decode 32 sharding=ep8                            207.58     492.41   0.422x      70.76  
+bs=8 load=verify 1 sharding=ep8                              150.77     307.00   0.491x      37.32  
+bs=128 load=verify 16 sharding=ep8                           454.93     658.01   0.691x     101.34  
+bs=256 load=verify 32 sharding=ep8                           617.60     772.44   0.800x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                  76.6 µs  92.0%      2
+_finalize_kernel                                                   4.5 µs   5.4%      1
+_route_kernel                                                      2.2 µs   2.6%      1
+total                                                             83.3 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 329.0 µs  96.8%      2
+_finalize_kernel                                                   6.8 µs   2.0%      1
+_route_kernel                                                      4.2 µs   1.2%      1
+total                                                            340.0 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 438.4 µs  97.5%      2
+_finalize_kernel                                                   6.9 µs   1.5%      1
+_route_kernel                                                      4.4 µs   1.0%      1
+total                                                            449.7 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 277.4 µs  97.2%      2
+_finalize_kernel                                                   5.2 µs   1.8%      1
+_route_kernel                                                      2.9 µs   1.0%      1
+total                                                            285.4 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 757.2 µs  97.8%      2
+_route_kernel                                                     10.1 µs   1.3%      1
+_finalize_kernel                                                   6.8 µs   0.9%      1
+total                                                            774.2 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 763.8 µs  96.8%      2
+_route_kernel                                                     17.8 µs   2.3%      1
+_finalize_kernel                                                   7.7 µs   1.0%      1
+total                                                            789.2 µs

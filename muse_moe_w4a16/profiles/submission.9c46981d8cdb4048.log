@@ -1,0 +1,16 @@
+BENCH moe (graph replays): ablations, dot kept in every mode. MODE 0 full | 1 fp16 weights, no dequant (2x bytes) | 4 no scale multiply | 5 numeric nibble->fp16 (no asm) | 2 dequant, no dot | 3 loads only
+  MODE 0: bs1   295.8  bs8   659.3  bs16   821.4  bs32   976.9  bs128   961.8  bs256  1227.0
+  MODE 4: bs1   135.6  bs8   287.1  bs16   355.8  bs32   422.1  bs128   838.8  bs256  1070.7
+  MODE 5: bs1   311.9  bs8   659.1  bs16   821.1  bs32   975.6  bs128   982.6  bs256  1232.5
+  MODE 1: bs1   215.6  bs8   583.1  bs16   722.5  bs32   802.3  bs128  1354.9  bs256  2240.1
+  MODE 2: bs1   189.4  bs8   516.1  bs16   642.3  bs32   757.6  bs128   850.1  bs256  1036.2
+  MODE 3: bs1   191.7  bs8   415.1  bs16   517.7  bs32   605.5  bs128   594.0  bs256   708.6
+  ctas/sm=3 cfg=(16, 32, 256, 4, 4)  bs1   295.8  bs8   861.7  bs16  1065.6  bs32  1246.8
+  ctas/sm=3 cfg=(16, 64, 128, 4, 4)  bs1   287.6  bs8   659.8  bs16   818.2  bs32   970.3
+  ctas/sm=3 cfg=(16, 32, 128, 4, 6)  bs1   295.0  bs8   760.8  bs16   943.3  bs32  1120.1
+  ctas/sm=3 cfg=(16, 64, 128, 8, 4)  bs1   263.0  bs8   975.5  bs16  1215.2  bs32  1382.9
+  ctas/sm=3 cfg=(16, 32, 256, 4, 6)  bs1   311.4  bs8   950.4  bs16  1176.4  bs32  1367.0
+  ctas/sm=3 cfg=(64, 64, 128, 4, 4)  bs128  1203.4  bs256  1400.4
+  ctas/sm=3 cfg=(64, 128, 128, 8, 3)  bs128   956.2  bs256  1220.5
+  ctas/sm=3 cfg=(64, 64, 128, 8, 3)  bs128  1276.6  bs256  1532.5
+BENCH moe done in 17s
