@@ -1,0 +1,25 @@
+cuda backend ready in 0s
+BENCH cuda variants (graph replays, us): (rows/16, n8 per warp)
+  None    : bs1   135.7  bs8   324.4  bs16   375.8  bs32   442.9  bs128   684.9  bs256  1058.9
+  (1, 1)  : bs1   135.2  bs8   324.3  bs16   399.8  bs32   464.9  bs128   947.0  bs256  1698.6
+  (1, 2)  : bs1   137.3  bs8   313.3  bs16   387.3  bs32   453.9  bs128   898.6  bs256  1593.3
+  (2, 1)  : bs1   152.3  bs8   407.4  bs16   505.1  bs32   540.3  bs128   739.2  bs256  1272.3
+  (2, 2)  : bs1   171.2  bs8   383.5  bs16   480.2  bs32   510.8  bs128   689.5  bs256  1150.3
+  (4, 1)  : bs1   240.0  bs8   678.9  bs16   844.6  bs32   902.2  bs128  1034.6  bs256  1295.6
+  (4, 2)  : bs1   197.9  bs8   565.0  bs16   703.5  bs32   746.8  bs128   861.2  bs256  1065.2
+BENCH cuda done in 8s
+BENCH moe (graph replays): ablations, dot kept in every mode. MODE 0 full | 1 fp16 weights, no dequant (2x bytes) | 4 no scale multiply | 5 numeric nibble->fp16 (no asm) | 2 dequant, no dot | 3 loads only
+  MODE 0: bs1   137.0  bs8   326.5  bs16   378.0  bs32   445.6  bs128   696.1  bs256  1072.9
+  MODE 4: bs1   136.6  bs8   326.5  bs16   377.3  bs32   445.5  bs128   694.5  bs256  1078.6
+  MODE 8: bs1   137.9  bs8   327.5  bs16   377.9  bs32   445.4  bs128   694.5  bs256  1075.0
+  MODE 10: bs1   138.7  bs8   330.9  bs16   378.3  bs32   446.0  bs128   694.9  bs256  1075.9
+  MODE 5: bs1   136.8  bs8   326.4  bs16   378.8  bs32   447.6  bs128   691.3  bs256  1078.3
+  ctas/sm=3 cfg=(16, 32, 256, 4, 4)  bs1   138.0  bs8   328.7  bs16   379.4  bs32   447.3
+  ctas/sm=3 cfg=(16, 64, 128, 4, 4)  bs1   136.4  bs8   327.9  bs16   379.2  bs32   445.7
+  ctas/sm=3 cfg=(16, 32, 128, 4, 6)  bs1   136.1  bs8   326.7  bs16   378.4  bs32   447.6
+  ctas/sm=3 cfg=(16, 64, 128, 8, 4)  bs1   136.7  bs8   327.8  bs16   373.4  bs32   439.2
+  ctas/sm=3 cfg=(16, 32, 256, 4, 6)  bs1   134.8  bs8   326.6  bs16   378.2  bs32   446.0
+  ctas/sm=3 cfg=(64, 64, 128, 4, 4)  bs128   696.4  bs256  1079.6
+  ctas/sm=3 cfg=(64, 128, 128, 8, 3)  bs128   695.9  bs256  1075.4
+  ctas/sm=3 cfg=(64, 64, 128, 8, 3)  bs128   700.5  bs256  1085.4
+BENCH moe done in 2s

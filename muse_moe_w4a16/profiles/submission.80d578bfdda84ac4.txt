@@ -1,0 +1,65 @@
+okc run 80d578bfdda84ac4 on muse_moe_w4a16
+submission  /Users/madhavanp/kerneloptimizer/muse_moe_w4a16/submission.py
+status      ok
+passed      true
+speedup     0.9882383285312343
+speedup_ci  [0.9734147536032658 1.0030619034592028]
+score_us    13608.559404883421
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               76.35      83.27   0.917x      11.42  
+bs=16 load=decode 16 sharding=ep8                            188.38     185.11   1.018x      52.52  
+bs=32 load=decode 32 sharding=ep8                            205.14     228.29   0.899x      70.76  
+bs=8 load=verify 1 sharding=ep8                              142.58     143.44   0.994x      37.32  
+bs=128 load=verify 16 sharding=ep8                           460.10     400.15   1.150x     101.34  
+bs=256 load=verify 32 sharding=ep8                           626.22     644.28   0.972x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_gemm_kernel<true, 1...      40.4 µs  57.7%      1
+void (anonymous namespace)::moe_w4a16_gemm_kernel<false, ...      22.6 µs  32.2%      1
+_finalize_kernel                                                   4.9 µs   7.0%      1
+_route_kernel                                                      2.1 µs   3.1%      1
+total                                                             70.1 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_gemm_kernel<true, 1...     115.2 µs  57.1%      1
+void (anonymous namespace)::moe_w4a16_gemm_kernel<false, ...      76.8 µs  38.1%      1
+_finalize_kernel                                                   5.5 µs   2.7%      1
+_route_kernel                                                      4.1 µs   2.0%      1
+total                                                            201.6 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_gemm_kernel<true, 1...     129.7 µs  59.9%      1
+void (anonymous namespace)::moe_w4a16_gemm_kernel<false, ...      76.5 µs  35.3%      1
+_finalize_kernel                                                   5.9 µs   2.7%      1
+_route_kernel                                                      4.3 µs   2.0%      1
+total                                                            216.4 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_gemm_kernel<true, 1...     112.4 µs  61.6%      1
+void (anonymous namespace)::moe_w4a16_gemm_kernel<false, ...      61.5 µs  33.7%      1
+_finalize_kernel                                                   5.9 µs   3.2%      1
+_route_kernel                                                      2.8 µs   1.6%      1
+total                                                            182.6 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_gemm_kernel<true, 2...     264.2 µs  62.2%      1
+void (anonymous namespace)::moe_w4a16_gemm_kernel<false, ...     142.8 µs  33.6%      1
+_route_kernel                                                     10.0 µs   2.4%      1
+_finalize_kernel                                                   7.6 µs   1.8%      1
+total                                                            424.5 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_gemm_kernel<true, 4...     418.2 µs  62.8%      1
+void (anonymous namespace)::moe_w4a16_gemm_kernel<false, ...     222.7 µs  33.4%      1
+_route_kernel                                                     17.6 µs   2.6%      1
+_finalize_kernel                                                   7.7 µs   1.2%      1
+total                                                            666.2 µs
