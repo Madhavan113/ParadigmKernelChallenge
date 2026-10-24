@@ -1408,7 +1408,12 @@ def _route(x, ids, local_start: int, BM: int, state, marlin: bool):
 MARLIN_BLOCK_M = (8, 16, 32, 48, 64)   # MuseSpark1xFp4Experts' candidates, smallest first
 
 
+_MARLIN_BM_OVERRIDE = None   # in-prepare benchmarking
+
+
 def _marlin_block_m(num_tokens: int) -> int:
+    if _MARLIN_BM_OVERRIDE is not None:
+        return _MARLIN_BM_OVERRIDE
     bm = MARLIN_BLOCK_M[0]
     for b in MARLIN_BLOCK_M:
         if num_tokens * TOPK / LOCAL / b < 0.9:

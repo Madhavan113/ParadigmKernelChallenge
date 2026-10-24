@@ -555,7 +555,12 @@ def _route(x, ids, local_start: int, BM: int, state, marlin: bool):
 MARLIN_BLOCK_M = (8, 16, 32, 48, 64)   # MuseSpark1xFp4Experts' candidates, smallest first
 
 
+_MARLIN_BM_OVERRIDE = None   # in-prepare benchmarking
+
+
 def _marlin_block_m(num_tokens: int) -> int:
+    if _MARLIN_BM_OVERRIDE is not None:
+        return _MARLIN_BM_OVERRIDE
     bm = MARLIN_BLOCK_M[0]
     for b in MARLIN_BLOCK_M:
         if num_tokens * TOPK / LOCAL / b < 0.9:
@@ -755,8 +760,49 @@ def _bench(state):
     print(f"BENCH moe done in {time.time() - t_start:.0f}s")
 
 
+def _bench_marlin(state):
+    import time
+    global _MARLIN_BM_OVERRIDE
+    t0 = time.time()
+    dev = state["w13"].device
+    data = {bs: _bench_inputs(bs, dev) for bs in (1, 8, 16, 32, 128, 256)}
+
+    def timeit(fn, reps=10):
+        fn(); fn()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            for _ in range(reps):
+                fn()
+        g.replay(); torch.cuda.synchronize()
+        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        e0.record()
+        for _ in range(3):
+            g.replay()
+        e1.record(); torch.cuda.synchronize()
+        return e0.elapsed_time(e1) * 1000.0 / (3 * reps)
+
+    print("BENCH marlin block size (graph replays, us): rule = the stock density rule")
+    for bm in (None, 8, 16, 32, 48, 64):
+        _MARLIN_BM_OVERRIDE = bm
+        try:
+            r = [timeit(lambda bs=bs: _moe_forward(*data[bs][:3], 0, 4096, state)) for bs in (1, 8, 16, 32, 128, 256)]
+            print(f"  BM={str(bm):4s}: " + "  ".join(f"bs{bs} {t:7.1f}" for bs, t in zip((1, 8, 16, 32, 128, 256), r)))
+        except Exception as e:
+            print(f"  BM={bm} failed: {str(e)[:100]}")
+    _MARLIN_BM_OVERRIDE = None
+    print(f"BENCH marlin done in {time.time() - t0:.0f}s")
+
+
 def prepare(weights: Weights):
     state = _moe_state(weights)
+    if BENCH and "bank" in state:
+        try:
+            _bench_marlin(state)
+        except Exception as e:
+            print("BENCH marlin failed:", repr(e))
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
     if BENCH and "bank" not in state:
         try:
             _bench(state)
