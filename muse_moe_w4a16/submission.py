@@ -183,8 +183,10 @@ def _moe_gemm_kernel(
     stride_am, stride_om, K, N, stride_we, stride_wn, stride_se, stride_sn, up_rows,
     NUM_CTAS, n_tiles,
     GATHER: tl.constexpr, GATED: tl.constexpr, ASM: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr,
 ):
+    # MODE (benchmark ablations; outputs are wrong unless 0): 1 = fp16 weights read from w_ptr
+    # (no dequant), 2 = dequant but no dot, 3 = loads only
     pid = tl.program_id(0)
     nblk = tl.load(nblk_ptr)
     total = nblk * n_tiles
@@ -204,32 +206,63 @@ def _moe_gemm_kernel(
             arow = tl.load(sorted_tok_ptr + rows, mask=rmask, other=0)
         else:
             arow = rows
-        # GATED: W13's rows are interleaved in prepare() (gate r at 2r, up r at 2r+1), so one
-        # tile of 2*BN rows yields BN gate/up pairs: one dequant, one layout conversion, one dot.
-        TN: tl.constexpr = 2 * BN if GATED else BN
-        offs_n = nt * TN + tl.arange(0, TN)
+        offs_n = nt * BN + tl.arange(0, BN)
         gs = tl.load(gs_ptr + e)
         a_ptrs = a_ptr + arow[:, None] * stride_am + offs_k[None, :]
         w_ptrs = w_ptr + e * stride_we + offs_n[:, None] * stride_wn + offs_kb[None, :]
         s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + offs_ks[None, :]
-        acc = tl.zeros((BM, TN), dtype=tl.float32)
+        acc = tl.zeros((BM, BN), dtype=tl.float32)
+        if GATED:
+            w2_ptrs = w_ptrs + up_rows * stride_wn
+            s2_ptrs = s_ptrs + up_rows * stride_sn
+            acc2 = tl.zeros((BM, BN), dtype=tl.float32)
+        if MODE == 1:
+            wf_ptrs = w_ptr.to(tl.pointer_type(tl.float16)) + e * (stride_we * 2) + offs_n[:, None] * (stride_wn * 2) + offs_k[None, :]
+            if GATED:
+                wf2_ptrs = wf_ptrs + up_rows * (stride_wn * 2)
         for _ in range(0, K, BK):
             a = tl.load(a_ptrs, mask=rmask[:, None], other=0.0)
-            wq = tl.load(w_ptrs)
-            sf = tl.load(s_ptrs)
-            w = _dequant(wq, sf, gs, ASM)
-            acc = tl.dot(a, tl.trans(w), acc)
+            if MODE == 1:
+                w = tl.load(wf_ptrs)
+                acc = tl.dot(a, tl.trans(w), acc)
+                wf_ptrs += BK
+                if GATED:
+                    w2 = tl.load(wf2_ptrs)
+                    acc2 = tl.dot(a, tl.trans(w2), acc2)
+                    wf2_ptrs += BK
+            else:
+                wq = tl.load(w_ptrs)
+                sf = tl.load(s_ptrs)
+                if MODE == 3:
+                    acc += tl.sum(wq.to(tl.float32), 1)[None, :] + tl.sum(sf.to(tl.float32), 1)[None, :]
+                else:
+                    w = _dequant(wq, sf, gs, ASM)
+                    if MODE == 2:
+                        acc += tl.sum(w.to(tl.float32), 1)[None, :]
+                    else:
+                        acc = tl.dot(a, tl.trans(w), acc)
+                if GATED:
+                    wq2 = tl.load(w2_ptrs)
+                    sf2 = tl.load(s2_ptrs)
+                    if MODE == 3:
+                        acc2 += tl.sum(wq2.to(tl.float32), 1)[None, :] + tl.sum(sf2.to(tl.float32), 1)[None, :]
+                    else:
+                        w2 = _dequant(wq2, sf2, gs, ASM)
+                        if MODE == 2:
+                            acc2 += tl.sum(w2.to(tl.float32), 1)[None, :]
+                        else:
+                            acc2 = tl.dot(a, tl.trans(w2), acc2)
+                    w2_ptrs += BK // 2
+                    s2_ptrs += BK // 16
+                w_ptrs += BK // 2
+                s_ptrs += BK // 16
             a_ptrs += BK
-            w_ptrs += BK // 2
-            s_ptrs += BK // 16
+        o_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :]
         if GATED:
-            g, u = tl.split(tl.reshape(acc, (BM, BN, 2)))
-            h = g * tl.sigmoid(g) * u
-            o_ptrs = out_ptr + rows[:, None] * stride_om + (nt * BN + tl.arange(0, BN))[None, :]
+            h = acc * tl.sigmoid(acc) * acc2
             # SiLU(gate) * up kept at BF16 precision (as SGLang's path does), stored in fp16
             tl.store(o_ptrs, h.to(tl.bfloat16).to(tl.float16), mask=rmask[:, None])
         else:
-            o_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :]
             tl.store(o_ptrs, acc.to(out_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
@@ -263,16 +296,17 @@ def _finalize_kernel(y_ptr, row_of_pair_ptr, tw_ptr, nw_ptr, out_ptr, eps,
 
 # Sweep (one hypothesis per scored shape): (BM, BN, BK, num_warps, num_stages)
 GEMM_SWEEP = {
-    1: (16, 64, 128, 4, 4),
+    1: (16, 32, 256, 4, 4),
     8: (16, 64, 128, 4, 4),
     16: (16, 64, 128, 4, 4),
-    32: (16, 64, 256, 4, 3),
-    128: (64, 128, 64, 8, 4),
-    256: (64, 64, 128, 4, 4),
+    32: (16, 64, 128, 4, 4),
+    128: (64, 128, 128, 8, 3),
+    256: (64, 128, 128, 8, 3),
 }
 
 
 _GEMM_OVERRIDE = None   # (BM, BN, BK, num_warps, num_stages) during in-prepare benchmarking
+_MODE = 0               # benchmark ablation mode (see _moe_gemm_kernel)
 _CTAS_PER_SM = 3
 
 
@@ -291,12 +325,8 @@ def _gemm_config(bs: int):
 
 def _moe_state(weights) -> dict:
     dev = weights["w13"].device
-    def interleave_rows(t):   # [E, 2I, ...] with gate rows then up rows -> gate r, up r alternating
-        E_, R, C = t.shape
-        return t.view(E_, 2, R // 2, C).permute(0, 2, 1, 3).reshape(E_, R, C).contiguous()
-
     state = {
-        "w13": interleave_rows(weights["w13"]), "w13_sf": interleave_rows(weights["w13_sf"]),
+        "w13": weights["w13"].contiguous(), "w13_sf": weights["w13_sf"].contiguous(),
         "w2": weights["w2"].contiguous(), "w2_sf": weights["w2_sf"].contiguous(),
         # the 2^14 of the fp16 placement trick, folded in (an exact power-of-two scaling)
         "w13_gs": (weights["w13_gs"].float() * SCALE_FIX).contiguous(),
@@ -354,7 +384,7 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
     w13, w13_sf, w2, w2_sf = state["w13"], state["w13_sf"], state["w2"], state["w2_sf"]
     max_items = (NP // BM + LOCAL) * (max(I, H) // BN)
     num_ctas = min(_CTAS_PER_SM * NUM_SMS, max_items)
-    common = dict(GATHER=True, GATED=True, ASM=DEQUANT_ASM, BM=BM, BN=BN, BK=BK, num_warps=nw, num_stages=ns)
+    common = dict(GATHER=True, GATED=True, ASM=DEQUANT_ASM, BM=BM, BN=BN, BK=BK, MODE=_MODE, num_warps=nw, num_stages=ns)
     # gate/up GEMM + SiLU: A = x16 [M, H], W13[e] rows [0, I) gate and [I, 2I) up, K = H, N = I
     _moe_gemm_kernel[(num_ctas,)](
         x16, w13, w13_sf, state["w13_gs"], state["inter"],
@@ -423,14 +453,19 @@ def _bench(state):
         torch.cuda.synchronize()
         return e0.elapsed_time(e1) * 1000.0 / (3 * reps)
 
-    print("BENCH moe: per-kernel breakdown with the default configs")
-    for bs, (x, ids, tw) in data.items():
-        nloc = int((ids < 32).sum()); ndist = int(torch.unique(ids[ids < 32]).numel())
-        full = timeit(lambda: _moe_forward(x, ids, tw, 0, 4096, state))
-        print(f"  bs={bs:4d} local routes={nloc:4d} distinct={ndist:2d}  total {full:8.1f} us")
-    cands = [(16, 32, 256, 4, 4), (16, 64, 128, 4, 4), (16, 64, 256, 4, 3), (16, 64, 128, 4, 3), (16, 128, 128, 4, 3),
-             (16, 128, 64, 4, 4), (16, 64, 128, 8, 4), (16, 128, 128, 8, 3), (16, 32, 128, 4, 6), (16, 64, 64, 4, 6)]
-    big = [(64, 64, 128, 4, 4), (64, 128, 128, 8, 3), (64, 128, 64, 4, 4), (64, 64, 128, 8, 3), (64, 64, 256, 4, 3), (64, 32, 256, 4, 4)]
+    global _MODE
+    print("BENCH moe (graph replays): ablations with the default configs; MODE 0 full, 1 fp16 weights no dequant,"
+          " 2 dequant no dot, 3 loads only")
+    for mode in (0, 1, 2, 3):
+        _MODE = mode
+        try:
+            r = [timeit(lambda bs=bs: _moe_forward(*data[bs][:3], 0, 4096, state)) for bs in (1, 8, 16, 32, 128, 256)]
+            print(f"  MODE {mode}: " + "  ".join(f"bs{bs} {t:7.1f}" for bs, t in zip((1, 8, 16, 32, 128, 256), r)))
+        except Exception as e:
+            print(f"  MODE {mode} failed: {str(e)[:100]}")
+    _MODE = 0
+    cands = [(16, 32, 256, 4, 4), (16, 64, 128, 4, 4), (16, 32, 128, 4, 6), (16, 64, 128, 8, 4), (16, 32, 256, 4, 6)]
+    big = [(64, 64, 128, 4, 4), (64, 128, 128, 8, 3), (64, 64, 128, 8, 3)]
     for ctas in (3,):
         _CTAS_PER_SM = ctas
         for cfg in cands:
