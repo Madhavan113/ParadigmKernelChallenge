@@ -1,0 +1,14 @@
+BENCH moe (graph replays): ablations with the default configs; MODE 0 full, 1 fp16 weights no dequant, 2 dequant no dot, 3 loads only
+  MODE 0: bs1   295.9  bs8   659.5  bs16   822.3  bs32   976.5  bs128   961.9  bs256  1226.1
+  MODE 1 failed: out of resource: shared memory, Required: 245760, Hardware limit: 232448. Reducing block sizes or `n
+  MODE 2: bs1   189.2  bs8   515.4  bs16   641.9  bs32   756.3  bs128   853.3  bs256  1037.1
+  MODE 3: bs1   192.1  bs8   414.8  bs16   516.6  bs32   604.4  bs128   596.6  bs256   707.5
+  ctas/sm=3 cfg=(16, 32, 256, 4, 4)  bs1   297.1  bs8   864.5  bs16  1064.8  bs32  1246.9
+  ctas/sm=3 cfg=(16, 64, 128, 4, 4)  bs1   287.1  bs8   659.4  bs16   819.5  bs32   971.1
+  ctas/sm=3 cfg=(16, 32, 128, 4, 6)  bs1   294.0  bs8   761.3  bs16   943.4  bs32  1121.0
+  ctas/sm=3 cfg=(16, 64, 128, 8, 4)  bs1   263.3  bs8   983.4  bs16  1205.6  bs32  1393.5
+  ctas/sm=3 cfg=(16, 32, 256, 4, 6)  bs1   311.5  bs8   951.1  bs16  1177.6  bs32  1370.0
+  ctas/sm=3 cfg=(64, 64, 128, 4, 4)  bs128  1202.4  bs256  1407.7
+  ctas/sm=3 cfg=(64, 128, 128, 8, 3)  bs128   956.8  bs256  1220.1
+  ctas/sm=3 cfg=(64, 64, 128, 8, 3)  bs128  1266.5  bs256  1537.1
+BENCH moe done in 16s
