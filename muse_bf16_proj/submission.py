@@ -345,27 +345,28 @@ def _block_m(m: int) -> int:
 # shapes move the same bytes, so giving each m a different configuration measures four
 # pipeline shapes per layer in one run.
 SWEEP = {
-    # (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma); with USE_TILED the tile shape is TILE_SHAPE[layer]
-    ("pooler", 4096, 1):   (32, 256, 1, 4, 8, True),
-    ("pooler", 4096, 8):   (32, 256, 1, 4, 6, True),      # 18.9 us in run 13180174
-    ("pooler", 4096, 16):  (32, 256, 1, 2, 6, True),
-    ("pooler", 4096, 32):  (32, 256, 1, 8, 6, True),
-    ("unpooler", 8192, 16): (32, 256, 1, 4, 8, True),
-    ("unpooler", 8192, 32): (32, 256, 1, 2, 6, True),
-    ("unpooler", 1024, 1): (32, 256, 4, 4, 4, True),
-    ("unpooler", 1024, 8): (32, 256, 4, 4, 6, True),
-    ("o", 8192, 1):   (64, 256, 1, 4, 4, True),
-    ("o", 8192, 8):   (64, 256, 1, 4, 6, True),
-    ("o", 8192, 16):  (64, 256, 1, 2, 4, False),
-    ("o", 8192, 32):  (64, 256, 1, 4, 5, True),
-    ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4, True),
-    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 6, True),
-    ("qkv_gate", 2304, 16): (32, 256, 2, 2, 4, False),
-    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 6, True),
-    ("router", 256, 1):   (32, 256, 16, 4, 3, False),
-    ("router", 256, 8):   (32, 256, 16, 4, 3, True),      # 6.4 us in run 78c2f421
-    ("router", 256, 16):  (32, 256, 16, 4, 4, True),
-    ("router", 256, 32):  (32, 256, 8, 4, 4, True),
+    # (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma): best of the on-device sweep (run 486e0009,
+    # graph replays, warm L2); with USE_TILED the tile shape is TILE_SHAPE[layer]
+    ("pooler", 4096, 1):   (32, 256, 1, 4, 6, False),     # 18.2
+    ("pooler", 4096, 8):   (32, 256, 1, 2, 6, True),      # 18.5
+    ("pooler", 4096, 16):  (32, 256, 1, 2, 6, True),      # 18.3
+    ("pooler", 4096, 32):  (32, 256, 1, 4, 6, True),      # 20.6
+    ("unpooler", 8192, 16): (32, 256, 1, 4, 4, True),     # 18.4
+    ("unpooler", 8192, 32): (32, 256, 1, 4, 4, True),     # 19.2
+    ("unpooler", 1024, 1): (32, 256, 8, 4, 4, True),      # 5.6
+    ("unpooler", 1024, 8): (32, 256, 8, 4, 4, True),      # 5.4
+    ("o", 8192, 1):   (64, 256, 1, 4, 4, True),           # 5.0
+    ("o", 8192, 8):   (64, 256, 1, 4, 4, True),           # 4.9
+    ("o", 8192, 16):  (64, 256, 1, 4, 4, True),           # 4.2
+    ("o", 8192, 32):  (64, 256, 1, 4, 4, True),           # 5.3
+    ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4, False),    # 12.2
+    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 4, True),     # 11.7
+    ("qkv_gate", 2304, 16): (32, 256, 4, 4, 4, True),     # 11.0
+    ("qkv_gate", 2304, 32): (32, 256, 4, 4, 4, True),     # 15.1
+    ("router", 256, 1):   (32, 256, 16, 4, 3, True),      # 5.2
+    ("router", 256, 8):   (32, 256, 16, 4, 3, True),      # 5.1
+    ("router", 256, 16):  (32, 256, 16, 4, 3, True),      # 5.1
+    ("router", 256, 32):  (32, 256, 16, 4, 4, True),      # 6.2
 }
 
 
@@ -567,7 +568,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 200
 
 
