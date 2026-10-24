@@ -716,7 +716,7 @@ def _attn_decode_kernel(
     # ---- merge the splits (last CTA of this (b, h)), then the gated norm ----
     if SPLITS > 1:
         base = (bh * SPLITS + s) * RB
-        tl.store(part_ptr + (base + rows)[:, None] * D + d[None, :], acc)
+        tl.store(part_ptr + (base + rows)[:, None] * D + d[None, :], acc.to(part_ptr.dtype.element_ty))
         tl.store(ml_ptr + (base + rows) * 2, m_i)
         tl.store(ml_ptr + (base + rows) * 2 + 1, l_i)
         tl.debug_barrier()
@@ -738,7 +738,7 @@ def _attn_decode_kernel(
                 m2 = tl.load(ml_ptr + (b2[:, None] + rows[None, :]) * 2, cache_modifier=".cg")
                 l2 = tl.load(ml_ptr + (b2[:, None] + rows[None, :]) * 2 + 1, cache_modifier=".cg")
                 a2 = tl.load(part_ptr + (b2[:, None, None] + rows[None, :, None]) * D + d[None, None, :],
-                             cache_modifier=".cg")                                 # [CH, RB, D]
+                             cache_modifier=".cg").to(tl.float32)                  # [CH, RB, D]
                 w = tl.exp2(m2 - m_all[None, :])                                    # [CH, RB]
                 l_all += tl.sum(l2 * w, 0)
                 o += tl.sum(a2 * w[:, :, None], 0)
@@ -775,7 +775,7 @@ def _workspace(device, n_part: int, n_ml: int, n_cnt: int):
     key = (str(device), n_part, n_ml, n_cnt)
     ws = _WS.get(key)
     if ws is None:
-        ws = (torch.empty((n_part,), dtype=torch.float32, device=device),
+        ws = (torch.empty((n_part,), dtype=torch.float16, device=device),   # acc partials (renormalized later)
               torch.empty((n_ml,), dtype=torch.float32, device=device),
               torch.zeros((n_cnt,), dtype=torch.int32, device=device))
         _WS[key] = ws
@@ -789,9 +789,10 @@ def _plan(cfg):
     rb = max(16, triton.next_power_of_2(L * (cfg["num_q_heads"] // hkv)))   # dots need >= 16 rows
     # measured on the H200 (attention run 2026-10-23): 64-row tiles want fewer splits
     if rb <= 16:
-        splits = max(1, min(16 if cfg["window"] else 128, (512 if cfg["window"] else 1024) // ctas))
+        splits = max(1, min(16 if cfg["window"] else 64, (512 if cfg["window"] else 1024) // ctas))
     else:
-        splits = max(1, min(16 if cfg["window"] else 32, (256 if cfg["window"] else 512) // ctas))
+        cap = 16 if cfg["window"] else (64 if ctas <= 4 else 16)
+        splits = max(1, min(cap, (256 if cfg["window"] else 512) // ctas))
     splits = 1 << (splits.bit_length() - 1)   # a power of two: the combine merges CH splits at a time
     block_t = 128
     lb = 16

@@ -11,7 +11,7 @@ L, WINDOW, SPLITS, BLOCK_T, HQ, HKV, PS, NW, NS = [int(x) for x in (a + ["1", "2
 D = 64
 RB = max(16, triton.next_power_of_2(L * (HQ // HKV)))
 sig = {"qkv_ptr": "*bf16", "loc_ptr": "*i64", "seq_ptr": "*i32", "pt_ptr": "*i32", "kc_ptr": "*fp8e4nv", "vc_ptr": "*fp8e4nv",
-       "kscale_ptr": "*fp32", "vscale_ptr": "*fp32", "out_ptr": "*bf16", "part_ptr": "*fp32", "ml_ptr": "*fp32", "cnt_ptr": "*i32",
+       "kscale_ptr": "*fp32", "vscale_ptr": "*fp32", "out_ptr": "*bf16", "part_ptr": "*fp16", "ml_ptr": "*fp32", "cnt_ptr": "*i32",
        "max_pages": "i32", "qk_scale": "fp32", "sm_scale_log2": "fp32", "log2_theta": "fp32",
        "L": "constexpr", "HQ": "constexpr", "HKV": "constexpr", "D": "constexpr", "PS": "constexpr", "WINDOW": "constexpr",
        "ROPE": "constexpr", "SPLITS": "constexpr", "RB": "constexpr", "LB": "constexpr", "BLOCK_T": "constexpr", "ACT": "constexpr", "FP8_ASM": "constexpr", "CH": "constexpr"}

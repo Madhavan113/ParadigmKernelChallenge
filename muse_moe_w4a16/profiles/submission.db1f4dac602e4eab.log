@@ -1,0 +1,24 @@
+BENCH moe: per-kernel breakdown with the default configs
+  bs=   1 local routes=   8 distinct= 8  total    319.2 us
+  bs=   8 local routes=  64 distinct=24  total    741.3 us
+  bs=  16 local routes= 128 distinct=30  total    923.5 us
+  bs=  32 local routes= 256 distinct=32  total   1218.4 us
+  bs= 128 local routes=1023 distinct=32  total   1201.4 us
+  bs= 256 local routes=2044 distinct=32  total   1456.9 us
+  ctas/sm=3 cfg=(16, 32, 256, 4, 4)  bs1   304.6  bs8   853.3  bs16  1071.9  bs32  1288.6
+  ctas/sm=3 cfg=(16, 64, 128, 4, 4)  bs1   318.3  bs8   741.9  bs16   924.6  bs32  1099.3
+  ctas/sm=3 cfg=(16, 64, 256, 4, 3)  bs1   306.4  bs8   818.8  bs16  1017.9  bs32  1217.7
+  ctas/sm=3 cfg=(16, 64, 128, 4, 3)  bs1   318.9  bs8   746.9  bs16   931.4  bs32  1109.8
+  ctas/sm=3 cfg=(16, 128, 128, 4, 3)  bs1   285.5  bs8   833.4  bs16  1006.5  bs32  1229.3
+  ctas/sm=3 cfg=(16, 128, 64, 4, 4)  bs1   376.7  bs8   744.5  bs16   991.4  bs32  1097.5
+  ctas/sm=3 cfg=(16, 64, 128, 8, 4)  bs1   250.9  bs8   800.3  bs16   990.1  bs32  1146.4
+  ctas/sm=3 cfg=(16, 128, 128, 8, 3)  bs1   269.7  bs8   777.4  bs16  1059.8  bs32  1156.1
+  ctas/sm=3 cfg=(16, 32, 128, 4, 6)  bs1   288.4  bs8   740.6  bs16   919.7  bs32  1096.3
+  ctas/sm=3 cfg=(16, 64, 64, 4, 6)  bs1   354.6  bs8   820.8  bs16  1022.1  bs32  1217.0
+  ctas/sm=3 cfg=(64, 64, 128, 4, 4)  bs128  1192.2  bs256  1444.9
+  ctas/sm=3 cfg=(64, 128, 128, 8, 3)  bs128   955.8  bs256  1220.0
+  ctas/sm=3 cfg=(64, 128, 64, 4, 4)  bs128  1124.4  bs256  1335.8
+  ctas/sm=3 cfg=(64, 64, 128, 8, 3)  bs128   968.1  bs256  1335.7
+  ctas/sm=3 cfg=(64, 64, 256, 4, 3)  bs128  1215.0  bs256  1493.2
+  ctas/sm=3 cfg=(64, 32, 256, 4, 4)  bs128  1401.3  bs256  1737.8
+BENCH moe done in 17s
