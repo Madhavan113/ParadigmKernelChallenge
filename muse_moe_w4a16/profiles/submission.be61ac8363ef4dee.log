@@ -1,0 +1,11 @@
+BENCH marlin block size (graph replays, us): rule = the stock density rule
+  BM=None: bs1   104.3  bs8   266.1  bs16   366.8  bs32   466.0  bs128   675.2  bs256  1025.8
+  BM=8   : bs1   103.7  bs8   264.9  bs16   364.5  bs32   464.3  bs128  1437.9  bs256  2734.6
+  BM=16  : bs1   109.8  bs8   280.6  bs16   345.8  bs32   410.3  bs128   855.7  bs256  1556.9
+  BM=32  : bs1   138.6  bs8   366.3  bs16   453.3  bs32   484.5  bs128   674.9  bs256  1183.8
+  BM=48 failed: at 64:17:
+        jm = j < total
+        oh = (ej[:, None] == ex[None, :]).to(tl.int32)
+        bo =
+  BM=64  : bs1   199.9  bs8   542.0  bs16   671.9  bs32   718.2  bs128   825.2  bs256  1023.7
+BENCH marlin done in 12s
