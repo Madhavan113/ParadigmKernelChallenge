@@ -915,7 +915,7 @@ NUM_SMS = 132
 MOE_OUT_DTYPE = torch.bfloat16
 DEQUANT_ASM = True          # inline PTX for the nibble -> fp16 placement (False: plain Triton ops)
 SCALE_3D = tl.constexpr(False)   # scale expansion: 3-D broadcast instead of 4 interleaves
-SCALE_VARIANT = tl.constexpr(2)  # scaled-asm dequant: 2 = interleave-expanded scales, 3 = broadcast-reshape
+SCALE_VARIANT = tl.constexpr(4)  # scaled-asm dequant: 2 = interleave-expanded scales, 3 = broadcast-reshape
 SCALE_FIX = 2.0 ** 14       # folded into the global scales: the placement trick yields value * 2^-14
 
 
@@ -1039,7 +1039,7 @@ def _dequant_scaled(wq, s8, gs16, VARIANT: tl.constexpr):
     elif VARIANT == 3:
         s = (s8.to(tl.float32).to(tl.float16)) * gs16            # [BN, BK/16]
         s = tl.reshape(tl.broadcast_to(s[:, :, None], (s.shape[0], s.shape[1], 8)), (s.shape[0], s.shape[1] * 8))
-    else:
+    else:   # 2 and 4 (4: the scales were loaded pair-blocked, see SF_BLOCKED)
         s = (s8.to(tl.float32).to(tl.float16)) * gs16            # [BN, BK/16]
         s = tl.interleave(s, s)
         s = tl.interleave(s, s)
@@ -1096,7 +1096,7 @@ def _moe_gemm_kernel(
     stride_am, stride_om, K, N, stride_we, stride_wn, stride_se, stride_sn, up_rows,
     NUM_CTAS, n_tiles,
     GATHER: tl.constexpr, GATED: tl.constexpr, ASM: tl.constexpr,
-    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr,
+    BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr, MODE: tl.constexpr, SF_BLOCKED: tl.constexpr,
 ):
     # MODE (benchmark ablations; outputs are wrong unless 0): 1 = fp16 weights read from w_ptr
     # (no dequant), 2 = dequant but no dot, 3 = loads only
@@ -1125,6 +1125,12 @@ def _moe_gemm_kernel(
         w_ptrs = w_ptr + e * stride_we + offs_n[:, None] * stride_wn + offs_kb[None, :]
         if MODE == 7:   # scale gathered per packed byte: [BN, BK/2]
             s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + (offs_kb // 8)[None, :]
+        elif SF_BLOCKED:
+            # scales stored as [N/8, G/2, 8, 2] (16-byte blocks): pairs are contiguous, so the
+            # load vectorizes by 2 and, after three interleaves, lands in the packed tile's layout
+            G = K // 16
+            s_ptrs = (sf_ptr + e * stride_se + (offs_n // 8)[:, None] * (G * 8) + (offs_n % 8)[:, None] * 2
+                      + (offs_ks // 2)[None, :] * 16 + (offs_ks % 2)[None, :])
         else:
             s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + offs_ks[None, :]
         gs16 = gs.to(tl.float16)
@@ -1152,6 +1158,14 @@ def _moe_gemm_kernel(
                 sf = tl.load(s_ptrs)
                 if MODE == 3:
                     acc += tl.sum(wq.to(tl.float32), 1)[None, :] + tl.sum(sf.to(tl.float32), 1)[None, :]
+                elif MODE == 11:
+                    # per-16-group loads and dots; the group's scale multiplies the fp32 dot output
+                    for g in tl.static_range(BK // 16):
+                        wq_g = tl.load(w_ptrs + g * 8)                                      # [BN, 8] bytes
+                        a_g = tl.load(a_ptrs + g * 16, mask=rmask[:, None], other=0.0)      # [BM, 16]
+                        s_g = tl.sum(tl.where(offs_ks[None, :] == g, sf.to(tl.float32), 0.0), 1) * gs   # [BN]
+                        w_g = _dequant(wq_g, sf, gs, ASM, 4)                                # [BN, 16] unscaled
+                        acc += tl.dot(a_g, tl.trans(w_g)) * s_g[None, :]
                 elif MODE == 9:
                     # per-16-group batched dot; scales applied to the dot output (fp32)
                     w = _dequant(wq, sf, gs, ASM, 4)                                  # [BN, BK] unscaled
@@ -1177,6 +1191,13 @@ def _moe_gemm_kernel(
                     sf2 = tl.load(s2_ptrs)
                     if MODE == 3:
                         acc2 += tl.sum(wq2.to(tl.float32), 1)[None, :] + tl.sum(sf2.to(tl.float32), 1)[None, :]
+                    elif MODE == 11:
+                        for g in tl.static_range(BK // 16):
+                            wq_g = tl.load(w2_ptrs + g * 8)
+                            a_g = tl.load(a_ptrs + g * 16, mask=rmask[:, None], other=0.0)
+                            s_g = tl.sum(tl.where(offs_ks[None, :] == g, sf2.to(tl.float32), 0.0), 1) * gs
+                            w_g = _dequant(wq_g, sf2, gs, ASM, 4)
+                            acc2 += tl.dot(a_g, tl.trans(w_g)) * s_g[None, :]
                     elif MODE == 9:
                         w2 = _dequant(wq2, sf2, gs, ASM, 4)
                         w3 = tl.permute(tl.reshape(w2, (BN, BK // 16, 16)), (1, 2, 0))
@@ -1197,9 +1218,9 @@ def _moe_gemm_kernel(
                         else:
                             acc2 = tl.dot(a, tl.trans(w2), acc2)
                     w2_ptrs += BK // 2
-                    s2_ptrs += (BK // 2) // 8 if MODE == 7 else BK // 16
+                    s2_ptrs += (BK // 2) // 8 if MODE == 7 else (BK // 2 if SF_BLOCKED else BK // 16)
                 w_ptrs += BK // 2
-                s_ptrs += (BK // 2) // 8 if MODE == 7 else BK // 16
+                s_ptrs += (BK // 2) // 8 if MODE == 7 else (BK // 2 if SF_BLOCKED else BK // 16)
             a_ptrs += BK
         o_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :]
         if GATED:
@@ -1264,12 +1285,17 @@ def _gemm_config(bs: int):
         return 16, 32, 256, 4, 4
     if bs <= 64:
         return 16, 64, 128, 4, 4
-    return 64, 128, 64, 4, 3
+    return 64, 128, 128, 8, 3   # (64, 128, 64, 4, 3) crashes Triton 3.8's pass pipeline with the scaled asm
 
 
 def _moe_state(weights) -> dict:
     dev = weights["w13"].device
+    def block_scales(sf):   # [E, N, G] fp8 -> [E, N/8, G/2, 8, 2] contiguous (same bytes, pair-blocked)
+        E_, N_, G_ = sf.shape
+        return sf.view(E_, N_ // 8, 8, G_ // 2, 2).permute(0, 1, 3, 2, 4).contiguous().view(E_, N_, G_)
+
     state = {
+        "w13_sfb": block_scales(weights["w13_sf"]), "w2_sfb": block_scales(weights["w2_sf"]),
         "w13": weights["w13"].contiguous(), "w13_sf": weights["w13_sf"].contiguous(),
         "w2": weights["w2"].contiguous(), "w2_sf": weights["w2_sf"].contiguous(),
         # the 2^14 of the fp16 placement trick, folded in (an exact power-of-two scaling)
@@ -1328,10 +1354,14 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
     w13, w13_sf, w2, w2_sf = state["w13"], state["w13_sf"], state["w2"], state["w2_sf"]
     max_items = (NP // BM + LOCAL) * (max(I, H) // BN)
     num_ctas = min(_CTAS_PER_SM * NUM_SMS, max_items)
-    common = dict(GATHER=True, GATED=True, ASM=DEQUANT_ASM, BM=BM, BN=BN, BK=BK, MODE=_MODE, num_warps=nw, num_stages=ns)
+    blocked = DEQUANT_ASM and _MODE == 0 and SCALE_VARIANT == 4
+    sf13 = state["w13_sfb"] if blocked else w13_sf
+    sf2 = state["w2_sfb"] if blocked else w2_sf
+    common = dict(GATHER=True, GATED=True, ASM=DEQUANT_ASM, BM=BM, BN=BN, BK=BK, MODE=_MODE, SF_BLOCKED=blocked,
+                  num_warps=nw, num_stages=ns)
     # gate/up GEMM + SiLU: A = x16 [M, H], W13[e] rows [0, I) gate and [I, 2I) up, K = H, N = I
     _moe_gemm_kernel[(num_ctas,)](
-        x16, w13, w13_sf, state["w13_gs"], state["inter"],
+        x16, w13, sf13, state["w13_gs"], state["inter"],
         state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
         x16.stride(0), state["inter"].stride(0), H, I,
         w13.stride(0), w13.stride(1), w13_sf.stride(0), w13_sf.stride(1), I,
@@ -1340,7 +1370,7 @@ def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
     # down GEMM: A = inter [rows, I], W2[e] [H, I/2], K = I, N = H
     common.update(GATHER=False, GATED=False)
     _moe_gemm_kernel[(num_ctas,)](
-        state["inter"], w2, w2_sf, state["w2_gs"], state["y"],
+        state["inter"], w2, sf2, state["w2_gs"], state["y"],
         state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
         state["inter"].stride(0), state["y"].stride(0), I, H,
         w2.stride(0), w2.stride(1), w2_sf.stride(0), w2_sf.stride(1), 0,
