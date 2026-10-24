@@ -914,6 +914,8 @@ MAX_M = 1024
 NUM_SMS = 132
 MOE_OUT_DTYPE = torch.bfloat16
 DEQUANT_ASM = True          # inline PTX for the nibble -> fp16 placement (False: plain Triton ops)
+SCALE_3D = tl.constexpr(False)   # scale expansion: 3-D broadcast instead of 4 interleaves
+SCALE_VARIANT = tl.constexpr(2)  # scaled-asm dequant: 2 = interleave-expanded scales, 3 = broadcast-reshape
 SCALE_FIX = 2.0 ** 14       # folded into the global scales: the placement trick yields value * 2^-14
 
 
@@ -1008,6 +1010,55 @@ _NIBBLE_ASM = tl.constexpr("""
 """)
 
 
+_NIBBLE_SCALED_ASM = tl.constexpr("""
+{
+    .reg .b32 a, b, t, u, z;
+    mov.b32 z, 0;
+    prmt.b32 a, $4, z, 0x4140;
+    prmt.b32 b, $4, z, 0x4342;
+    shl.b32 t, a, 9;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, a, 12;   and.b32 u, u, 0x80008000;  or.b32 t, t, u;   mul.f16x2 $0, t, $5;
+    shl.b32 t, b, 9;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, b, 12;   and.b32 u, u, 0x80008000;  or.b32 t, t, u;   mul.f16x2 $1, t, $5;
+    shl.b32 t, a, 5;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, a, 8;    and.b32 u, u, 0x80008000;  or.b32 t, t, u;   mul.f16x2 $2, t, $5;
+    shl.b32 t, b, 5;    and.b32 t, t, 0x0E000E00;
+    shl.b32 u, b, 8;    and.b32 u, u, 0x80008000;  or.b32 t, t, u;   mul.f16x2 $3, t, $5;
+}
+""")
+
+
+@triton.jit
+def _dequant_scaled(wq, s8, gs16, VARIANT: tl.constexpr):
+    """Scale applied inside the nibble asm (packed f16x2), so the result keeps the asm output
+    layout and feeds the MMA without a shared-memory round trip.
+    wq uint8 [BN, BK/2]; s8: VARIANT 1 -> fp8 [BN, BK/2] (each group's scale gathered per byte),
+    VARIANT 2 -> fp8 [BN, BK/16] expanded here by interleaves. gs16: fp16 global scale x 2^14."""
+    if VARIANT == 1:
+        s = _cache_scale_to_f16(s8) * gs16                       # [BN, BK/2] fp16
+    elif VARIANT == 3:
+        s = (s8.to(tl.float32).to(tl.float16)) * gs16            # [BN, BK/16]
+        s = tl.reshape(tl.broadcast_to(s[:, :, None], (s.shape[0], s.shape[1], 8)), (s.shape[0], s.shape[1] * 8))
+    else:
+        s = (s8.to(tl.float32).to(tl.float16)) * gs16            # [BN, BK/16]
+        s = tl.interleave(s, s)
+        s = tl.interleave(s, s)
+        s = tl.interleave(s, s)                                  # [BN, BK/2]
+    lo, hi = tl.inline_asm_elementwise(
+        asm=_NIBBLE_SCALED_ASM, constraints="=r,=r,=r,=r,r,r,r", args=[wq, s],
+        dtype=(tl.float16, tl.float16), is_pure=True, pack=4)
+    return tl.interleave(lo, hi)
+
+
+@triton.jit
+def _cache_scale_to_f16(x8):
+    """fp8 e4m3 -> fp16, one cvt per pair, keeping the input's layout."""
+    b = x8.to(tl.uint8, bitcast=True)
+    return tl.inline_asm_elementwise(
+        asm="{ .reg .b16 lo, hi; mov.b32 {lo, hi}, $2; cvt.rn.f16x2.e4m3x2 $0, lo; cvt.rn.f16x2.e4m3x2 $1, hi; }",
+        constraints="=r,=r,r", args=[b], dtype=tl.float16, is_pure=True, pack=4)
+
+
 @triton.jit
 def _dequant(wq, sf, gs, ASM: tl.constexpr, MODE: tl.constexpr = 0):
     """wq uint8 [BN, BK/2] packed E2M1, sf fp8 [BN, BK/16], gs fp32 (x 2^14) -> fp16 [BN, BK]."""
@@ -1027,6 +1078,10 @@ def _dequant(wq, sf, gs, ASM: tl.constexpr, MODE: tl.constexpr = 0):
     if MODE == 4:
         return w
     s = (sf.to(tl.float32) * gs).to(tl.float16)                 # [BN, BK/16]
+    if MODE == 6 or SCALE_3D:
+        # one scale per 16 consecutive K elements: broadcast over a [BN, BK/16, 16] view
+        w3 = tl.reshape(w, (w.shape[0], w.shape[1] // 16, 16))
+        return tl.reshape(w3 * s[:, :, None], (w.shape[0], w.shape[1]))
     s = tl.interleave(s, s)
     s = tl.interleave(s, s)
     s = tl.interleave(s, s)
@@ -1068,7 +1123,11 @@ def _moe_gemm_kernel(
         gs = tl.load(gs_ptr + e)
         a_ptrs = a_ptr + arow[:, None] * stride_am + offs_k[None, :]
         w_ptrs = w_ptr + e * stride_we + offs_n[:, None] * stride_wn + offs_kb[None, :]
-        s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + offs_ks[None, :]
+        if MODE == 7:   # scale gathered per packed byte: [BN, BK/2]
+            s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + (offs_kb // 8)[None, :]
+        else:
+            s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + offs_ks[None, :]
+        gs16 = gs.to(tl.float16)
         acc = tl.zeros((BM, BN), dtype=tl.float32)
         if GATED:
             w2_ptrs = w_ptrs + up_rows * stride_wn
@@ -1093,6 +1152,20 @@ def _moe_gemm_kernel(
                 sf = tl.load(s_ptrs)
                 if MODE == 3:
                     acc += tl.sum(wq.to(tl.float32), 1)[None, :] + tl.sum(sf.to(tl.float32), 1)[None, :]
+                elif MODE == 9:
+                    # per-16-group batched dot; scales applied to the dot output (fp32)
+                    w = _dequant(wq, sf, gs, ASM, 4)                                  # [BN, BK] unscaled
+                    w3 = tl.permute(tl.reshape(w, (BN, BK // 16, 16)), (1, 2, 0))     # [G, 16, BN]
+                    a3 = tl.permute(tl.reshape(a, (BM, BK // 16, 16)), (1, 0, 2))     # [G, BM, 16]
+                    o3 = tl.dot(a3, w3)                                               # [G, BM, BN]
+                    s3 = (sf.to(tl.float32) * gs)                                     # [BN, G]
+                    acc += tl.sum(o3 * tl.permute(s3, (1, 0))[:, None, :], 0)
+                elif MODE == 7 or MODE == 8 or MODE == 10:
+                    w = _dequant_scaled(wq, sf, gs16, 1 if MODE == 7 else (3 if MODE == 10 else 2))
+                    acc = tl.dot(a, tl.trans(w), acc)
+                elif MODE == 0 and ASM:
+                    w = _dequant_scaled(wq, sf, gs16, SCALE_VARIANT)
+                    acc = tl.dot(a, tl.trans(w), acc)
                 else:
                     w = _dequant(wq, sf, gs, ASM, MODE)
                     if MODE == 2:
@@ -1104,6 +1177,19 @@ def _moe_gemm_kernel(
                     sf2 = tl.load(s2_ptrs)
                     if MODE == 3:
                         acc2 += tl.sum(wq2.to(tl.float32), 1)[None, :] + tl.sum(sf2.to(tl.float32), 1)[None, :]
+                    elif MODE == 9:
+                        w2 = _dequant(wq2, sf2, gs, ASM, 4)
+                        w3 = tl.permute(tl.reshape(w2, (BN, BK // 16, 16)), (1, 2, 0))
+                        a3 = tl.permute(tl.reshape(a, (BM, BK // 16, 16)), (1, 0, 2))
+                        o3 = tl.dot(a3, w3)
+                        s3 = (sf2.to(tl.float32) * gs)
+                        acc2 += tl.sum(o3 * tl.permute(s3, (1, 0))[:, None, :], 0)
+                    elif MODE == 7 or MODE == 8 or MODE == 10:
+                        w2 = _dequant_scaled(wq2, sf2, gs16, 1 if MODE == 7 else (3 if MODE == 10 else 2))
+                        acc2 = tl.dot(a, tl.trans(w2), acc2)
+                    elif MODE == 0 and ASM:
+                        w2 = _dequant_scaled(wq2, sf2, gs16, SCALE_VARIANT)
+                        acc2 = tl.dot(a, tl.trans(w2), acc2)
                     else:
                         w2 = _dequant(wq2, sf2, gs, ASM, MODE)
                         if MODE == 2:
@@ -1111,9 +1197,9 @@ def _moe_gemm_kernel(
                         else:
                             acc2 = tl.dot(a, tl.trans(w2), acc2)
                     w2_ptrs += BK // 2
-                    s2_ptrs += BK // 16
+                    s2_ptrs += (BK // 2) // 8 if MODE == 7 else BK // 16
                 w_ptrs += BK // 2
-                s_ptrs += BK // 16
+                s_ptrs += (BK // 2) // 8 if MODE == 7 else BK // 16
             a_ptrs += BK
         o_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :]
         if GATED:

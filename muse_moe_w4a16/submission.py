@@ -62,6 +62,7 @@ NUM_SMS = 132
 MOE_OUT_DTYPE = torch.bfloat16
 DEQUANT_ASM = True          # inline PTX for the nibble -> fp16 placement (False: plain Triton ops)
 SCALE_3D = tl.constexpr(False)   # scale expansion: 3-D broadcast instead of 4 interleaves
+SCALE_VARIANT = tl.constexpr(2)  # scaled-asm dequant: 2 = interleave-expanded scales, 3 = broadcast-reshape
 SCALE_FIX = 2.0 ** 14       # folded into the global scales: the placement trick yields value * 2^-14
 
 
@@ -309,6 +310,9 @@ def _moe_gemm_kernel(
                 elif MODE == 7 or MODE == 8 or MODE == 10:
                     w = _dequant_scaled(wq, sf, gs16, 1 if MODE == 7 else (3 if MODE == 10 else 2))
                     acc = tl.dot(a, tl.trans(w), acc)
+                elif MODE == 0 and ASM:
+                    w = _dequant_scaled(wq, sf, gs16, SCALE_VARIANT)
+                    acc = tl.dot(a, tl.trans(w), acc)
                 else:
                     w = _dequant(wq, sf, gs, ASM, MODE)
                     if MODE == 2:
@@ -329,6 +333,9 @@ def _moe_gemm_kernel(
                         acc2 += tl.sum(o3 * tl.permute(s3, (1, 0))[:, None, :], 0)
                     elif MODE == 7 or MODE == 8 or MODE == 10:
                         w2 = _dequant_scaled(wq2, sf2, gs16, 1 if MODE == 7 else (3 if MODE == 10 else 2))
+                        acc2 = tl.dot(a, tl.trans(w2), acc2)
+                    elif MODE == 0 and ASM:
+                        w2 = _dequant_scaled(wq2, sf2, gs16, SCALE_VARIANT)
                         acc2 = tl.dot(a, tl.trans(w2), acc2)
                     else:
                         w2 = _dequant(wq2, sf2, gs, ASM, MODE)
@@ -548,7 +555,7 @@ def _bench(state):
     except Exception as e:
         dummy13 = dummy2 = None
         print("  (no fp16 dummy weights:", str(e)[:60], ")")
-    for mode in (0, 4, 8, 10):
+    for mode in (0, 4, 8, 10, 5):
         _MODE = mode
         _GEMM_OVERRIDE = (16, 64, 64, 4, 4) if mode == 1 else None
         if mode == 1:
