@@ -1053,38 +1053,32 @@ def _moe_gemm_kernel(
             arow = tl.load(sorted_tok_ptr + rows, mask=rmask, other=0)
         else:
             arow = rows
-        offs_n = nt * BN + tl.arange(0, BN)
+        # GATED: W13's rows are interleaved in prepare() (gate r at 2r, up r at 2r+1), so one
+        # tile of 2*BN rows yields BN gate/up pairs: one dequant, one layout conversion, one dot.
+        TN: tl.constexpr = 2 * BN if GATED else BN
+        offs_n = nt * TN + tl.arange(0, TN)
         gs = tl.load(gs_ptr + e)
         a_ptrs = a_ptr + arow[:, None] * stride_am + offs_k[None, :]
         w_ptrs = w_ptr + e * stride_we + offs_n[:, None] * stride_wn + offs_kb[None, :]
         s_ptrs = sf_ptr + e * stride_se + offs_n[:, None] * stride_sn + offs_ks[None, :]
-        acc = tl.zeros((BM, BN), dtype=tl.float32)
-        if GATED:
-            w2_ptrs = w_ptrs + up_rows * stride_wn
-            s2_ptrs = s_ptrs + up_rows * stride_sn
-            acc2 = tl.zeros((BM, BN), dtype=tl.float32)
+        acc = tl.zeros((BM, TN), dtype=tl.float32)
         for _ in range(0, K, BK):
             a = tl.load(a_ptrs, mask=rmask[:, None], other=0.0)
             wq = tl.load(w_ptrs)
             sf = tl.load(s_ptrs)
             w = _dequant(wq, sf, gs, ASM)
             acc = tl.dot(a, tl.trans(w), acc)
-            if GATED:
-                wq2 = tl.load(w2_ptrs)
-                sf2 = tl.load(s2_ptrs)
-                w2 = _dequant(wq2, sf2, gs, ASM)
-                acc2 = tl.dot(a, tl.trans(w2), acc2)
-                w2_ptrs += BK // 2
-                s2_ptrs += BK // 16
             a_ptrs += BK
             w_ptrs += BK // 2
             s_ptrs += BK // 16
-        o_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :]
         if GATED:
-            h = acc * tl.sigmoid(acc) * acc2
+            g, u = tl.split(tl.reshape(acc, (BM, BN, 2)))
+            h = g * tl.sigmoid(g) * u
+            o_ptrs = out_ptr + rows[:, None] * stride_om + (nt * BN + tl.arange(0, BN))[None, :]
             # SiLU(gate) * up kept at BF16 precision (as SGLang's path does), stored in fp16
             tl.store(o_ptrs, h.to(tl.bfloat16).to(tl.float16), mask=rmask[:, None])
         else:
+            o_ptrs = out_ptr + rows[:, None] * stride_om + offs_n[None, :]
             tl.store(o_ptrs, acc.to(out_ptr.dtype.element_ty), mask=rmask[:, None])
 
 
@@ -1118,17 +1112,17 @@ def _finalize_kernel(y_ptr, row_of_pair_ptr, tw_ptr, nw_ptr, out_ptr, eps,
 
 # Sweep (one hypothesis per scored shape): (BM, BN, BK, num_warps, num_stages)
 GEMM_SWEEP = {
-    1: (16, 64, 128, 4, 6),      # deeper pipeline, half the n-tiles
-    8: (16, 32, 256, 8, 4),      # more warps per tile
-    16: (16, 64, 64, 4, 8),      # small K steps, deep pipeline
-    32: (16, 128, 128, 8, 4),    # wide tile
-    128: (64, 128, 64, 8, 4),    # wgmma, wide
-    256: (64, 64, 128, 4, 4),    # wgmma, narrower
+    1: (16, 64, 128, 4, 4),
+    8: (16, 64, 128, 4, 4),
+    16: (16, 64, 128, 4, 4),
+    32: (16, 64, 256, 4, 3),
+    128: (64, 128, 64, 8, 4),
+    256: (64, 64, 128, 4, 4),
 }
 
 
 _GEMM_OVERRIDE = None   # (BM, BN, BK, num_warps, num_stages) during in-prepare benchmarking
-_CTAS_PER_SM = 2
+_CTAS_PER_SM = 3
 
 
 def _gemm_config(bs: int):
@@ -1146,8 +1140,12 @@ def _gemm_config(bs: int):
 
 def _moe_state(weights) -> dict:
     dev = weights["w13"].device
+    def interleave_rows(t):   # [E, 2I, ...] with gate rows then up rows -> gate r, up r alternating
+        E_, R, C = t.shape
+        return t.view(E_, 2, R // 2, C).permute(0, 2, 1, 3).reshape(E_, R, C).contiguous()
+
     state = {
-        "w13": weights["w13"].contiguous(), "w13_sf": weights["w13_sf"].contiguous(),
+        "w13": interleave_rows(weights["w13"]), "w13_sf": interleave_rows(weights["w13_sf"]),
         "w2": weights["w2"].contiguous(), "w2_sf": weights["w2_sf"].contiguous(),
         # the 2^14 of the fp16 placement trick, folded in (an exact power-of-two scaling)
         "w13_gs": (weights["w13_gs"].float() * SCALE_FIX).contiguous(),

@@ -1,0 +1,40 @@
+BENCH moe: per-kernel breakdown with the default configs
+  bs=   1 local routes=   8 distinct= 8  total    260.0 us
+  bs=   8 local routes=  64 distinct=24  total   1071.9 us
+  bs=  16 local routes= 128 distinct=30  total   1083.4 us
+  bs=  32 local routes= 256 distinct=32  total   1136.0 us
+  bs= 128 local routes=1023 distinct=32  total   1066.5 us
+  bs= 256 local routes=2044 distinct=32  total   1132.5 us
+  ctas/sm=2 cfg=(16, 32, 256, 4, 4)  bs1   279.7  bs8   770.8  bs16   950.8  bs32  1132.2
+  ctas/sm=2 cfg=(16, 32, 256, 4, 3)  bs1   284.9  bs8   783.4  bs16   968.7  bs32  1151.0
+  ctas/sm=2 cfg=(16, 32, 256, 4, 6)  bs1   272.9  bs8   741.7  bs16   916.4  bs32  1087.8
+  ctas/sm=2 cfg=(16, 32, 128, 4, 4)  bs1   309.7  bs8   856.8  bs16  1058.8  bs32  1253.8
+  ctas/sm=2 cfg=(16, 64, 128, 4, 4)  bs1   257.6  bs8   707.0  bs16   887.9  bs32  1043.1
+  ctas/sm=2 cfg=(16, 32, 256, 2, 4)  bs1   284.2  bs8   790.1  bs16   978.8  bs32  1166.4
+  ctas/sm=2 cfg=(16, 16, 256, 4, 4)  bs1   456.3  bs8  1267.7  bs16  1575.6  bs32  1864.0
+  ctas/sm=2 cfg=(16, 64, 256, 4, 3)  bs1   245.9  bs8   677.2  bs16   849.6  bs32  1000.9
+  ctas/sm=2 cfg=(32, 32, 256, 4, 4)  bs1   399.7  bs8  1137.7  bs16  1412.9  bs32  1505.3
+  ctas/sm=2 cfg=(16, 32, 512, 4, 3)  bs1   309.2  bs8   853.0  bs16  1058.0  bs32  1259.3
+  ctas/sm=2 cfg=(64, 64, 128, 4, 4)  bs128   926.6  bs256  1124.8
+  ctas/sm=2 cfg=(64, 128, 64, 8, 4)  bs128  1063.1  bs256  1244.5
+  ctas/sm=2 cfg=(64, 64, 64, 4, 6)  bs128  1203.9  bs256  1442.2
+  ctas/sm=2 cfg=(64, 128, 128, 8, 3)  bs128  1003.4  bs256  1197.9
+  ctas/sm=2 cfg=(128, 64, 64, 4, 4)  bs128  1349.9  bs256  1512.8
+  ctas/sm=2 cfg=(32, 64, 128, 4, 4)  bs128  1502.8  bs256  2563.5
+  ctas/sm=4 cfg=(16, 32, 256, 4, 4)  bs1   292.2  bs8   789.1  bs16   974.0  bs32  1155.0
+  ctas/sm=4 cfg=(16, 32, 256, 4, 3)  bs1   294.8  bs8   801.5  bs16   989.9  bs32  1173.3
+  ctas/sm=4 cfg=(16, 32, 256, 4, 6)  bs1   271.7  bs8   739.4  bs16   916.1  bs32  1087.5
+  ctas/sm=4 cfg=(16, 32, 128, 4, 4)  bs1   263.4  bs8   728.9  bs16   900.8  bs32  1078.6
+  ctas/sm=4 cfg=(16, 64, 128, 4, 4)  bs1   242.2  bs8   661.2  bs16   870.3  bs32  1019.5
+  ctas/sm=4 cfg=(16, 32, 256, 2, 4)  bs1   274.1  bs8   759.4  bs16   942.9  bs32  1091.0
+  ctas/sm=4 cfg=(16, 16, 256, 4, 4)  bs1   474.9  bs8  1320.5  bs16  1658.8  bs32  2070.8
+  ctas/sm=4 cfg=(16, 64, 256, 4, 3)  bs1   255.2  bs8   686.7  bs16   904.9  bs32  1048.1
+  ctas/sm=4 cfg=(32, 32, 256, 4, 4)  bs1   399.0  bs8  1133.4  bs16  1411.9  bs32  1496.3
+  ctas/sm=4 cfg=(16, 32, 512, 4, 3)  bs1   309.2  bs8   854.0  bs16  1061.9  bs32  1263.7
+  ctas/sm=4 cfg=(64, 64, 128, 4, 4)  bs128   940.1  bs256  1134.8
+  ctas/sm=4 cfg=(64, 128, 64, 8, 4)  bs128  1072.4  bs256  1240.8
+  ctas/sm=4 cfg=(64, 64, 64, 4, 6)  bs128  1265.0  bs256  1542.5
+  ctas/sm=4 cfg=(64, 128, 128, 8, 3)  bs128  1002.1  bs256  1179.8
+  ctas/sm=4 cfg=(128, 64, 64, 4, 4)  bs128  1345.4  bs256  1516.8
+  ctas/sm=4 cfg=(32, 64, 128, 4, 4)  bs128  1525.5  bs256  2635.1
+BENCH moe done in 35s

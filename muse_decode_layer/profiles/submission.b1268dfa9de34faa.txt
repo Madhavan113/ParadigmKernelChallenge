@@ -1,0 +1,191 @@
+okc run b1268dfa9de34faa on muse_decode_layer
+submission  /Users/madhavanp/kerneloptimizer/muse_decode_layer/submission.py
+status      ok
+passed      true
+speedup     0.6874424906108918
+speedup_ci  [0.6771308532517284 0.6997561506437588]
+score_us    32905.00704996952
+tests       13/13 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1     171.66     211.21   0.813x      40.02  
+batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1     182.29     241.60   0.755x      44.18  
+batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic     267.30     421.11   0.635x      76.72  
+batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic     440.58     556.30   0.792x     137.46  
+batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic     257.01     485.97   0.529x      84.51  
+batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic     615.41     840.91   0.732x     208.10  
+batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8     266.98     485.47   0.550x      62.29  
+batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8     273.22     533.49   0.512x      66.44  
+batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic     514.70     751.82   0.685x     126.61  
+batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic     687.58     989.46   0.695x     188.68  
+batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic     694.51     776.74   0.894x     143.81  
+batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic    1069.04    1320.34   0.810x     267.18  
+
+profile 0: batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 117.8 µs  56.2%      2
+_tiled_gemm_tma_kernel                                            49.8 µs  23.8%      4
+_boundary_kernel                                                  12.0 µs   5.7%      2
+_attn_decode_kernel                                               10.6 µs   5.0%      1
+_tiled_gemm_kernel                                                 6.8 µs   3.2%      1
+_finalize_kernel                                                   5.0 µs   2.4%      1
+_route_topk_kernel                                                 3.2 µs   1.5%      1
+_rms_gain_kernel                                                   2.4 µs   1.1%      1
+_route_kernel                                                      2.1 µs   1.0%      1
+total                                                            209.5 µs
+
+profile 1: batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 122.5 µs  50.1%      2
+_tiled_gemm_tma_kernel                                            48.2 µs  19.7%      4
+_attn_decode_kernel                                               42.4 µs  17.3%      1
+_boundary_kernel                                                  11.5 µs   4.7%      2
+_tiled_gemm_kernel                                                 6.9 µs   2.8%      1
+_finalize_kernel                                                   5.3 µs   2.2%      1
+_route_topk_kernel                                                 3.5 µs   1.4%      1
+_rms_gain_kernel                                                   2.2 µs   0.9%      1
+_route_kernel                                                      2.1 µs   0.9%      1
+total                                                            244.7 µs
+
+profile 2: batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 283.7 µs  71.8%      2
+_tiled_gemm_tma_kernel                                            48.4 µs  12.3%      3
+_tiled_gemm_kernel                                                22.0 µs   5.6%      2
+_attn_decode_kernel                                               14.0 µs   3.5%      1
+_boundary_kernel                                                  11.9 µs   3.0%      2
+_finalize_kernel                                                   5.0 µs   1.3%      1
+_route_kernel                                                      4.3 µs   1.1%      1
+_route_topk_kernel                                                 3.2 µs   0.8%      1
+_rms_gain_kernel                                                   2.4 µs   0.6%      1
+total                                                            394.9 µs
+
+profile 3: batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 284.2 µs  51.6%      2
+_attn_decode_kernel                                              168.9 µs  30.7%      1
+_tiled_gemm_tma_kernel                                            49.0 µs   8.9%      3
+_tiled_gemm_kernel                                                21.6 µs   3.9%      2
+_boundary_kernel                                                  11.6 µs   2.1%      2
+_finalize_kernel                                                   5.7 µs   1.0%      1
+_route_kernel                                                      4.3 µs   0.8%      1
+_route_topk_kernel                                                 3.2 µs   0.6%      1
+_rms_gain_kernel                                                   2.2 µs   0.4%      1
+total                                                            550.6 µs
+
+profile 4: batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 234.5 µs  63.9%      2
+_tiled_gemm_tma_kernel                                            87.5 µs  23.9%      5
+_attn_decode_kernel                                               16.9 µs   4.6%      1
+_boundary_kernel                                                  11.6 µs   3.2%      2
+_finalize_kernel                                                   5.6 µs   1.5%      1
+_route_kernel                                                      4.9 µs   1.3%      1
+_route_topk_kernel                                                 3.5 µs   0.9%      1
+_rms_gain_kernel                                                   2.2 µs   0.6%      1
+total                                                            366.7 µs
+
+profile 5: batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+_attn_decode_kernel                                              348.3 µs  49.9%      1
+_moe_gemm_kernel                                                 233.7 µs  33.5%      2
+_tiled_gemm_tma_kernel                                            88.2 µs  12.6%      5
+_boundary_kernel                                                  11.5 µs   1.7%      2
+_finalize_kernel                                                   5.5 µs   0.8%      1
+_route_kernel                                                      4.5 µs   0.7%      1
+_route_topk_kernel                                                 3.3 µs   0.5%      1
+_rms_gain_kernel                                                   2.5 µs   0.4%      1
+total                                                            697.5 µs
+
+profile 6: batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 267.3 µs  68.8%      2
+_tiled_gemm_tma_kernel                                            60.3 µs  15.5%      5
+_attn_decode_kernel                                               35.6 µs   9.2%      1
+_boundary_kernel                                                  11.5 µs   3.0%      2
+_finalize_kernel                                                   5.2 µs   1.3%      1
+_route_topk_kernel                                                 3.3 µs   0.8%      1
+_route_kernel                                                      2.9 µs   0.7%      1
+_rms_gain_kernel                                                   2.4 µs   0.6%      1
+total                                                            388.5 µs
+
+profile 7: batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 334.0 µs  65.9%      2
+_attn_decode_kernel                                               87.0 µs  17.2%      1
+_tiled_gemm_tma_kernel                                            60.3 µs  11.9%      5
+_boundary_kernel                                                  11.1 µs   2.2%      2
+_finalize_kernel                                                   5.5 µs   1.1%      1
+_route_topk_kernel                                                 3.4 µs   0.7%      1
+_route_kernel                                                      3.0 µs   0.6%      1
+_rms_gain_kernel                                                   2.3 µs   0.5%      1
+total                                                            506.6 µs
+
+profile 8: batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 577.5 µs  77.3%      2
+_attn_decode_kernel                                               47.7 µs   6.4%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           28.5 µs   3.8%      2
+nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT                           25.1 µs   3.4%      1
+nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN                    15.4 µs   2.1%      1
+_boundary_kernel                                                  14.9 µs   2.0%      2
+_route_kernel                                                     10.2 µs   1.4%      1
+nvjet_sm90_tss_64x32_64x16_1x2_h_bz_splitK_NNT                     7.3 µs   1.0%      1
+_finalize_kernel                                                   6.8 µs   0.9%      1
+_route_topk_kernel                                                 3.7 µs   0.5%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, __...       3.1 µs   0.4%      1
+void at::native::(anonymous namespace)::CatArrayBatchedCo...       2.8 µs   0.4%      1
+... 2 more
+total                                                            747.3 µs
+
+profile 9: batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 577.2 µs  57.4%      2
+_attn_decode_kernel                                              305.7 µs  30.4%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           29.5 µs   2.9%      2
+nvjet_sm90_tst_64x64_64x13_2x1_v_bz_TNT                           26.1 µs   2.6%      1
+nvjet_sm90_tst_96x64_64x10_4x2_h_bz_splitK_TNN                    15.1 µs   1.5%      1
+_boundary_kernel                                                  14.6 µs   1.5%      2
+_route_kernel                                                     10.4 µs   1.0%      1
+nvjet_sm90_tss_64x32_64x16_1x2_h_bz_splitK_NNT                     6.8 µs   0.7%      1
+_finalize_kernel                                                   6.8 µs   0.7%      1
+_route_topk_kernel                                                 3.6 µs   0.4%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, __...       3.2 µs   0.3%      1
+void at::native::(anonymous namespace)::CatArrayBatchedCo...       2.8 µs   0.3%      1
+... 2 more
+total                                                           1005.9 µs
+
+profile 10: batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 673.4 µs  77.0%      2
+_attn_decode_kernel                                               46.4 µs   5.3%      1
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT                          34.3 µs   3.9%      2
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           32.2 µs   3.7%      1
+nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN                           24.0 µs   2.7%      1
+_boundary_kernel                                                  18.9 µs   2.2%      2
+_route_kernel                                                     17.7 µs   2.0%      1
+_finalize_kernel                                                   7.7 µs   0.9%      1
+nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT                     7.5 µs   0.9%      1
+void at::native::(anonymous namespace)::CatArrayBatchedCo...       4.1 µs   0.5%      1
+_route_topk_kernel                                                 3.6 µs   0.4%      1
+_rms_gain_kernel                                                   3.0 µs   0.3%      1
+... 1 more
+total                                                            874.7 µs
+
+profile 11: batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+_moe_gemm_kernel                                                 601.9 µs  45.4%      2
+_attn_decode_kernel                                              566.1 µs  42.7%      1
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT                          34.3 µs   2.6%      2
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                           32.4 µs   2.4%      1
+nvjet_sm90_tst_96x64_64x10_2x4_h_bz_TNN                           24.2 µs   1.8%      1
+_route_kernel                                                     19.5 µs   1.5%      1
+_boundary_kernel                                                  19.2 µs   1.5%      2
+_finalize_kernel                                                   7.4 µs   0.6%      1
+nvjet_sm90_tss_64x64_64x13_2x1_v_bz_splitK_NNT                     7.3 µs   0.5%      1
+void at::native::(anonymous namespace)::CatArrayBatchedCo...       4.0 µs   0.3%      1
+_route_topk_kernel                                                 3.9 µs   0.3%      1
+_rms_gain_kernel                                                   3.0 µs   0.2%      1
+... 1 more
+total                                                           1324.9 µs
