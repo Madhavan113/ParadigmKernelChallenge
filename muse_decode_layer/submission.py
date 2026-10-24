@@ -421,7 +421,7 @@ BIG_M = {
     ("pooler", 128): (128, 64, 4, 8, 4), ("pooler", 256): (128, 64, 2, 8, 4),
     ("unpooler", 128): (128, 64, 2, 8, 4), ("unpooler", 256): (128, 64, 2, 8, 4),
 }
-USE_BIG_M = True
+USE_BIG_M = False   # measured 1.5-2x slower than cuBLAS at m=128/256 (run d007f8c6)
 
 
 def _config_table_(layer: str, m: int, n: int, k: int):
