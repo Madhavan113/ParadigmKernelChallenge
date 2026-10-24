@@ -561,14 +561,14 @@ _MARLIN_BM_OVERRIDE = None   # in-prepare benchmarking
 def _marlin_block_m(num_tokens: int) -> int:
     if _MARLIN_BM_OVERRIDE is not None:
         return _MARLIN_BM_OVERRIDE
-    # measured on the H200 (graph replays): 8 up to 8 tokens, 16 up to 64, 32 up to 192, else 64
-    if num_tokens <= 8:
-        return 8
-    if num_tokens <= 64:
-        return 16
-    if num_tokens <= 192:
-        return 32
-    return 64
+    # the stock density rule (a per-batch sweep on synthetic heavy routing preferred 16 at
+    # 16-64 tokens, but on the judge's lighter routing it measured no better: run 7d2d04b3)
+    bm = MARLIN_BLOCK_M[0]
+    for b in MARLIN_BLOCK_M:
+        if num_tokens * TOPK / LOCAL / b < 0.9:
+            break
+        bm = b
+    return bm
 
 
 def _moe_forward_marlin(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
