@@ -787,12 +787,14 @@ _CUDA_OVERRIDE = None
 
 
 def _cuda_variant(M: int):
-    """(rows per block / 16, n8 blocks per warp, K-split warp groups)."""
+    """(rows per block / 16, n8 blocks per warp, K-split warp groups). On-device sweep (run
+    30863d92): (1,2,1) best up to 32 tokens; wider row blocks pay off only when experts hold many
+    rows, so 32-row blocks above 64 tokens (the judge's routing is lighter than the synthetic)."""
     if _CUDA_OVERRIDE is not None:
         return _CUDA_OVERRIDE
-    if M <= 32:
-        return 1, 2, 2      # few blocks: 8 warps per CTA, two groups on alternate K chunks
-    return 1, 2, 1
+    if M <= 64:
+        return 1, 2, 1
+    return 2, 2, 1
 
 
 def _moe_forward_cuda(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
@@ -900,7 +902,7 @@ def _moe_state(weights) -> dict:
             torch.cuda.synchronize()
         except Exception as e:
             print("cuda backend unavailable:", repr(e)[:200])
-    if MOE_BACKEND in ("marlin", "cuda") and "Wr13" not in state:
+    if MOE_BACKEND in ("marlin", "cuda"):
         try:
             state["bank"] = _marlin_bank(weights)
             state["cache13"] = torch.empty((MAX_M * TOPK * max(2 * I, H),), dtype=torch.bfloat16, device=dev)
@@ -1013,8 +1015,12 @@ def _moe_forward_marlin(x, ids, tw, local_start: int, I: int, state) -> torch.Te
     return out
 
 
+CUDA_MIN_TOKENS = 65   # Marlin (stock GEMM + this file's routing) below, this file's CUDA GEMM from here
+
+
 def _moe_forward(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor:
-    if "Wr13" in state:
+    M = x.shape[0]
+    if "Wr13" in state and (M >= CUDA_MIN_TOKENS or "bank" not in state):
         return _moe_forward_cuda(x, ids, tw, local_start, I, state)
     if "bank" in state:
         return _moe_forward_marlin(x, ids, tw, local_start, I, state)
@@ -1070,7 +1076,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 

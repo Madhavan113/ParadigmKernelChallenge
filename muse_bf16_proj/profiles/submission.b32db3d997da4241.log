@@ -1,0 +1,24 @@
+BENCH proj: us per call (warm L2), configs = (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)
+BENCH proj small m: current Triton config vs CUDA skinny GEMM (BM, BN)
+  pooler    m=  1 n=4096: triton   18.4 | cuda(16, 16)   19.6 | cuda(16, 32)   19.7 | cuda(32, 16)   19.6 | cuda(32, 32)   20.2
+  pooler    m=  8 n=4096: triton   18.4 | cuda(16, 16)   26.5 | cuda(16, 32)   24.5 | cuda(32, 16)   27.1 | cuda(32, 32)   25.2
+  pooler    m= 16 n=4096: triton   18.5 | cuda(16, 16)   33.7 | cuda(16, 32)   25.0 | cuda(32, 16)   34.2 | cuda(32, 32)   25.4
+  pooler    m= 32 n=4096: triton   20.4 | cuda(32, 16)   47.0 | cuda(32, 32)   31.8
+  unpooler  m=  1 n=1024: triton    5.9 | cuda(16, 16)    6.2 | cuda(16, 32)    8.3 | cuda(32, 16)    7.1 | cuda(32, 32)    9.6
+  unpooler  m=  8 n=1024: triton    5.4 | cuda(16, 16)    6.3 | cuda(16, 32)    8.3 | cuda(32, 16)    7.2 | cuda(32, 32)    9.5
+  unpooler  m= 16 n=8192: triton   18.4 | cuda(16, 16)   37.9 | cuda(16, 32)   26.6 | cuda(32, 16)   34.8 | cuda(32, 32)   26.9
+  unpooler  m= 32 n=8192: triton   19.1 | cuda(32, 16)   45.8 | cuda(32, 32)   31.1
+  o         m=  1 n=8192: triton    5.1 | cuda(16, 16)    6.7 | cuda(16, 32)    5.2 | cuda(32, 16)    6.8 | cuda(32, 32)    6.5
+  o         m=  8 n=8192: triton    4.8 | cuda(16, 16)   10.5 | cuda(16, 32)    7.4 | cuda(32, 16)    9.8 | cuda(32, 32)    8.2
+  o         m= 16 n=8192: triton    4.5 | cuda(16, 16)   12.4 | cuda(16, 32)    8.7 | cuda(32, 16)   12.3 | cuda(32, 32)    9.4
+  o         m= 32 n=8192: triton    5.4 | cuda(32, 16)   15.1 | cuda(32, 32)   10.9
+  qkv_gate  m=  1 n=2304: triton   12.0 | cuda(16, 16)   13.8 | cuda(16, 32)   15.6 | cuda(32, 16)   16.7 | cuda(32, 32)   18.1
+  qkv_gate  m=  8 n=2304: triton   11.2 | cuda(16, 16)   16.2 | cuda(16, 32)   15.7 | cuda(32, 16)   17.6 | cuda(32, 32)   18.1
+  qkv_gate  m= 16 n=2304: triton   10.9 | cuda(16, 16)   22.1 | cuda(16, 32)   17.6 | cuda(32, 16)   22.1 | cuda(32, 32)   18.7
+  qkv_gate  m= 32 n=2304: triton   15.6 | cuda(32, 16)   30.8 | cuda(32, 32)   21.9
+  router    m=  1 n=256: triton    5.3 | cuda(16, 16)   14.8 | cuda(16, 32)   32.3 | cuda(32, 16)   20.7 | cuda(32, 32)   24.4
+  router    m=  8 n=256: triton    5.1 | cuda(16, 16)   15.0 | cuda(16, 32)   32.5 | cuda(32, 16)   20.7 | cuda(32, 32)   25.1
+  router    m= 16 n=256: triton    5.1 | cuda(16, 16)   16.1 | cuda(16, 32)   33.0 | cuda(32, 16)   20.8 | cuda(32, 32)   26.2
+  router    m= 32 n=256: triton    6.2 | cuda(32, 16)   23.9 | cuda(32, 32)   29.3
+BENCH proj large m: cuBLAS vs TMA wgmma split-K (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages)
+BENCH proj done in 46s
