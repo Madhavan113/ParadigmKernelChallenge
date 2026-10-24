@@ -156,9 +156,12 @@ _NIBBLE_ASM = tl.constexpr("""
 
 
 @triton.jit
-def _dequant(wq, sf, gs, ASM: tl.constexpr):
+def _dequant(wq, sf, gs, ASM: tl.constexpr, MODE: tl.constexpr = 0):
     """wq uint8 [BN, BK/2] packed E2M1, sf fp8 [BN, BK/16], gs fp32 (x 2^14) -> fp16 [BN, BK]."""
-    if ASM:
+    if MODE == 5:
+        lo = wq.to(tl.float16)
+        hi = lo
+    elif ASM:
         lo, hi = tl.inline_asm_elementwise(
             asm=_NIBBLE_ASM, constraints="=r,=r,=r,=r,r", args=[wq],
             dtype=(tl.float16, tl.float16), is_pure=True, pack=4)
@@ -168,6 +171,8 @@ def _dequant(wq, sf, gs, ASM: tl.constexpr):
         lo = (((lo & 7) << 9) | ((lo & 8) << 12)).to(tl.float16, bitcast=True)
         hi = (((hi & 7) << 9) | ((hi & 8) << 12)).to(tl.float16, bitcast=True)
     w = tl.interleave(lo, hi)                                   # [BN, BK]
+    if MODE == 4:
+        return w
     s = (sf.to(tl.float32) * gs).to(tl.float16)                 # [BN, BK/16]
     s = tl.interleave(s, s)
     s = tl.interleave(s, s)
@@ -217,9 +222,9 @@ def _moe_gemm_kernel(
             s2_ptrs = s_ptrs + up_rows * stride_sn
             acc2 = tl.zeros((BM, BN), dtype=tl.float32)
         if MODE == 1:
-            wf_ptrs = w_ptr.to(tl.pointer_type(tl.float16)) + e * (stride_we * 2) + offs_n[:, None] * (stride_wn * 2) + offs_k[None, :]
+            wf_ptrs = w_ptr.to(tl.pointer_type(tl.float16)) + e * (stride_we // 2) + offs_n[:, None] * (stride_wn // 2) + offs_k[None, :]
             if GATED:
-                wf2_ptrs = wf_ptrs + up_rows * (stride_wn * 2)
+                wf2_ptrs = wf_ptrs + up_rows * (stride_wn // 2)
         for _ in range(0, K, BK):
             a = tl.load(a_ptrs, mask=rmask[:, None], other=0.0)
             if MODE == 1:
@@ -236,7 +241,7 @@ def _moe_gemm_kernel(
                 if MODE == 3:
                     acc += tl.sum(wq.to(tl.float32), 1)[None, :] + tl.sum(sf.to(tl.float32), 1)[None, :]
                 else:
-                    w = _dequant(wq, sf, gs, ASM)
+                    w = _dequant(wq, sf, gs, ASM, MODE)
                     if MODE == 2:
                         acc += tl.sum(w.to(tl.float32), 1)[None, :]
                     else:
@@ -247,7 +252,7 @@ def _moe_gemm_kernel(
                     if MODE == 3:
                         acc2 += tl.sum(wq2.to(tl.float32), 1)[None, :] + tl.sum(sf2.to(tl.float32), 1)[None, :]
                     else:
-                        w2 = _dequant(wq2, sf2, gs, ASM)
+                        w2 = _dequant(wq2, sf2, gs, ASM, MODE)
                         if MODE == 2:
                             acc2 += tl.sum(w2.to(tl.float32), 1)[None, :]
                         else:
@@ -454,15 +459,31 @@ def _bench(state):
         return e0.elapsed_time(e1) * 1000.0 / (3 * reps)
 
     global _MODE
-    print("BENCH moe (graph replays): ablations with the default configs; MODE 0 full, 1 fp16 weights no dequant,"
-          " 2 dequant no dot, 3 loads only")
-    for mode in (0, 1, 2, 3):
+    print("BENCH moe (graph replays): ablations, dot kept in every mode. MODE 0 full | 1 fp16 weights, no dequant"
+          " (2x bytes) | 4 no scale multiply | 5 numeric nibble->fp16 (no asm) | 2 dequant, no dot | 3 loads only")
+    E = state["w13"].shape[0]
+    saved = (state["w13"], state["w2"], _GEMM_OVERRIDE)
+    try:
+        dummy13 = torch.randn((min(E, 32), 8192, 4096), device=dev).to(torch.float16).view(torch.uint8)
+        dummy2 = torch.randn((min(E, 32), 4096, 4096), device=dev).to(torch.float16).view(torch.uint8)
+    except Exception as e:
+        dummy13 = dummy2 = None
+        print("  (no fp16 dummy weights:", str(e)[:60], ")")
+    for mode in (0, 4, 5, 1, 2, 3):
         _MODE = mode
+        _GEMM_OVERRIDE = (16, 64, 64, 4, 4) if mode == 1 else None
+        if mode == 1:
+            if dummy13 is None:
+                continue
+            state["w13"], state["w2"] = dummy13, dummy2
         try:
             r = [timeit(lambda bs=bs: _moe_forward(*data[bs][:3], 0, 4096, state)) for bs in (1, 8, 16, 32, 128, 256)]
             print(f"  MODE {mode}: " + "  ".join(f"bs{bs} {t:7.1f}" for bs, t in zip((1, 8, 16, 32, 128, 256), r)))
         except Exception as e:
             print(f"  MODE {mode} failed: {str(e)[:100]}")
+        state["w13"], state["w2"] = saved[0], saved[1]
+    del dummy13, dummy2
+    _GEMM_OVERRIDE = saved[2]
     _MODE = 0
     cands = [(16, 32, 256, 4, 4), (16, 64, 128, 4, 4), (16, 32, 128, 4, 6), (16, 64, 128, 8, 4), (16, 32, 256, 4, 6)]
     big = [(64, 64, 128, 4, 4), (64, 128, 128, 8, 3), (64, 64, 128, 8, 3)]

@@ -1009,9 +1009,12 @@ _NIBBLE_ASM = tl.constexpr("""
 
 
 @triton.jit
-def _dequant(wq, sf, gs, ASM: tl.constexpr):
+def _dequant(wq, sf, gs, ASM: tl.constexpr, MODE: tl.constexpr = 0):
     """wq uint8 [BN, BK/2] packed E2M1, sf fp8 [BN, BK/16], gs fp32 (x 2^14) -> fp16 [BN, BK]."""
-    if ASM:
+    if MODE == 5:
+        lo = wq.to(tl.float16)
+        hi = lo
+    elif ASM:
         lo, hi = tl.inline_asm_elementwise(
             asm=_NIBBLE_ASM, constraints="=r,=r,=r,=r,r", args=[wq],
             dtype=(tl.float16, tl.float16), is_pure=True, pack=4)
@@ -1021,6 +1024,8 @@ def _dequant(wq, sf, gs, ASM: tl.constexpr):
         lo = (((lo & 7) << 9) | ((lo & 8) << 12)).to(tl.float16, bitcast=True)
         hi = (((hi & 7) << 9) | ((hi & 8) << 12)).to(tl.float16, bitcast=True)
     w = tl.interleave(lo, hi)                                   # [BN, BK]
+    if MODE == 4:
+        return w
     s = (sf.to(tl.float32) * gs).to(tl.float16)                 # [BN, BK/16]
     s = tl.interleave(s, s)
     s = tl.interleave(s, s)
@@ -1070,9 +1075,9 @@ def _moe_gemm_kernel(
             s2_ptrs = s_ptrs + up_rows * stride_sn
             acc2 = tl.zeros((BM, BN), dtype=tl.float32)
         if MODE == 1:
-            wf_ptrs = w_ptr.to(tl.pointer_type(tl.float16)) + e * (stride_we * 2) + offs_n[:, None] * (stride_wn * 2) + offs_k[None, :]
+            wf_ptrs = w_ptr.to(tl.pointer_type(tl.float16)) + e * (stride_we // 2) + offs_n[:, None] * (stride_wn // 2) + offs_k[None, :]
             if GATED:
-                wf2_ptrs = wf_ptrs + up_rows * (stride_wn * 2)
+                wf2_ptrs = wf_ptrs + up_rows * (stride_wn // 2)
         for _ in range(0, K, BK):
             a = tl.load(a_ptrs, mask=rmask[:, None], other=0.0)
             if MODE == 1:
@@ -1089,7 +1094,7 @@ def _moe_gemm_kernel(
                 if MODE == 3:
                     acc += tl.sum(wq.to(tl.float32), 1)[None, :] + tl.sum(sf.to(tl.float32), 1)[None, :]
                 else:
-                    w = _dequant(wq, sf, gs, ASM)
+                    w = _dequant(wq, sf, gs, ASM, MODE)
                     if MODE == 2:
                         acc += tl.sum(w.to(tl.float32), 1)[None, :]
                     else:
@@ -1100,7 +1105,7 @@ def _moe_gemm_kernel(
                     if MODE == 3:
                         acc2 += tl.sum(wq2.to(tl.float32), 1)[None, :] + tl.sum(sf2.to(tl.float32), 1)[None, :]
                     else:
-                        w2 = _dequant(wq2, sf2, gs, ASM)
+                        w2 = _dequant(wq2, sf2, gs, ASM, MODE)
                         if MODE == 2:
                             acc2 += tl.sum(w2.to(tl.float32), 1)[None, :]
                         else:
