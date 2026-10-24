@@ -357,7 +357,7 @@ def _attn_bench(data):
 
 def _attention_forward(data) -> torch.Tensor:
     global _BENCH_DONE
-    if ATTN_BENCH and not _BENCH_DONE and not torch.cuda.is_current_stream_capturing():
+    if ATTN_BENCH and not _BENCH_DONE and torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
         _BENCH_DONE = True
         try:
             _attn_bench(data)
