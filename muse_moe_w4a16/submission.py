@@ -799,6 +799,10 @@ __device__ __forceinline__ uint32_t e4m3x2_hi16_to_f16x2(uint32_t w) {
 // programmatic dependent launch (no-ops when the kernel was launched without the attribute)
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2::evict_last [%0];\n" :: "l"(p)); }
+__device__ __forceinline__ void cp_async16_pol(uint32_t dst, const void* src, int src_bytes, uint64_t pol) {
+    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" :: "r"(dst), "l"(src), "r"(src_bytes), "l"(pol));
+}
 
 constexpr int WT_NWARPS = 4;
 __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
@@ -810,11 +814,11 @@ __global__ void __launch_bounds__(128 * KS)
 moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     const int* __restrict__ sorted_tok,
                     const int* __restrict__ blk_e, const int* __restrict__ blk_row0,
-                    const int* __restrict__ blk_end, const int* __restrict__ nblk,
+                    const int* __restrict__ blk_end, const int* __restrict__ nblk, const int* __restrict__ blk_bm,
                     const uint8_t* __restrict__ Wr, const uint8_t* __restrict__ Sr, const float* __restrict__ gs,
                     __half* __restrict__ out16, __nv_bfloat16* __restrict__ out_bf, int ldo,
                     float* __restrict__ part, int ldp, int part_rows, int* __restrict__ counters,
-                    int K, int NTILES, float gs_mul)
+                    int K, int NTILES, float gs_mul, int l2pf)
 {
     // gridDim.z > 1: split-K; CTA z owns chunks [z*NC/KSPLIT, (z+1)*NC/KSPLIT) and writes its fp32 partial
     // sums (times gs) to part[z][row][col] (GATED: gate at col, up at col + N/2); the last CTA to arrive at
@@ -829,8 +833,10 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     extern __shared__ __align__(16) uint8_t wt_smem[];
 
     if (GATED) pdl_wait();                            // the routing lists and x16 come from the previous launch
+    if (GATED && l2pf) pdl_trigger();                 // small batches: let GEMM2's CTAs pre-launch and prefetch W2
     const int j = blockIdx.y;
     if (j >= *nblk) return;
+    if (blk_bm[j] != 8 * NT) return;                  // mixed block sizes: this block belongs to the other kernel
     const int e = blk_e[j];
     const int row0 = blk_row0[j];
     const int nrows = blk_end[j] - row0;              // valid tokens in this block (<= 8*NT)
@@ -875,13 +881,16 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
     const uint32_t smem_base = smem_u32(wt_smem);
 
+    uint64_t pol;
+    if (l2pf) asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
+    else asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;\n" : "=l"(pol));
     auto issue_w = [&](int c, int stage) {
         const uint32_t ws = smem_base + stage * STAGE_BYTES;
         const uint32_t ss = ws + W_STAGE;
         #pragma unroll
         for (int i = 0; i < WSEG; ++i)
-            cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 1024, 16);
-        if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * 128, 16);
+            cp_async16_pol(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 1024, 16, pol);
+        if (tid < TPC * 8) cp_async16_pol(ss + tid * 16, ssrc + c * 128, 16, pol);
     };
     auto issue_x = [&](int c, int stage) {
         const uint32_t xs = smem_base + stage * STAGE_BYTES + W_STAGE + S_STAGE;
@@ -916,6 +925,24 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         #pragma unroll
         for (int st = 0; st < NSTAGE - 1; ++st)
             if (st < NC) issue_w(st, st);
+        if (l2pf && (tid & 7) == 0) {
+            // prefetch the rest of this slice and the same tiles of the next two blocks (their experts) into L2
+            for (int k = 0; k < 3; ++k) {
+                const int jb = j + k;
+                if (jb >= *nblk) break;
+                const size_t eb = (size_t)blk_e[jb] * NTILES;
+                #pragma unroll
+                for (int i = 0; i < WSEG; ++i) {
+                    const int sidx = tid + i * NTHR;
+                    const uint8_t* wb = Wr + ((eb + tile_of(sidx >> 6)) * NC_ALL + c0) * 1024 + (sidx & 63) * 16;
+                    for (int c = k == 0 ? NSTAGE - 1 : 0; c < NC; ++c) prefetch_l2(wb + c * 1024);
+                }
+                if (tid < TPC * 8) {
+                    const uint8_t* sb = Sr + ((eb + tile_of(tid >> 3)) * NC_ALL + c0) * 128 + (tid & 7) * 16;
+                    for (int c = k == 0 ? NSTAGE - 1 : 0; c < NC; ++c) prefetch_l2(sb + c * 128);
+                }
+            }
+        }
         pdl_wait();
         #pragma unroll
         for (int st = 0; st < NSTAGE - 1; ++st) {
@@ -997,7 +1024,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             }
         }
     }
-    pdl_trigger();                                    // main loop done: the next kernel may start launching
+    if (!(GATED && l2pf)) pdl_trigger();              // main loop done: the next kernel may start launching
     cp_async_wait<0>();
 
     if (KS == 2) {
@@ -1095,10 +1122,10 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
 }
 
 template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, int ABL>
-void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
+void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb, const int* bbm,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
                float* part, int ldp, int part_rows, int* counters, int ksplit,
-               int K, int ntiles, int max_blocks, float gs_mul, bool pdl, cudaStream_t stream)
+               int K, int ntiles, int max_blocks, float gs_mul, bool pdl, bool l2pf, cudaStream_t stream)
 {
     constexpr int TPW = (GATED ? 2 : 1) * MW;
     constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT);
@@ -1119,7 +1146,7 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
     const cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, ABL>,
-        X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul);
+        X, ldx, st, be, br, bend, nb, bbm, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul, (int)l2pf);
     TORCH_CHECK(err == cudaSuccess, "wt launch failed: ", cudaGetErrorString(err));
 }
 
@@ -1201,8 +1228,8 @@ template <int TOPK, int E, int MAXCH>
 __global__ void __launch_bounds__(1024)
 moe_route_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ x, __half* __restrict__ x16,
                  int* __restrict__ sorted_tok, int* __restrict__ row_of_pair, int* __restrict__ blk_e,
-                 int* __restrict__ blk_row0, int* __restrict__ blk_end, int* __restrict__ nblk,
-                 int M, int local_start, int BM, int n_elems, float xscale)
+                 int* __restrict__ blk_row0, int* __restrict__ blk_end, int* __restrict__ nblk, int* __restrict__ blk_bm,
+                 int M, int local_start, int BM, int BM2, int n_elems, float xscale)
 {
     const int tid = threadIdx.x;
     if (blockIdx.x > 0) {                                        // x -> fp16, 8 elements per thread
@@ -1226,7 +1253,7 @@ moe_route_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ 
     __shared__ int wc[NW][E];                                    // this chunk's pairs per (warp, expert)
     __shared__ int wp[NW][E];                                    // exclusive prefix over the warps
     __shared__ int base[E];                                      // pairs of the earlier chunks
-    __shared__ int pad_off[E], blk_off[E], nb_s[E], cnt_s[E];
+    __shared__ int pad_off[E], blk_off[E], nb_s[E], cnt_s[E], bm_s[E];
     __shared__ int total_s;
     const int warp = tid >> 5, lane = tid & 31;
     const int npairs = M * TOPK;
@@ -1262,15 +1289,16 @@ moe_route_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ 
     }
     if (warp == 0) {                                             // lane e: counts -> padded rows, block offsets
         const int cnt = base[lane];
-        const int padded = (cnt + BM - 1) / BM * BM;
-        const int nb = padded / BM;
+        const int bm = (BM2 > 0 && cnt > BM) ? BM2 : BM;          // heavier experts get the larger blocks
+        const int padded = (cnt + bm - 1) / bm * bm;
+        const int nb = padded / bm;
         int po = padded, bo = nb;
         #pragma unroll
         for (int o = 1; o < 32; o <<= 1) {
             const int a = __shfl_up_sync(0xffffffffu, po, o), b = __shfl_up_sync(0xffffffffu, bo, o);
             if (lane >= o) { po += a; bo += b; }
         }
-        cnt_s[lane] = cnt; pad_off[lane] = po - padded; blk_off[lane] = bo - nb; nb_s[lane] = nb;
+        cnt_s[lane] = cnt; pad_off[lane] = po - padded; blk_off[lane] = bo - nb; nb_s[lane] = nb; bm_s[lane] = bm;
         if (lane == 31) total_s = bo;
     }
     __syncthreads();
@@ -1296,8 +1324,9 @@ moe_route_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ 
         #pragma unroll
         for (int e = 1; e < E; ++e) ej += (blk_off[e] <= j);     // blk_off is non-decreasing: the expert of block j
         blk_e[j] = ej + local_start;
-        blk_row0[j] = pad_off[ej] + (j - blk_off[ej]) * BM;
+        blk_row0[j] = pad_off[ej] + (j - blk_off[ej]) * bm_s[ej];
         blk_end[j] = pad_off[ej] + cnt_s[ej];
+        blk_bm[j] = bm_s[ej];
     }
     if (tid == 0) nblk[0] = total;
 }
@@ -1340,10 +1369,10 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
 }
 
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
-                  torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
+                  torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor blk_bm, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
                   torch::Tensor out, torch::Tensor part, torch::Tensor counters, int64_t ksplit, int64_t K, int64_t ntiles,
                   int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, int64_t abl,
-                  bool pdl)
+                  bool pdl, bool l2pf)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const __half* Xp = reinterpret_cast<const __half*>(X.data_ptr());
@@ -1362,8 +1391,8 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         TORCH_CHECK(counters.numel() >= max_blocks * n_x, "split-K counters too small");
     }
 #define OKC_W(G, M, T, S, NS, SK, AB) launch_wt<G, M, T, S, NS, SK, AB>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
-        blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
-        pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
+        blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), blk_bm.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
+        pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, l2pf, stream)
     const int key = (int)abl * 10000000 + (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
     switch (key) {
         case 111102: OKC_W(true, 1, 1, 1, 2, false, 0); break;   case 111104: OKC_W(true, 1, 1, 1, 4, false, 0); break;
@@ -1412,8 +1441,8 @@ void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, 
 }
 
 void moe_route(torch::Tensor ids, torch::Tensor x, torch::Tensor x16, torch::Tensor sorted_tok, torch::Tensor row_of_pair,
-               torch::Tensor blk_e, torch::Tensor blk_row0, torch::Tensor blk_end, torch::Tensor nblk,
-               int64_t M, int64_t local_start, int64_t BM, double xscale)
+               torch::Tensor blk_e, torch::Tensor blk_row0, torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor blk_bm,
+               int64_t M, int64_t local_start, int64_t BM, int64_t BM2, double xscale)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)x.size(1);
@@ -1424,7 +1453,7 @@ void moe_route(torch::Tensor ids, torch::Tensor x, torch::Tensor x16, torch::Ten
     moe_route_kernel<8, 32, 8><<<grid, 1024, 0, stream>>>(
         ids.data_ptr<int>(), reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<__half*>(x16.data_ptr()),
         sorted_tok.data_ptr<int>(), row_of_pair.data_ptr<int>(), blk_e.data_ptr<int>(), blk_row0.data_ptr<int>(),
-        blk_end.data_ptr<int>(), nblk.data_ptr<int>(), (int)M, (int)local_start, (int)BM, n_elems, (float)xscale);
+        blk_end.data_ptr<int>(), nblk.data_ptr<int>(), blk_bm.data_ptr<int>(), (int)M, (int)local_start, (int)BM, (int)BM2, n_elems, (float)xscale);
 }
 """
 
@@ -1436,15 +1465,15 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
                     torch::Tensor out, torch::Tensor scratch, int64_t K, int64_t N, int64_t max_blocks, bool gated,
                     int64_t mt, int64_t nper, int64_t ks, int64_t ksplit);
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
-                  torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
+                  torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor blk_bm, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
                   torch::Tensor out, torch::Tensor part, torch::Tensor counters, int64_t ksplit, int64_t K, int64_t ntiles,
                   int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, int64_t abl,
-                  bool pdl);
+                  bool pdl, bool l2pf);
 void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, torch::Tensor nw, torch::Tensor out,
                   int64_t M, double eps, bool pdl);
 void moe_route(torch::Tensor ids, torch::Tensor x, torch::Tensor x16, torch::Tensor sorted_tok, torch::Tensor row_of_pair,
-               torch::Tensor blk_e, torch::Tensor blk_row0, torch::Tensor blk_end, torch::Tensor nblk,
-               int64_t M, int64_t local_start, int64_t BM, double xscale);
+               torch::Tensor blk_e, torch::Tensor blk_row0, torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor blk_bm,
+               int64_t M, int64_t local_start, int64_t BM, int64_t BM2, double xscale);
 """
 
 _EXT = None
@@ -1582,6 +1611,12 @@ _WT_OVERRIDE = None
 _WT_ABL = 0            # bench ablation of the wt GEMMs (1 = no mma, 2 = no dequant, 3 = loads only)
 PDL = True             # programmatic dependent launch GEMM1 -> GEMM2 -> finalize
 _PDL_OVERRIDE = None   # bench: False forces plain launches
+# mixed block sizes above this many tokens: experts with more rows than the policy's block get the big variant's blocks
+WT_BIG = {128: (4, 2, 1, 2, 1), 100000: (4, 2, 1, 2, 1)}
+MIXED_MIN_TOKENS = 65
+_MIXED_OVERRIDE = None
+L2PF_MAX_TOKENS = 16   # up to this many tokens GEMM2 prefetches its W2 slice into L2 while GEMM1 runs (PDL)
+_L2PF_OVERRIDE = None
 
 
 def _wt_variant(M: int, state):
@@ -1602,14 +1637,31 @@ def _wt_variant(M: int, state):
 ROUTE_CUDA = True   # the one-launch CUDA routing kernel (ranks + block list + fp16 copy of x) instead of the Triton one
 
 
-def _route_wt(x, ids, local_start: int, BM: int, state, ext):
+def _wt_big_variant(M: int, state, small):
+    """The variant for the heavier experts' blocks (None: a single block size)."""
+    mixed = (M >= MIXED_MIN_TOKENS) if _MIXED_OVERRIDE is None else _MIXED_OVERRIDE
+    if not mixed or _WT_OVERRIDE is not None:
+        return None
+    keys = sorted(WT_BIG)
+    v = WT_BIG[keys[-1]]
+    for k in keys:
+        if M <= k:
+            v = WT_BIG[k]
+            break
+    if v[0] <= small[0] or v in state.get("wt_bad", ()):
+        return None
+    return v
+
+
+def _route_wt(x, ids, local_start: int, BM: int, state, ext, BM2: int = 0):
     M, H = x.shape
     if not ROUTE_CUDA:
+        state["blk_bm"].fill_(BM)
         return _route(x, ids, local_start, BM, state, marlin=False)
     NP = max(16, triton.next_power_of_2(M * TOPK))
     MAXB = triton.next_power_of_2(NP // BM + LOCAL)
     ext.moe_route(ids, x.contiguous(), state["x16"], state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"],
-                  state["blk_end"], state["nblk"], M, local_start, BM, float(state.get("xscale", 1.0)))
+                  state["blk_end"], state["nblk"], state["blk_bm"], M, local_start, BM, BM2, float(state.get("xscale", 1.0)))
     return NP, MAXB
 
 
@@ -1626,13 +1678,17 @@ def _moe_forward_wt(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor
         ids = ids.to(torch.int32)
     ids = ids.contiguous()
     tw = tw.contiguous()
-    nt, mw2, ks, nstage, ksplit = _wt_variant(M, state)
+    small = _wt_variant(M, state)
+    nt, mw2, ks, nstage, ksplit = small
+    big = _wt_big_variant(M, state, small)
     pdl = PDL if _PDL_OVERRIDE is None else _PDL_OVERRIDE
+    l2pf = pdl and ((M <= L2PF_MAX_TOKENS) if _L2PF_OVERRIDE is None else _L2PF_OVERRIDE)
     BM = 8 * nt
+    BM2 = 8 * big[0] if big is not None else 0
     if M * TOPK + LOCAL * (BM - 1) > PART_ROWS:
         ksplit = 1
     ext = build()
-    NP, MAXB = _route_wt(x, ids, local_start, BM, state, ext)
+    NP, MAXB = _route_wt(x, ids, local_start, BM, state, ext, BM2)
     maxb = min(MAXB, _wt_max_blocks(M, BM))
     x16 = state["x16"][:M]
     out = torch.empty((M, H), dtype=MOE_OUT_DTYPE, device=x.device)
@@ -1640,12 +1696,19 @@ def _moe_forward_wt(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor
     y = state["y"]
     part = state["part"]
     counters = state["counters"]
-    ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                     state["Wt13"], state["St13"], state["gs13"], inter, part, counters, ksplit, H, 2 * I // 16, maxb, True, 1, nt, ks,
-                     nstage, state["gs_mul"], _WT_ABL, pdl)
-    ext.moe_w4a16_wt(inter, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                     state["Wt2"], state["St2"], state["gs2"], y, part, counters, ksplit, I, H // 16, maxb, False, mw2, nt, ks, nstage,
-                     state["gs_mul"], _WT_ABL, pdl)
+    lists = (state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"], state["blk_bm"])
+    # the big variant's launch is a plain one (its blocks are independent of the small kernel's, and stream order
+    # keeps the next PDL kernel's wait covering both)
+    ext.moe_w4a16_wt(x16, *lists, state["Wt13"], state["St13"], state["gs13"], inter, part, counters, ksplit, H, 2 * I // 16, maxb,
+                     True, 1, nt, ks, nstage, state["gs_mul"], _WT_ABL, pdl, l2pf)
+    if big is not None:
+        ext.moe_w4a16_wt(x16, *lists, state["Wt13"], state["St13"], state["gs13"], inter, part, counters, 1, H, 2 * I // 16, maxb,
+                         True, 1, big[0], big[2], big[3], state["gs_mul"], _WT_ABL, False, False)
+    ext.moe_w4a16_wt(inter, *lists, state["Wt2"], state["St2"], state["gs2"], y, part, counters, ksplit, I, H // 16, maxb,
+                     False, mw2, nt, ks, nstage, state["gs_mul"], _WT_ABL, pdl, l2pf)
+    if big is not None:
+        ext.moe_w4a16_wt(inter, *lists, state["Wt2"], state["St2"], state["gs2"], y, part, counters, 1, I, H // 16, maxb,
+                         False, big[1], big[0], big[2], big[3], state["gs_mul"], _WT_ABL, False, False)
     ext.moe_finalize(y, state["row_of_pair"], tw, state["norm_w"], out, M, POST_NORM_EPS, pdl)
     return out
 
@@ -1712,6 +1775,7 @@ def _moe_state(weights) -> dict:
         "blk_row0": torch.zeros((maxb,), dtype=torch.int32, device=dev),
         "blk_end": torch.zeros((maxb,), dtype=torch.int32, device=dev),
         "nblk": torch.zeros((1,), dtype=torch.int32, device=dev),
+        "blk_bm": torch.zeros((maxb,), dtype=torch.int32, device=dev),
         "inter": torch.empty((rows_max, I), dtype=torch.float16, device=dev),
         "y": torch.empty((rows_max, H), dtype=torch.bfloat16, device=dev),
         "sorted_pair": torch.zeros((rows_max,), dtype=torch.int32, device=dev),
@@ -2115,15 +2179,20 @@ WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 2, 1, 4, 1), (2, 2, 1,
 def _selftest_wt(state):
     """Every wt variant against the Marlin path on judge-like routings; variants that are off are excluded."""
     import time
-    global _WT_OVERRIDE
+    global _WT_OVERRIDE, _MIXED_OVERRIDE, MIXED_MIN_TOKENS
     t0 = time.time()
     dev = state["w13"].device
     worst = {}
     for bs, dist, seed in ((1, "normal", 1), (4, "normal", 2), (33, "normal", 3), (128, "skewed", 4), (257, "normal", 5)):
         x, ids, tw = _judge_inputs(bs, dev, seed=seed, dist=dist)
         ref = _moe_forward_marlin(x, ids, tw, 0, 4096, state).float()
-        for v in WT_TEST_VARIANTS:
-            _WT_OVERRIDE = v
+        for v in WT_TEST_VARIANTS + ("mixed",):
+            if v == "mixed":
+                if bs < MIXED_MIN_TOKENS:
+                    continue
+                _MIXED_OVERRIDE = True
+            else:
+                _WT_OVERRIDE = v
             try:
                 out = _moe_forward_wt(x, ids, tw, 0, 4096, state).float()
                 torch.cuda.synchronize()
@@ -2135,9 +2204,12 @@ def _selftest_wt(state):
                 print(f"  selftest bs={bs} {v} failed: {str(e)[:100]}")
             finally:
                 _WT_OVERRIDE = None
+                _MIXED_OVERRIDE = None
             worst[v] = max(worst.get(v, 0.0), err)
-        print(f"  selftest bs={bs:3d} {dist:6s}: " + " ".join(f"{v}:{worst[v]:.2e}" for v in WT_TEST_VARIANTS))
+        print(f"  selftest bs={bs:3d} {dist:6s}: " + " ".join(f"{v}:{worst[v]:.2e}" for v in worst))
     bad = {v for v, e in worst.items() if not e < 1.2e-2}   # a broken variant is off by O(1); Marlin itself differs by ~6e-3
+    if "mixed" in bad:
+        MIXED_MIN_TOKENS = 10 ** 9
     state["wt_bad"] = bad
     state["wt_ok"] = WT_SAFE not in bad
     print(f"selftest wt: bad variants {sorted(bad)} -> {'enabled' if state['wt_ok'] else 'DISABLED'} ({time.time() - t0:.0f}s)")
@@ -2176,10 +2248,10 @@ def _bench_wt(state, autotune=False):
         parts = {
             "route": lambda: _route_wt(x, ids, 0, BM, state, ext),
             "route_triton": lambda: _route(x, ids, 0, BM, state, marlin=False),
-            "gemm1": lambda: ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                              state["Wt13"], state["St13"], state["gs13"], state["inter"], part, counters, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, state["gs_mul"], _WT_ABL, False),
-            "gemm2": lambda: ext.moe_w4a16_wt(state["inter"], state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                              state["Wt2"], state["St2"], state["gs2"], state["y"], part, counters, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, state["gs_mul"], _WT_ABL, False),
+            "gemm1": lambda: ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"], state["blk_bm"],
+                                              state["Wt13"], state["St13"], state["gs13"], state["inter"], part, counters, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, state["gs_mul"], _WT_ABL, False, False),
+            "gemm2": lambda: ext.moe_w4a16_wt(state["inter"], state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"], state["blk_bm"],
+                                              state["Wt2"], state["St2"], state["gs2"], state["y"], part, counters, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, state["gs_mul"], _WT_ABL, False, False),
             "finalize": lambda: ext.moe_finalize(state["y"], state["row_of_pair"], tw, state["norm_w"], out, bs, POST_NORM_EPS, False),
         }
         try:
@@ -2187,7 +2259,17 @@ def _bench_wt(state, autotune=False):
                   + f"  | local routes {int(((ids >= 0) & (ids < 32)).sum())} distinct {int(torch.unique(ids[(ids < 32)]).numel())}")
         except Exception as e:
             print(f"  wt parts bs{bs} failed: {str(e)[:100]}")
-    global _WT_ABL, _PDL_OVERRIDE
+    global _WT_ABL, _PDL_OVERRIDE, _MIXED_OVERRIDE, _L2PF_OVERRIDE
+    for name, var in (("mixed", "_MIXED_OVERRIDE"), ("l2pf", "_L2PF_OVERRIDE")):
+        for flag in (False, True):
+            globals()[var] = flag
+            try:
+                r = [_timeit_cold(lambda bs=bs: _moe_forward_wt(*data[bs], 0, 4096, state), dev) for bs in shapes]
+                print(f"  wt {name}={int(flag)}    : " + "  ".join(f"bs{bs} {t:7.1f}" for bs, t in zip(shapes, r)))
+            except Exception as e:
+                print(f"  wt {name}={int(flag)} failed: {str(e)[:80]}")
+            finally:
+                globals()[var] = None
     for flag in (False, True):
         _PDL_OVERRIDE = flag
         try:
@@ -2208,10 +2290,10 @@ def _bench_wt(state, autotune=False):
         for abl in (0, 1, 2, 3):
             _WT_ABL = abl
             try:
-                t1 = _timeit_cold(lambda: ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                                        state["Wt13"], state["St13"], state["gs13"], state["inter"], part, counters, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, state["gs_mul"], _WT_ABL, False), dev)
-                t2 = _timeit_cold(lambda: ext.moe_w4a16_wt(state["inter"], state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                                        state["Wt2"], state["St2"], state["gs2"], state["y"], part, counters, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, state["gs_mul"], _WT_ABL, False), dev)
+                t1 = _timeit_cold(lambda: ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"], state["blk_bm"],
+                                                        state["Wt13"], state["St13"], state["gs13"], state["inter"], part, counters, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, state["gs_mul"], _WT_ABL, False, False), dev)
+                t2 = _timeit_cold(lambda: ext.moe_w4a16_wt(state["inter"], state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"], state["blk_bm"],
+                                                        state["Wt2"], state["St2"], state["gs2"], state["y"], part, counters, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, state["gs_mul"], _WT_ABL, False, False), dev)
             except Exception as e:
                 t1 = t2 = float("nan")
                 print(f"  ablation bs{bs} abl={abl} failed: {str(e)[:80]}")
