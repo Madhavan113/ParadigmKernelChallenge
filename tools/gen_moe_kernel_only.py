@@ -15,8 +15,8 @@ for g, m, p, s in re.findall(r"OKC_L\((true|false), (\d), (\d), (\d)\)", cu):
     inst.append(f"template void launch<{g}, {m}, {p}, {s}>{sig};")
 wsig = ("(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, "
         "const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t)")
-for g, m, t, s, n in re.findall(r"OKC_W\((true|false), (\d), (\d), (\d), (\d)\)", cu):
-    inst.append(f"template void launch_wt<{g}, {m}, {t}, {s}, {n}>{wsig};")
+for g, m, t, s, n, sk in re.findall(r"OKC_W\((true|false), (\d), (\d), (\d), (\d), (true|false)\)", cu):
+    inst.append(f"template void launch_wt<{g}, {m}, {t}, {s}, {n}, {sk}>{wsig};")
 # keep the finalize kernel referenced
 inst.append("void* finalize_ref = (void*)&moe_finalize_kernel;")
 out = body + "\n".join(inst) + "\n} // namespace\n"

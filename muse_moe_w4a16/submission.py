@@ -796,7 +796,7 @@ __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
     return tpw * WT_NWARPS * 1024 + tpw * WT_NWARPS * 128 + 8 * nt * A_STRIDE * 2;
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK>
 __global__ void __launch_bounds__(128 * KS)
 moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     const int* __restrict__ sorted_tok,
@@ -828,10 +828,10 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     const int tid = threadIdx.x;
     const int warp = (tid >> 5) & 3, lane = tid & 31, gidx = tid >> 7;
     const int g = lane >> 2, t = lane & 3;
-    const int KSPLIT = gridDim.z;
+    const int KSPLIT = SPLITK ? (int)gridDim.z : 1;
     const int NC_ALL = K / KC;
     const int NC = NC_ALL / KSPLIT;                   // chunks of this CTA
-    const int c0 = blockIdx.z * NC;
+    const int c0 = SPLITK ? (int)blockIdx.z * NC : 0;
 
     // CTA tile ti (0..TPC-1) -> global m16 tile index
     auto tile_of = [&](int ti) {
@@ -983,8 +983,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
 
     // C fragment: rows (weight rows) g, g+8 of the tile -> output column; cols (tokens) 2t, 2t+1
-    __shared__ int s_last;
-    if (KSPLIT > 1) {
+    if constexpr (SPLITK) {
+        __shared__ int s_last;
         #pragma unroll
         for (int i = 0; i < MW; ++i) {
             const int tile = (blockIdx.x * WT_NWARPS + warp) * MW + i;
@@ -1028,7 +1028,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     if (tok >= nrows) continue;
                     float gv = acc[i][nb * CH][2 * hr + cc] * gsf;
                     float uv = GATED ? acc[MW + i][nb * CH][2 * hr + cc] * gsf : 0.f;
-                    if (KSPLIT > 1) {
+                    if constexpr (SPLITK) {
                         for (int z = 0; z < KSPLIT; ++z) {
                             if (z == (int)blockIdx.z) continue;
                             const float* pp = part + ((size_t)z * part_rows + row0 + tok) * ldp + col;
@@ -1049,7 +1049,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK>
 void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
                float* part, int ldp, int part_rows, int* counters, int ksplit,
@@ -1059,12 +1059,12 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
     constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT);
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         attr_set = true;
     }
     const int n_x = (GATED ? ntiles / 2 : ntiles) / (WT_NWARPS * MW);
     dim3 grid(n_x, max_blocks, ksplit);
-    moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE><<<grid, 128 * KS, smem, stream>>>(
+    moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK><<<grid, 128 * KS, smem, stream>>>(
         X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul);
 }
 
@@ -1187,20 +1187,28 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         const int n_x = (gated ? ntiles / 2 : ntiles) / (WT_NWARPS * mw);
         TORCH_CHECK(counters.numel() >= max_blocks * n_x, "split-K counters too small");
     }
-#define OKC_W(G, M, T, S, NS) launch_wt<G, M, T, S, NS>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
+#define OKC_W(G, M, T, S, NS, SK) launch_wt<G, M, T, S, NS, SK>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
         pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, stream)
-    const int key = (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
+    const int key = (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
     switch (key) {
-        case 111104: OKC_W(true, 1, 1, 1, 4); break;   case 111108: OKC_W(true, 1, 1, 1, 8); break;
-        case 112104: OKC_W(true, 1, 2, 1, 4); break;   case 112108: OKC_W(true, 1, 2, 1, 8); break;
-        case 114104: OKC_W(true, 1, 4, 1, 4); break;
-        case 11104: OKC_W(false, 1, 1, 1, 4); break;   case 11108: OKC_W(false, 1, 1, 1, 8); break;
-        case 21104: OKC_W(false, 2, 1, 1, 4); break;   case 21108: OKC_W(false, 2, 1, 1, 8); break;
-        case 12104: OKC_W(false, 1, 2, 1, 4); break;   case 22104: OKC_W(false, 2, 2, 1, 4); break;
-        case 22108: OKC_W(false, 2, 2, 1, 8); break;   case 14104: OKC_W(false, 1, 4, 1, 4); break;
-        case 24104: OKC_W(false, 2, 4, 1, 4); break;
-        default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage)");
+        case 111102: OKC_W(true, 1, 1, 1, 2, false); break;   case 111104: OKC_W(true, 1, 1, 1, 4, false); break;
+        case 111108: OKC_W(true, 1, 1, 1, 8, false); break;
+        case 112102: OKC_W(true, 1, 2, 1, 2, false); break;   case 112104: OKC_W(true, 1, 2, 1, 4, false); break;
+        case 114102: OKC_W(true, 1, 4, 1, 2, false); break;   case 114104: OKC_W(true, 1, 4, 1, 4, false); break;
+        case 11102: OKC_W(false, 1, 1, 1, 2, false); break;   case 11104: OKC_W(false, 1, 1, 1, 4, false); break;
+        case 11108: OKC_W(false, 1, 1, 1, 8, false); break;
+        case 21102: OKC_W(false, 2, 1, 1, 2, false); break;   case 21104: OKC_W(false, 2, 1, 1, 4, false); break;
+        case 12104: OKC_W(false, 1, 2, 1, 4, false); break;   case 22102: OKC_W(false, 2, 2, 1, 2, false); break;
+        case 22104: OKC_W(false, 2, 2, 1, 4, false); break;   case 14104: OKC_W(false, 1, 4, 1, 4, false); break;
+        case 24102: OKC_W(false, 2, 4, 1, 2, false); break;   case 24104: OKC_W(false, 2, 4, 1, 4, false); break;
+        // split-K instantiations (the candidate small-batch variants)
+        case 1111102: OKC_W(true, 1, 1, 1, 2, true); break;   case 1111104: OKC_W(true, 1, 1, 1, 4, true); break;
+        case 1111108: OKC_W(true, 1, 1, 1, 8, true); break;   case 1112104: OKC_W(true, 1, 2, 1, 4, true); break;
+        case 1011102: OKC_W(false, 1, 1, 1, 2, true); break;  case 1011104: OKC_W(false, 1, 1, 1, 4, true); break;
+        case 1011108: OKC_W(false, 1, 1, 1, 8, true); break;  case 1021104: OKC_W(false, 2, 1, 1, 4, true); break;
+        case 1021108: OKC_W(false, 2, 1, 1, 8, true); break;  case 1022104: OKC_W(false, 2, 2, 1, 4, true); break;
+        default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage, ksplit)");
     }
 #undef OKC_W
 }
@@ -1877,8 +1885,9 @@ def _timeit_cold(fn, dev, reps=8):
     return run(True) - run(False)
 
 
-WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 1, 1, 8, 2), (1, 1, 1, 8, 4), (1, 1, 1, 4, 4), (1, 2, 1, 8, 2),
-                    (1, 2, 1, 4, 2), (1, 2, 1, 4, 4), (2, 2, 1, 4, 1), (2, 2, 1, 4, 2), (4, 2, 1, 4, 1), (2, 1, 1, 4, 1), (4, 1, 1, 4, 1))
+WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 2, 1), (1, 1, 1, 8, 1), (1, 1, 1, 8, 2), (1, 1, 1, 8, 4), (1, 1, 1, 4, 4), (1, 1, 1, 2, 2),
+                    (1, 2, 1, 8, 2), (1, 2, 1, 4, 2), (1, 2, 1, 2, 1), (2, 2, 1, 4, 1), (2, 2, 1, 2, 1),
+                    (4, 2, 1, 4, 1), (4, 2, 1, 2, 1), (2, 1, 1, 2, 1), (4, 1, 1, 4, 1))
 
 
 def _selftest_wt(state):
@@ -1955,8 +1964,8 @@ def _bench_wt(state, autotune=False):
                   + f"  | local routes {int(((ids >= 0) & (ids < 32)).sum())} distinct {int(torch.unique(ids[(ids < 32)]).numel())}")
         except Exception as e:
             print(f"  wt parts bs{bs} failed: {str(e)[:100]}")
-    small = [(1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 1, 1, 8, 2), (1, 1, 1, 8, 4), (1, 1, 1, 4, 4), (1, 2, 1, 8, 2), (1, 2, 1, 4, 2), (1, 2, 1, 4, 4)]
-    big = [(2, 2, 1, 4, 1), (4, 2, 1, 4, 1), (2, 2, 1, 4, 2), (2, 1, 1, 4, 1), (4, 1, 1, 4, 1)]
+    small = [(1, 1, 1, 2, 1), (1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 1, 1, 8, 2), (1, 1, 1, 8, 4), (1, 1, 1, 4, 4), (1, 2, 1, 8, 2), (1, 2, 1, 4, 2), (1, 2, 1, 2, 1), (1, 1, 1, 2, 2)]
+    big = [(2, 2, 1, 4, 1), (2, 2, 1, 2, 1), (4, 2, 1, 4, 1), (4, 2, 1, 2, 1), (2, 1, 1, 2, 1), (4, 1, 1, 4, 1)]
     bad = state.get("wt_bad", set())
     best = {}
     for bs in shapes:
