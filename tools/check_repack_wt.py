@@ -12,7 +12,8 @@ w, sf, gs = random_weights(N, K, generator=gen, device="cpu", leading=(E,))
 ref = dequantize(w, sf, gs)                       # [E, N, K] fp32
 Wr, Sr = repack_weights_wt(w, sf)
 NTL, NC = N // 16, K // 128
-words = Wr.view(E, NTL, NC, 2, 32, 4, 4).view(torch.int32).view(E, NTL, NC, 2, 32, 4)   # ..., half, lane, step4
+words = Wr.view(E, NTL // 4, NC, 4, 2, 32, 4, 4).permute(0, 1, 3, 2, 4, 5, 6, 7).reshape(E, NTL, NC, 2, 32, 16).contiguous().view(torch.int32).view(E, NTL, NC, 2, 32, 4)
+Sr = Sr.view(E, NTL // 4, NC, 4, 8, 16).permute(0, 1, 3, 2, 4, 5).reshape(E, NTL, NC, 8, 16)
 gsf = float(gs) * 64.0            # applied to the fp32 sums in the kernel; here to each exact fp16 weight
 
 
