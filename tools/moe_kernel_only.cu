@@ -352,6 +352,10 @@ __device__ __forceinline__ uint32_t e4m3x2_hi16_to_f16x2(uint32_t w) {
     return r;
 }
 
+// programmatic dependent launch (no-ops when the kernel was launched without the attribute)
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
+
 constexpr int WT_NWARPS = 4;
 __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
     return tpw * WT_NWARPS * 1024 + tpw * WT_NWARPS * 128 + 8 * nt * A_STRIDE * 2;
@@ -380,6 +384,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     constexpr int CH = NT == 1 ? 2 : 1;               // accumulator chains per tile (latency)
     extern __shared__ __align__(16) uint8_t wt_smem[];
 
+    if (GATED) pdl_wait();                            // the routing lists and x16 come from the previous launch
     const int j = blockIdx.y;
     if (j >= *nblk) return;
     const int e = blk_e[j];
@@ -426,14 +431,16 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
     const uint32_t smem_base = smem_u32(wt_smem);
 
-    auto issue = [&](int c, int stage) {
+    auto issue_w = [&](int c, int stage) {
         const uint32_t ws = smem_base + stage * STAGE_BYTES;
         const uint32_t ss = ws + W_STAGE;
-        const uint32_t xs = ss + S_STAGE;
         #pragma unroll
         for (int i = 0; i < WSEG; ++i)
             cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 1024, 16);
         if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * 128, 16);
+    };
+    auto issue_x = [&](int c, int stage) {
+        const uint32_t xs = smem_base + stage * STAGE_BYTES + W_STAGE + S_STAGE;
         #pragma unroll
         for (int i = 0; i < XSEG; ++i) {
             const int sidx = tid + i * NTHR;
@@ -441,6 +448,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                 cp_async16(xs + ((sidx >> 4) * A_STRIDE + (sidx & 15) * 8) * 2, xsrc[i] + c * KC, xbytes[i]);
         }
     };
+    auto issue = [&](int c, int stage) { issue_w(c, stage); issue_x(c, stage); };
 
     float acc[TPW][NT * CH][4];
     #pragma unroll
@@ -452,10 +460,24 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
 
     const float gsf = gs[e] * gs_mul;                                   // gs * 2^14: applied to the fp32 sums
 
-    #pragma unroll
-    for (int st = 0; st < NSTAGE - 1; ++st) {
-        if (st < NC) issue(st, st);
-        cp_async_commit();
+    if (GATED) {
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st) {
+            if (st < NC) issue(st, st);
+            cp_async_commit();
+        }
+    } else {
+        // GEMM2: the weights only need the routing lists (complete long ago), so their first stages stream before
+        // waiting for GEMM1's inter; group st then holds the token rows of stage st (group 0 also all the weights)
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st)
+            if (st < NC) issue_w(st, st);
+        pdl_wait();
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st) {
+            if (st < NC) issue_x(st, st);
+            cp_async_commit();
+        }
     }
 
     int stage = 0, stage_n = NSTAGE - 1;                              // ring slots of chunk c and of chunk c + NSTAGE - 1
@@ -531,6 +553,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             }
         }
     }
+    pdl_trigger();                                    // main loop done: the next kernel may start launching
     cp_async_wait<0>();
 
     if (KS == 2) {
@@ -631,7 +654,7 @@ template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, int ABL>
 void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
                float* part, int ldp, int part_rows, int* counters, int ksplit,
-               int K, int ntiles, int max_blocks, float gs_mul, cudaStream_t stream)
+               int K, int ntiles, int max_blocks, float gs_mul, bool pdl, cudaStream_t stream)
 {
     constexpr int TPW = (GATED ? 2 : 1) * MW;
     constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT);
@@ -641,9 +664,19 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
         attr_set = true;
     }
     const int n_x = (GATED ? ntiles / 2 : ntiles) / (WT_NWARPS * MW);
-    dim3 grid(n_x, max_blocks, ksplit);
-    moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, ABL><<<grid, 128 * KS, smem, stream>>>(
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(n_x, max_blocks, ksplit);
+    cfg.blockDim = dim3(128 * KS);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    const cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, ABL>,
         X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul);
+    TORCH_CHECK(err == cudaSuccess, "wt launch failed: ", cudaGetErrorString(err));
 }
 
 // post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route). Phase 1: each
@@ -660,6 +693,8 @@ moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const int* __r
     __shared__ int row_sh[8];
     const int tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = row_of_pair[tok * 8 + warp];
+    const float twv = tw[tok * 8 + warp];
+    pdl_wait();                                          // y comes from the previous launch
     float ss = 0.f;
     if (r >= 0) {
         const uint4* src = reinterpret_cast<const uint4*>(y + (size_t)r * ldy);
@@ -681,7 +716,7 @@ moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const int* __r
         for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
     }
     if (lane == 0) {
-        sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * tw[tok * 8 + warp] : 0.f;
+        sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * twv : 0.f;
         row_sh[warp] = r;
     }
     __syncthreads();
@@ -825,39 +860,37 @@ moe_route_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ 
 
 template void launch<true, 2, 2, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint4*, const uint2*, const float*, __half*, __nv_bfloat16*, float*, int, int, int, int, int, cudaStream_t);
 template void launch<false, 2, 2, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint4*, const uint2*, const float*, __half*, __nv_bfloat16*, float*, int, int, int, int, int, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 8, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 2, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 2, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 2, 1, 3, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 2, 1, 3, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 8, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 8, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 4, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 4, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 8, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 1, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 1, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 2, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 2, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 2, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 4, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 4, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 4, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 2, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 2, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 2, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 2, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 2, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 2, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
+template void launch_wt<true, 1, 1, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 1, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 1, 1, 8, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 2, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 2, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 2, 1, 3, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 2, 1, 3, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 4, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 4, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 1, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 1, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 1, 1, 8, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 1, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 1, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 2, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 2, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 2, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 4, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 4, 1, 2, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 4, 1, 4, false, 0>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 2, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 2, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 2, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 2, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 2, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 2, 2, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 1, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 1, 1, 4, false, 1>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 1, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 1, 1, 4, false, 2>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<true, 1, 1, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
+template void launch_wt<false, 1, 1, 1, 4, false, 3>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, bool, cudaStream_t);
 void* finalize_ref = (void*)&moe_finalize_kernel<4096>;
 } // namespace
