@@ -670,11 +670,7 @@ void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t th
     switch (key) {
         case 25604: stream_kernel<4, 256><<<grid, 256, 0, stream>>>(p, n_vec, o); break;
         case 25608: stream_kernel<8, 256><<<grid, 256, 0, stream>>>(p, n_vec, o); break;
-        case 25616: stream_kernel<16, 256><<<grid, 256, 0, stream>>>(p, n_vec, o); break;
-        case 51204: stream_kernel<4, 512><<<grid, 512, 0, stream>>>(p, n_vec, o); break;
         case 51208: stream_kernel<8, 512><<<grid, 512, 0, stream>>>(p, n_vec, o); break;
-        case 12808: stream_kernel<8, 128><<<grid, 128, 0, stream>>>(p, n_vec, o); break;
-        case 12816: stream_kernel<16, 128><<<grid, 128, 0, stream>>>(p, n_vec, o); break;
         default: TORCH_CHECK(false, "unsupported stream config");
     }
 }
@@ -695,19 +691,28 @@ void gemv(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tensor out,
     const int ldx = (int)X.stride(0), ldw = (int)W.stride(0), ldo = (int)out.stride(0);
     const int key = (int)mpad * 100000 + (int)rpw * 10000 + (int)unroll * 100 + (int)ksplit * 10 + (two_w ? 1 : 0);
     switch (key) {
+        GEMV_CASE(1, 1, 2, 1, false)
+        GEMV_CASE(1, 1, 4, 1, false)
+        GEMV_CASE(1, 1, 8, 1, false)
+        GEMV_CASE(1, 1, 16, 1, false)
         GEMV_CASE(1, 2, 4, 1, false)
+        GEMV_CASE(1, 2, 8, 1, false)
+        GEMV_CASE(1, 4, 4, 1, false)
+        GEMV_CASE(1, 4, 8, 1, false)
         GEMV_CASE(1, 1, 4, 2, false)
+        GEMV_CASE(1, 1, 8, 2, false)
         GEMV_CASE(1, 2, 2, 2, false)
         GEMV_CASE(1, 2, 4, 2, false)
+        GEMV_CASE(1, 2, 8, 2, false)
         GEMV_CASE(1, 4, 2, 2, false)
         GEMV_CASE(1, 1, 4, 4, false)
         GEMV_CASE(1, 2, 2, 4, false)
         GEMV_CASE(1, 2, 4, 4, false)
-        GEMV_CASE(1, 1, 2, 4, false)
         GEMV_CASE(1, 1, 2, 8, false)
         GEMV_CASE(1, 1, 4, 8, true)
         GEMV_CASE(1, 1, 2, 8, true)
         GEMV_CASE(1, 2, 2, 8, true)
+        GEMV_CASE(1, 1, 8, 4, true)
         default: TORCH_CHECK(false, "unsupported gemv config");
     }
 }
@@ -729,17 +734,9 @@ void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt,
         MMA_CASE(1, 2, 4, 8)
         MMA_CASE(1, 1, 8, 8)
         MMA_CASE(1, 2, 4, 4)
-        MMA_CASE(1, 4, 2, 8)
         MMA_CASE(1, 1, 4, 4)
-        MMA_CASE(1, 4, 2, 4)
-        MMA_CASE(2, 4, 4, 8)
-        MMA_CASE(2, 2, 8, 8)
         MMA_CASE(2, 2, 4, 8)
-        MMA_CASE(2, 1, 8, 8)
         MMA_CASE(2, 2, 4, 4)
-        MMA_CASE(2, 4, 2, 8)
-        MMA_CASE(2, 1, 4, 4)
-        MMA_CASE(2, 4, 2, 4)
         default: TORCH_CHECK(false, "unsupported mma config");
     }
 }
@@ -761,7 +758,7 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda2", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda3", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
             functions=["stream_bytes", "gemv", "skinny_mma"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
@@ -1140,7 +1137,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
@@ -1152,7 +1149,7 @@ def _bench(state):
     layers = {"qkv_gate": (2304, 8192), "o": (8192, 1024), "pooler": (4096, 8192), "unpooler": (8192, 4096),
               "router": (256, 8192)}
     xs = {(m, k): torch.randn((m, k), device=dev).to(torch.bfloat16) for m in (1, 8, 16, 32, 128, 256) for k in (8192, 1024, 4096)}
-    flush = torch.empty((128 << 20,), dtype=torch.uint8, device=dev)
+    flush = torch.empty((256 << 20,), dtype=torch.uint8, device=dev)
     sink = torch.empty((4096 * 16,), dtype=torch.int32, device=dev)
     ext = None
     try:
@@ -1162,34 +1159,37 @@ def _bench(state):
         print("  cuda build failed:", repr(e)[:300])
 
     def do_flush():
-        # as the judge: a read of a buffer larger than L2 (a write would leave dirty lines whose
-        # write-back overlaps the timed kernel: run 2a945e84 measured ~5.5 us too high)
+        # as the judge: read a buffer larger than L2 just before the timed replay
         if ext is not None:
-            ext.stream_bytes(flush, sink, 1056, 512, 8)
+            ext.stream_bytes(flush, sink, 2112, 512, 8)
         else:
-            flush.fill_(1)
+            flush.sum()
 
-    def _graph_time(fn, reps):
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g):
-            for _ in range(reps):
-                fn()
-        g.replay()
-        torch.cuda.synchronize()
-        best = 1e9
-        for _ in range(4):
-            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-            e0.record(); g.replay(); e1.record()
-            torch.cuda.synchronize()
-            best = min(best, e0.elapsed_time(e1) * 1000.0 / reps)
-        return best
-
-    def timeit(fn, reps=10):
+    def timeit(fn, reps=15):
+        # as the judge: a graph holding one call, replayed once per measurement after a cold-L2 flush,
+        # event-timed (stream-ordered events: e0 fires when the flush ends), median of reps
         fn(); fn()
         torch.cuda.synchronize()
-        t_flush = _graph_time(do_flush, reps)
-        t_both = _graph_time(lambda: (do_flush(), fn()), reps)
-        return t_both - t_flush
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        g.replay()
+        torch.cuda.synchronize()
+        ts = []
+        for _ in range(reps):
+            do_flush()
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            g.replay()
+            e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1) * 1000.0)
+        ts.sort()
+        return ts[len(ts) // 2]
+
+    tiny = torch.empty((1,), dtype=torch.int32, device=dev)
+    t_empty = timeit(lambda: tiny.fill_(0))
+    print(f"  graph replay fixed cost (tiny kernel): {t_empty:.1f} us, subtracted below")
 
     def budget():
         return time.time() - t0 < BENCH_BUDGET_S
@@ -1218,7 +1218,7 @@ def _bench(state):
             if cfg is not None and not cfg.get("none") and not cfg.get("table") and not _usable(cfg, m, n, layers[layer][1]):
                 return f"{label} n/a"
             out = _proj_forward(x, layer, n, state)
-            t = timeit(lambda: _proj_forward(x, layer, n, state))
+            t = timeit(lambda: _proj_forward(x, layer, n, state)) - t_empty
             return f"{label} {t:5.1f}{check(out, ref_of(layer, m, n), layer)}"
         except Exception as e:
             print("   fail", layer, m, label, str(e).splitlines()[0][:90])
@@ -1227,49 +1227,62 @@ def _bench(state):
             _OVERRIDE = None
 
     TAB = {"table": True}
-    print("BENCH proj (us per call, cold L2 by a read flush; '!' = rel err above tol)")
-    global ROUTER_DUP
-    # ---- A. router m=128/256: torch.cat vs the Triton dup kernel for [x | x]
-    for m in (128, 256):
-        ROUTER_DUP = False
-        a_ = row("cat+mm", "router", m, 256, {"none": True})
-        ROUTER_DUP = True
-        b_ = row("dup+mm", "router", m, 256, {"none": True})
-        print(f"  router m={m}: {a_} | {b_}")
-    # ---- B. pooler m=128: cuBLAS vs bmm2/bmm4 (re-measure)
-    parts = [row("cuBLAS", "pooler", 128, 4096, {"none": True})] + [row(f"bmm{sk}", "pooler", 128, 4096, dict(bmm=True, SPLIT_K=sk)) for sk in (2, 4)]
-    print("  pooler m=128: " + " | ".join(parts))
-    # ---- C. pooler / unpooler m=16/32: BN=64 tiles with split-K 2 (half the x traffic, 128 CTAs)
-    print("BENCH pooler/unpooler m=16/32 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
-    pl = [(64, 256, 2, 4, 4, True), (64, 256, 2, 4, 4, False), (64, 128, 2, 4, 6, True), (64, 128, 2, 4, 8, True),
-          (64, 256, 2, 2, 4, True), (64, 128, 2, 2, 8, True), (32, 256, 1, 4, 5, True), (32, 128, 1, 4, 8, False),
-          (64, 256, 4, 4, 4, True), (128, 64, 2, 4, 8, True)]
+    print("BENCH proj, judge protocol (us per replay minus fixed cost; '!' = rel err above tol)")
+    if ext is not None:
+        wbuf = state["pooler"]; nbytes = wbuf.numel() * 2
+        parts = []
+        for threads, unroll, grid in ((512, 8, 1056), (512, 8, 2112), (256, 8, 2112), (256, 4, 528)):
+            t = timeit(lambda: ext.stream_bytes(wbuf, sink, grid, threads, unroll)) - t_empty
+            parts.append(f"t{threads} u{unroll} g{grid} {t:5.1f} ({nbytes / t / 1e6:.2f})")
+        print("  stream 67MB: " + " | ".join(parts))
+        # ---- A. m=1: Triton table vs GEMV (rpw / unroll / ksplit)
+        gemv1 = [(1, 1, 2, 1), (1, 1, 4, 1), (1, 1, 8, 1), (1, 1, 16, 1), (1, 2, 4, 1), (1, 2, 8, 1), (1, 4, 4, 1), (1, 4, 8, 1),
+                 (1, 1, 4, 2), (1, 1, 8, 2), (1, 2, 2, 2), (1, 2, 4, 2), (1, 2, 8, 2), (1, 4, 2, 2), (1, 1, 4, 4), (1, 2, 2, 4),
+                 (1, 2, 4, 4), (1, 1, 2, 8)]
+        gemv1_router = [(1, 1, 4, 8), (1, 1, 2, 8), (1, 2, 2, 8), (1, 1, 8, 4)]
+        for layer in ("pooler", "unpooler", "o", "qkv_gate", "router"):
+            if not budget():
+                break
+            N, K = layers[layer]
+            n = 1024 if layer == "unpooler" else N
+            parts = [row("triton", layer, 1, n, TAB), row("cuBLAS", layer, 1, n, {"none": True})]
+            for mpad, rpw, unroll, ksplit in (gemv1_router if layer == "router" else gemv1):
+                parts.append(row(f"g{rpw}/{unroll}/{ksplit}", layer, 1, n, dict(gemv=True, mpad=mpad, rpw=rpw, unroll=unroll, ksplit=ksplit)))
+            print(f"  m=1 {layer:9s}: " + " | ".join(parts))
+        # ---- B. m=8 pooler / unpooler-slice / o: Triton vs cuBLAS vs mma (rpw / unroll / ksplit)
+        for layer in ("pooler", "unpooler", "o"):
+            if not budget():
+                break
+            N, K = layers[layer]
+            n = 1024 if layer == "unpooler" else N
+            parts = [row("triton", layer, 8, n, TAB), row("cuBLAS", layer, 8, n, {"none": True})]
+            for rpw, unroll, ksplit in ((4, 4, 8), (2, 8, 8), (2, 4, 8), (1, 8, 8), (2, 4, 4), (1, 4, 4)):
+                parts.append(row(f"mma{rpw}/{unroll}/{ksplit}", layer, 8, n, dict(mma=True, mt=1, rpw=rpw, unroll=unroll, ksplit=ksplit)))
+            print(f"  m=8 {layer:9s}: " + " | ".join(parts))
+    # ---- C. o layer m=8/16/32: short K (1024): shallow pipelines, BLOCK_K=256 2-3 stages, cuBLAS
+    print("BENCH o m=8/16/32 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
+    oc = [(64, 256, 1, 4, 2, True), (64, 256, 1, 4, 3, True), (32, 256, 1, 4, 2, True), (32, 256, 1, 4, 3, True),
+          (32, 256, 1, 4, 4, True), (64, 256, 1, 8, 3, True), (64, 256, 1, 2, 4, True), (32, 128, 1, 4, 4, True),
+          (64, 256, 1, 4, 4, False), (32, 256, 1, 4, 4, False), (128, 64, 1, 4, 4, True)]
+    cur = " ".join(f"m{m} {row('', 'o', m, 8192, TAB)}/cu{row('', 'o', m, 8192, {'none': True})}" for m in (8, 16, 32))
+    print(f"  o current/cuBLAS: {cur}")
+    for bn, bk, sk, nw, ns, tma in oc:
+        if not budget():
+            break
+        parts = []
+        for m in (8, 16, 32):
+            cfg = dict(BLOCK_M=_block_m(m), BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
+            parts.append(row(f"m{m}", "o", m, 8192, cfg))
+        print(f"  o {str((bn, bk, sk, nw, ns, tma)):30s} " + " | ".join(parts))
+    # ---- D. pooler / unpooler m=16/32: Triton table vs cuBLAS, and the m=8 table config at m=16
     for layer in ("pooler", "unpooler"):
         N, K = layers[layer]
-        cur = f"cur m16 {row('', layer, 16, N, TAB)} m32 {row('', layer, 32, N, TAB)}"
-        for bn, bk, sk, nw, ns, tma in pl:
+        parts = []
+        for m in (16, 32):
             if not budget():
                 break
-            parts = []
-            for m in (16, 32):
-                cfg = dict(BLOCK_M=_block_m(m), BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
-                parts.append(row(f"m{m}", layer, m, N, cfg))
-            print(f"  {layer:9s} {str((bn, bk, sk, nw, ns, tma)):30s} {cur} | " + " | ".join(parts))
-    # ---- D. qkv m=8/16/32 and o m=32: the new table vs cuBLAS vs a few neighbours
-    print("BENCH qkv/o (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
-    for m in (8, 16, 32):
-        parts = [row("table", "qkv_gate", m, 2304, TAB), row("cuBLAS", "qkv_gate", m, 2304, {"none": True})]
-        for bn, bk, sk, nw, ns, tma in ((64, 128, 8, 4, 4, True), (32, 256, 4, 4, 3, True), (64, 128, 8, 4, 4, False), (64, 256, 4, 4, 4, True), (64, 128, 4, 4, 6, True)):
-            if not budget():
-                break
-            cfg = dict(BLOCK_M=_block_m(m), BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
-            parts.append(row(f"{(bn, bk, sk, nw, ns, tma)}", "qkv_gate", m, 2304, cfg))
-        print(f"  qkv m={m}: " + " | ".join(parts))
-    parts = [row("table", "o", 32, 8192, TAB), row("cuBLAS", "o", 32, 8192, {"none": True})]
-    for bn, bk, sk, nw, ns, tma in ((64, 256, 1, 4, 4, True), (64, 128, 1, 4, 6, True), (32, 128, 1, 4, 8, True), (64, 256, 1, 4, 4, False)):
-        cfg = dict(BLOCK_M=32, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
-        parts.append(row(f"{(bn, bk, sk, nw, ns, tma)}", "o", 32, 8192, cfg))
-    print("  o m=32: " + " | ".join(parts))
+            parts.append(f"m{m}: " + row("triton", layer, m, N, TAB) + " " + row("cuBLAS", layer, m, N, {"none": True}))
+        print(f"  {layer:9s} " + " | ".join(parts))
     _OVERRIDE = None
     print(f"BENCH proj done in {time.time() - t0:.0f}s")
 

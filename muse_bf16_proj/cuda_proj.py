@@ -313,11 +313,7 @@ void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t th
     switch (key) {
         case 25604: stream_kernel<4, 256><<<grid, 256, 0, stream>>>(p, n_vec, o); break;
         case 25608: stream_kernel<8, 256><<<grid, 256, 0, stream>>>(p, n_vec, o); break;
-        case 25616: stream_kernel<16, 256><<<grid, 256, 0, stream>>>(p, n_vec, o); break;
-        case 51204: stream_kernel<4, 512><<<grid, 512, 0, stream>>>(p, n_vec, o); break;
         case 51208: stream_kernel<8, 512><<<grid, 512, 0, stream>>>(p, n_vec, o); break;
-        case 12808: stream_kernel<8, 128><<<grid, 128, 0, stream>>>(p, n_vec, o); break;
-        case 12816: stream_kernel<16, 128><<<grid, 128, 0, stream>>>(p, n_vec, o); break;
         default: TORCH_CHECK(false, "unsupported stream config");
     }
 }
@@ -338,19 +334,28 @@ void gemv(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tensor out,
     const int ldx = (int)X.stride(0), ldw = (int)W.stride(0), ldo = (int)out.stride(0);
     const int key = (int)mpad * 100000 + (int)rpw * 10000 + (int)unroll * 100 + (int)ksplit * 10 + (two_w ? 1 : 0);
     switch (key) {
+        GEMV_CASE(1, 1, 2, 1, false)
+        GEMV_CASE(1, 1, 4, 1, false)
+        GEMV_CASE(1, 1, 8, 1, false)
+        GEMV_CASE(1, 1, 16, 1, false)
         GEMV_CASE(1, 2, 4, 1, false)
+        GEMV_CASE(1, 2, 8, 1, false)
+        GEMV_CASE(1, 4, 4, 1, false)
+        GEMV_CASE(1, 4, 8, 1, false)
         GEMV_CASE(1, 1, 4, 2, false)
+        GEMV_CASE(1, 1, 8, 2, false)
         GEMV_CASE(1, 2, 2, 2, false)
         GEMV_CASE(1, 2, 4, 2, false)
+        GEMV_CASE(1, 2, 8, 2, false)
         GEMV_CASE(1, 4, 2, 2, false)
         GEMV_CASE(1, 1, 4, 4, false)
         GEMV_CASE(1, 2, 2, 4, false)
         GEMV_CASE(1, 2, 4, 4, false)
-        GEMV_CASE(1, 1, 2, 4, false)
         GEMV_CASE(1, 1, 2, 8, false)
         GEMV_CASE(1, 1, 4, 8, true)
         GEMV_CASE(1, 1, 2, 8, true)
         GEMV_CASE(1, 2, 2, 8, true)
+        GEMV_CASE(1, 1, 8, 4, true)
         default: TORCH_CHECK(false, "unsupported gemv config");
     }
 }
@@ -372,17 +377,9 @@ void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt,
         MMA_CASE(1, 2, 4, 8)
         MMA_CASE(1, 1, 8, 8)
         MMA_CASE(1, 2, 4, 4)
-        MMA_CASE(1, 4, 2, 8)
         MMA_CASE(1, 1, 4, 4)
-        MMA_CASE(1, 4, 2, 4)
-        MMA_CASE(2, 4, 4, 8)
-        MMA_CASE(2, 2, 8, 8)
         MMA_CASE(2, 2, 4, 8)
-        MMA_CASE(2, 1, 8, 8)
         MMA_CASE(2, 2, 4, 4)
-        MMA_CASE(2, 4, 2, 8)
-        MMA_CASE(2, 1, 4, 4)
-        MMA_CASE(2, 4, 2, 4)
         default: TORCH_CHECK(false, "unsupported mma config");
     }
 }
@@ -404,7 +401,7 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda2", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda3", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
             functions=["stream_bytes", "gemv", "skinny_mma"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
