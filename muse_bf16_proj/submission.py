@@ -828,7 +828,7 @@ SWEEP = {
     ("o", 8192, 32):  (64, 256, 1, 4, 4, True),           # 5.3
     ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4, False),    # 12.2
     ("qkv_gate", 2304, 8):  (64, 128, 8, 4, 4, True),     # 13.7 vs 14.6 for (32, 256, 4, 4, 4) (run 662944e4, cold)
-    ("qkv_gate", 2304, 16): (64, 128, 8, 4, 4, True),     # 13.8 vs 14.6
+    ("qkv_gate", 2304, 16): (32, 256, 4, 4, 4, True),     # judge: 13.8 here vs 14.5 on (64, 128, 8, 4, 4) (run df4bcce7)
     ("qkv_gate", 2304, 32): (32, 256, 4, 4, 4, True),     # 15.1
     ("router", 256, 1):   (32, 256, 16, 4, 3, True),      # 5.2
     ("router", 256, 8):   (32, 256, 16, 4, 3, True),      # 5.1
@@ -868,7 +868,8 @@ GEMV_SHAPES = {
 MMA_SHAPES = {}
 # (layer, n, m) -> SPLIT_K: cuBLAS batched split-K (bmm over K chunks) + fp32 partial sum. Check
 # 2a945e84: qkv 18.6 vs 20.6 (m=128), 21.6 vs 24.5 (m=256); pooler m=256 32.4 vs 34.0.
-BMM_SHAPES = {("qkv_gate", 2304, 128): 4, ("qkv_gate", 2304, 256): 4, ("pooler", 4096, 256): 2}
+BMM_SHAPES = {("qkv_gate", 2304, 128): 4, ("qkv_gate", 2304, 256): 4, ("pooler", 4096, 256): 2,
+              ("pooler", 4096, 128): 2}   # pooler m=128: 26.7 vs 28.3 cuBLAS (runs d39344c2, df4bcce7)
 # shapes that go to cuBLAS although m <= MAX_TRITON_M: the judge measured our Triton configs behind
 # SGLang's cuBLAS call there (qkv m=32: 18.2-19.6 vs 14.0-14.5; o m=32: 7.0 vs 6.8)
 CUBLAS_SHAPES = {("qkv_gate", 2304, 32), ("o", 8192, 32)}
@@ -1139,7 +1140,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
