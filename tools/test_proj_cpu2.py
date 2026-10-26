@@ -8,7 +8,7 @@ import torch
 import reference as R
 import submission as S
 S.BENCH = False
-S.GEMV_SHAPES = {}; S.MMA_SHAPES = {}; S.BMM_SHAPES = {}   # CUDA-only paths
+S.GEMV_SHAPES = {}; S.MMA_SHAPES = {}; S.BMM_SHAPES = {}; S.G12_SHAPES = {}; S.M12_SHAPES = {}; S.T12_SHAPES = {}   # CUDA-only paths
 dev = "cpu"
 torch.manual_seed(0)
 weights = R.generate_weights(R.WEIGHTS_SEED, device=dev)

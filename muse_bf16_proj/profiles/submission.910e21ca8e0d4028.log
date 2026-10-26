@@ -1,0 +1,28 @@
+  cuda built 44s
+  graph replay fixed cost (tiny kernel): 4.5 us, subtracted below
+BENCH proj, judge protocol (us per replay minus fixed cost; '!' = rel err above tol)
+  stream 67MB: t512 u8 g1056  15.9 (4.23) | t512 u8 g2112  16.8 (3.99) | t256 u8 g2112  15.8 (4.25) | t256 u4 g528  16.6 (4.05)
+  m=1 pooler   : triton  17.7 | cuBLAS  20.7 | g1/2/1  17.3 | g1/4/1  17.9 | g1/8/1  18.5 | g1/16/1  20.1 | g2/4/1  18.2 | g2/8/1  18.2 | g4/4/1  18.8 | g4/8/1  19.3 | g1/4/2  19.1 | g1/8/2  19.4 | g2/2/2  17.6 | g2/4/2  17.9 | g2/8/2  19.5 | g4/2/2  17.3 | g1/4/4  19.6 | g2/2/4  20.3 | g2/4/4  19.5 | g1/2/8  21.3
+  m=1 unpooler : triton   5.1 | cuBLAS   5.1 | g1/2/1   5.2 | g1/4/1   4.1 | g1/8/1   4.0 | g1/16/1   4.1 | g2/4/1   4.7 | g2/8/1   4.2 | g4/4/1   5.8 | g4/8/1   5.8 | g1/4/2   3.7 | g1/8/2   4.0 | g2/2/2   4.7 | g2/4/2   3.9 | g2/8/2   4.1 | g4/2/2   4.7 | g1/4/4   3.9 | g2/2/4   3.8 | g2/4/4   3.9 | g1/2/8   4.9
+  m=1 o        : triton   4.0 | cuBLAS   4.0 | g1/2/1   5.9 | g1/4/1   6.0 | g1/8/1 n/a | g1/16/1 n/a | g2/4/1   6.4 | g2/8/1 n/a | g4/4/1   6.4 | g4/8/1 n/a | g1/4/2 n/a | g1/8/2 n/a | g2/2/2   6.8 | g2/4/2 n/a | g2/8/2 n/a | g4/2/2   6.9 | g1/4/4 n/a | g2/2/4 n/a | g2/4/4 n/a | g1/2/8 n/a
+  m=1 qkv_gate : triton  12.6 | cuBLAS  11.5 | g1/2/1  11.6 | g1/4/1  11.6 | g1/8/1  11.9 | g1/16/1  13.9 | g2/4/1  12.1 | g2/8/1  11.7 | g4/4/1  12.4 | g4/8/1  12.6 | g1/4/2  11.0 | g1/8/2  13.3 | g2/2/2  11.4 | g2/4/2  11.9 | g2/8/2  13.1 | g4/2/2  11.5 | g1/4/4  12.0 | g2/2/4  10.8 | g2/4/4  13.1 | g1/2/8  12.8
+  m=1 router   : triton   4.6 | cuBLAS   6.9 | g1/4/8   4.1 | g1/2/8   3.8 | g2/2/8   4.4 | g1/8/4   4.3
+  m=8 pooler   : triton  18.0 | cuBLAS  20.7 | mma4/4/8  27.2 | mma2/8/8  26.6 | mma2/4/8  22.8 | mma1/8/8  22.6 | mma2/4/4  27.0 | mma1/4/4  25.6
+  m=8 unpooler : triton   4.8 | cuBLAS   5.2 | mma4/4/8  13.7 | mma2/8/8   7.0 | mma2/4/8   8.3 | mma1/8/8   6.1 | mma2/4/4  12.1 | mma1/4/4  10.8
+  m=8 o        : triton   3.7 | cuBLAS   3.6 | mma4/4/8  22.9 | mma2/8/8 n/a | mma2/4/8  13.0 | mma1/8/8 n/a | mma2/4/4   8.9 | mma1/4/4   7.6
+BENCH o m=8/16/32 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)
+  o current/cuBLAS: m8    3.8/cu   3.6 m16    3.6/cu   3.9 m32    4.5/cu   4.2
+  o (64, 256, 1, 4, 2, True)       m8   5.4 | m16   5.4 | m32   6.6
+  o (64, 256, 1, 4, 3, True)       m8   3.7 | m16   3.6 | m32   4.5
+  o (32, 256, 1, 4, 2, True)       m8   5.5 | m16   5.2 | m32   5.9
+  o (32, 256, 1, 4, 3, True)       m8   4.5 | m16   3.9 | m32   4.6
+  o (32, 256, 1, 4, 4, True)       m8   4.8 | m16   4.4 | m32   5.0
+  o (64, 256, 1, 8, 3, True)       m8   4.1 | m16   4.1 | m32   5.0
+  o (64, 256, 1, 2, 4, True)       m8   4.3 | m16   4.3 | m32   5.2
+  o (32, 128, 1, 4, 4, True)       m8   4.5 | m16   4.3 | m32   5.2
+  o (64, 256, 1, 4, 4, False)      m8   3.8 | m16   3.8 | m32   5.1
+  o (32, 256, 1, 4, 4, False)      m8   4.6 | m16   4.8 | m32   5.8
+  o (128, 64, 1, 4, 4, True)       m8   6.0 | m16   6.0 | m32   6.2
+  pooler    m16: triton  17.9 cuBLAS  20.8 | m32: triton  20.0 cuBLAS  21.5
+  unpooler  m16: triton  18.0 cuBLAS  18.2 | m32: triton  18.5 cuBLAS  18.4
+BENCH proj done in 50s
