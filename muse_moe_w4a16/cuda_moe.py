@@ -374,11 +374,12 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     const int* __restrict__ blk_end, const int* __restrict__ nblk,
                     const uint8_t* __restrict__ Wr, const uint8_t* __restrict__ Sr, const float* __restrict__ gs,
                     __half* __restrict__ out16, __nv_bfloat16* __restrict__ out_bf, int ldo,
-                    float* __restrict__ part, int ldp, int part_rows,
+                    float* __restrict__ part, int ldp, int part_rows, int* __restrict__ counters,
                     int K, int NTILES, float gs_mul)
 {
     // gridDim.z > 1: split-K; CTA z owns chunks [z*NC/KSPLIT, (z+1)*NC/KSPLIT) and writes its fp32 partial
-    // sums (times gs) to part[z][row][col] (GATED: gate at col, up at col + N/2) for a reduce kernel.
+    // sums (times gs) to part[z][row][col] (GATED: gate at col, up at col + N/2); the last CTA to arrive at
+    // counters[(y, x)] sums the slices and writes the output (the counter resets itself).
     constexpr int TPW = (GATED ? 2 : 1) * MW;        // m16 weight tiles per warp
     constexpr int TPC = TPW * WT_NWARPS;              // per CTA
     constexpr int W_STAGE = TPC * 1024;
@@ -552,6 +553,37 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
 
     // C fragment: rows (weight rows) g, g+8 of the tile -> output column; cols (tokens) 2t, 2t+1
+    __shared__ int s_last;
+    if (KSPLIT > 1) {
+        #pragma unroll
+        for (int i = 0; i < MW; ++i) {
+            const int tile = (blockIdx.x * WT_NWARPS + warp) * MW + i;
+            #pragma unroll
+            for (int nb = 0; nb < NT; ++nb)
+                #pragma unroll
+                for (int hr = 0; hr < 2; ++hr) {
+                    const int col = tile * 16 + g + 8 * hr;
+                    #pragma unroll
+                    for (int cc = 0; cc < 2; ++cc) {
+                        const int tok = nb * 8 + 2 * t + cc;
+                        if (tok >= nrows) continue;
+                        float* pp = part + ((size_t)blockIdx.z * part_rows + row0 + tok) * ldp + col;
+                        pp[0] = acc[i][nb * CH][2 * hr + cc] * gsf;
+                        if (GATED) pp[(size_t)NTILES * 8] = acc[MW + i][nb * CH][2 * hr + cc] * gsf;
+                    }
+                }
+        }
+        __threadfence();
+        __syncthreads();
+        if (tid == 0) {
+            const int old = atomicAdd(counters + blockIdx.y * gridDim.x + blockIdx.x, 1);
+            s_last = (old == KSPLIT - 1);
+            if (old == KSPLIT - 1) counters[blockIdx.y * gridDim.x + blockIdx.x] = 0;
+        }
+        __syncthreads();
+        if (!s_last) return;
+        __threadfence();
+    }
     #pragma unroll
     for (int i = 0; i < MW; ++i) {
         const int tile = (blockIdx.x * WT_NWARPS + warp) * MW + i;
@@ -564,19 +596,22 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                 for (int cc = 0; cc < 2; ++cc) {
                     const int tok = nb * 8 + 2 * t + cc;
                     if (tok >= nrows) continue;
+                    float gv = acc[i][nb * CH][2 * hr + cc] * gsf;
+                    float uv = GATED ? acc[MW + i][nb * CH][2 * hr + cc] * gsf : 0.f;
                     if (KSPLIT > 1) {
-                        float* pp = part + ((size_t)blockIdx.z * part_rows + row0 + tok) * ldp + col;
-                        pp[0] = acc[i][nb * CH][2 * hr + cc] * gsf;
-                        if (GATED) pp[(size_t)NTILES * 8] = acc[MW + i][nb * CH][2 * hr + cc] * gsf;   // up: + N/2
-                        continue;
+                        for (int z = 0; z < KSPLIT; ++z) {
+                            if (z == (int)blockIdx.z) continue;
+                            const float* pp = part + ((size_t)z * part_rows + row0 + tok) * ldp + col;
+                            gv += __ldcg(pp);
+                            if (GATED) uv += __ldcg(pp + (size_t)NTILES * 8);
+                        }
                     }
                     const size_t o = (size_t)(row0 + tok) * ldo + col;
                     if (GATED) {
-                        const float gv = acc[i][nb * CH][2 * hr + cc] * gsf, uv = acc[MW + i][nb * CH][2 * hr + cc] * gsf;
                         const float hv = gv / (1.f + __expf(-gv)) * uv;
                         out16[o] = __float2half(__bfloat162float(__float2bfloat16(hv)));   // bf16 value in an fp16 container
                     } else {
-                        out_bf[o] = __float2bfloat16(acc[i][nb * CH][2 * hr + cc] * gsf);
+                        out_bf[o] = __float2bfloat16(gv);
                     }
                 }
             }
@@ -587,7 +622,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
 template <bool GATED, int MW, int NT, int KS, int NSTAGE>
 void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
-               float* part, int ldp, int part_rows, int ksplit,
+               float* part, int ldp, int part_rows, int* counters, int ksplit,
                int K, int ntiles, int max_blocks, float gs_mul, cudaStream_t stream)
 {
     constexpr int TPW = (GATED ? 2 : 1) * MW;
@@ -600,83 +635,52 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
     const int n_x = (GATED ? ntiles / 2 : ntiles) / (WT_NWARPS * MW);
     dim3 grid(n_x, max_blocks, ksplit);
     moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE><<<grid, 128 * KS, smem, stream>>>(
-        X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, K, ntiles, gs_mul);
+        X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul);
 }
 
-// split-K reduce of GEMM1's fp32 partials + SiLU(gate) * up -> inter (bf16 values in fp16); grid (rows per block, blocks)
+// post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route); dynamic smem
+// 8 x H floats. Rows are loaded in groups of 8 x 16B per lane so the loads overlap.
 __global__ void __launch_bounds__(256)
-wt_silu_reduce_kernel(const float* __restrict__ part, int ldp, int part_rows, int ksplit, __half* __restrict__ out, int ldo,
-                      const int* __restrict__ blk_row0, const int* __restrict__ blk_end, const int* __restrict__ nblk, int I)
-{
-    const int j = blockIdx.y;
-    if (j >= *nblk) return;
-    const int r = blk_row0[j] + blockIdx.x;
-    if (r >= blk_end[j]) return;
-    for (int c = threadIdx.x * 4; c < I; c += 256 * 4) {
-        float4 gg = make_float4(0.f, 0.f, 0.f, 0.f), uu = gg;
-        for (int z = 0; z < ksplit; ++z) {
-            const float* row = part + ((size_t)z * part_rows + r) * ldp;
-            const float4 a = *reinterpret_cast<const float4*>(row + c), b = *reinterpret_cast<const float4*>(row + I + c);
-            gg.x += a.x; gg.y += a.y; gg.z += a.z; gg.w += a.w;
-            uu.x += b.x; uu.y += b.y; uu.z += b.z; uu.w += b.w;
-        }
-        const float h0 = gg.x / (1.f + __expf(-gg.x)) * uu.x, h1 = gg.y / (1.f + __expf(-gg.y)) * uu.y;
-        const float h2 = gg.z / (1.f + __expf(-gg.z)) * uu.z, h3 = gg.w / (1.f + __expf(-gg.w)) * uu.w;
-        __half2 v01 = __halves2half2(__float2half(__bfloat162float(__float2bfloat16(h0))), __float2half(__bfloat162float(__float2bfloat16(h1))));
-        __half2 v23 = __halves2half2(__float2half(__bfloat162float(__float2bfloat16(h2))), __float2half(__bfloat162float(__float2bfloat16(h3))));
-        uint2 pk;
-        pk.x = *reinterpret_cast<uint32_t*>(&v01); pk.y = *reinterpret_cast<uint32_t*>(&v23);
-        *reinterpret_cast<uint2*>(out + (size_t)r * ldo + c) = pk;
-    }
-}
-
-// post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route). y is bf16
-// (ksplit == 1) or the sum of ksplit fp32 partial slices rounded to bf16 (as SGLang keeps y in bf16).
-__global__ void __launch_bounds__(256)
-moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const float* __restrict__ part, int ldp, int part_rows,
-                    int ksplit, const int* __restrict__ row_of_pair, const float* __restrict__ tw,
-                    const float* __restrict__ nw, __nv_bfloat16* __restrict__ out, int H, float eps)
+moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const int* __restrict__ row_of_pair,
+                    const float* __restrict__ tw, const float* __restrict__ nw, __nv_bfloat16* __restrict__ out,
+                    int H, float eps)
 {
     extern __shared__ __align__(16) float red[];              // [8][H]
     __shared__ float sc_sh[8];
+    constexpr int GS = 8;
     const int tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = row_of_pair[tok * 8 + warp];
+    const uint4* src = r >= 0 ? reinterpret_cast<const uint4*>(y + (size_t)r * ldy) : nullptr;
     float* myrow = red + warp * H;
-    // pass 1: the route's row (bf16 values), scaled by (1 + w), into smem; sum of squares
     float ss = 0.f;
-    for (int seg = lane; seg < H / 8; seg += 32) {
-        float v[8];
-        if (r < 0) {
-            #pragma unroll
-            for (int q = 0; q < 8; ++q) v[q] = 0.f;
-        } else if (ksplit == 1) {
-            const uint4 u = *reinterpret_cast<const uint4*>(y + (size_t)r * ldy + seg * 8);
-            const __nv_bfloat162* p = reinterpret_cast<const __nv_bfloat162*>(&u);
-            #pragma unroll
-            for (int q = 0; q < 4; ++q) { const float2 f = __bfloat1622float2(p[q]); v[2 * q] = f.x; v[2 * q + 1] = f.y; }
-        } else {
-            #pragma unroll
-            for (int q = 0; q < 8; ++q) v[q] = 0.f;
-            for (int z = 0; z < ksplit; ++z) {
-                const float* row = part + ((size_t)z * part_rows + r) * ldp + seg * 8;
-                const float4 a = *reinterpret_cast<const float4*>(row), b = *reinterpret_cast<const float4*>(row + 4);
-                v[0] += a.x; v[1] += a.y; v[2] += a.z; v[3] += a.w; v[4] += b.x; v[5] += b.y; v[6] += b.z; v[7] += b.w;
-            }
-            #pragma unroll
-            for (int q = 0; q < 8; ++q) v[q] = __bfloat162float(__float2bfloat16(v[q]));
-        }
-        const float4 n0 = *reinterpret_cast<const float4*>(nw + seg * 8), n1 = *reinterpret_cast<const float4*>(nw + seg * 8 + 4);
-        v[0] *= n0.x; v[1] *= n0.y; v[2] *= n0.z; v[3] *= n0.w; v[4] *= n1.x; v[5] *= n1.y; v[6] *= n1.z; v[7] *= n1.w;
+    for (int seg0 = 0; seg0 < H / 8; seg0 += 32 * GS) {
+        uint4 u[GS];
         #pragma unroll
-        for (int q = 0; q < 8; ++q) ss += v[q] * v[q];
-        *reinterpret_cast<float4*>(myrow + seg * 8) = make_float4(v[0], v[1], v[2], v[3]);
-        *reinterpret_cast<float4*>(myrow + seg * 8 + 4) = make_float4(v[4], v[5], v[6], v[7]);
+        for (int q = 0; q < GS; ++q) {
+            const int seg = seg0 + lane + 32 * q;
+            u[q] = (src != nullptr && seg < H / 8) ? src[seg] : make_uint4(0u, 0u, 0u, 0u);
+        }
+        #pragma unroll
+        for (int q = 0; q < GS; ++q) {
+            const int seg = seg0 + lane + 32 * q;
+            if (seg < H / 8) {
+                const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&u[q]);
+                const float4 n0 = *reinterpret_cast<const float4*>(nw + seg * 8), n1 = *reinterpret_cast<const float4*>(nw + seg * 8 + 4);
+                float v[8];
+                #pragma unroll
+                for (int k = 0; k < 4; ++k) { const float2 f = __bfloat1622float2(pb[k]); v[2 * k] = f.x; v[2 * k + 1] = f.y; }
+                v[0] *= n0.x; v[1] *= n0.y; v[2] *= n0.z; v[3] *= n0.w; v[4] *= n1.x; v[5] *= n1.y; v[6] *= n1.z; v[7] *= n1.w;
+                #pragma unroll
+                for (int k = 0; k < 8; ++k) ss += v[k] * v[k];
+                *reinterpret_cast<float4*>(myrow + seg * 8) = make_float4(v[0], v[1], v[2], v[3]);
+                *reinterpret_cast<float4*>(myrow + seg * 8 + 4) = make_float4(v[4], v[5], v[6], v[7]);
+            }
+        }
     }
     #pragma unroll
     for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
     if (lane == 0) sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * tw[tok * 8 + warp] : 0.f;
     __syncthreads();
-    // pass 2: weighted sum over the 8 routes
     for (int base = threadIdx.x * 8; base < H; base += 256 * 8) {
         float acc[8];
         #pragma unroll
@@ -734,8 +738,8 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
 
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
                   torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
-                  torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles, int64_t max_blocks, bool gated,
-                  int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul)
+                  torch::Tensor out, torch::Tensor part, torch::Tensor counters, int64_t ksplit, int64_t K, int64_t ntiles,
+                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const __half* Xp = reinterpret_cast<const __half*>(X.data_ptr());
@@ -748,9 +752,14 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
     float* pp = ksplit > 1 ? part.data_ptr<float>() : nullptr;
     const int ldp = ksplit > 1 ? (int)part.stride(1) : 0;
     const int prow = ksplit > 1 ? (int)part.size(1) : 0;
+    int* cnt = ksplit > 1 ? counters.data_ptr<int>() : nullptr;
+    if (ksplit > 1) {
+        const int n_x = (gated ? ntiles / 2 : ntiles) / (WT_NWARPS * mw);
+        TORCH_CHECK(counters.numel() >= max_blocks * n_x, "split-K counters too small");
+    }
 #define OKC_W(G, M, T, S, NS) launch_wt<G, M, T, S, NS>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
-        pp, ldp, prow, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, stream)
+        pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, stream)
     const int key = (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
     switch (key) {
         case 111104: OKC_W(true, 1, 1, 1, 4); break;   case 111108: OKC_W(true, 1, 1, 1, 8); break;
@@ -766,18 +775,8 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
 #undef OKC_W
 }
 
-void moe_wt_silu_reduce(torch::Tensor part, int64_t ksplit, torch::Tensor out, torch::Tensor blk_row0, torch::Tensor blk_end,
-                        torch::Tensor nblk, int64_t rows_per_block, int64_t max_blocks, int64_t I)
-{
-    auto stream = at::cuda::getCurrentCUDAStream();
-    dim3 grid((unsigned)rows_per_block, (unsigned)max_blocks);
-    wt_silu_reduce_kernel<<<grid, 256, 0, stream>>>(part.data_ptr<float>(), (int)part.stride(1), (int)part.size(1), (int)ksplit,
-        reinterpret_cast<__half*>(out.data_ptr()), (int)out.stride(0), blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(),
-        nblk.data_ptr<int>(), (int)I);
-}
-
-void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Tensor row_of_pair, torch::Tensor tw,
-                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps)
+void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, torch::Tensor nw, torch::Tensor out,
+                  int64_t M, double eps)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int H = (int)out.size(1);
@@ -788,10 +787,8 @@ void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Te
         cudaFuncSetAttribute(moe_finalize_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         attr_set = true;
     }
-    const float* pp = ksplit > 1 ? part.data_ptr<float>() : nullptr;
     moe_finalize_kernel<<<(unsigned)M, 256, smem, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), (int)y.stride(0), pp, ksplit > 1 ? (int)part.stride(1) : 0,
-        ksplit > 1 ? (int)part.size(1) : 0, (int)ksplit, row_of_pair.data_ptr<int>(),
+        reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), (int)y.stride(0), row_of_pair.data_ptr<int>(),
         tw.data_ptr<float>(), nw.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), H, (float)eps);
 }
 """
@@ -805,12 +802,10 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
                     int64_t mt, int64_t nper, int64_t ks, int64_t ksplit);
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
                   torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
-                  torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles, int64_t max_blocks, bool gated,
-                  int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul);
-void moe_wt_silu_reduce(torch::Tensor part, int64_t ksplit, torch::Tensor out, torch::Tensor blk_row0, torch::Tensor blk_end,
-                        torch::Tensor nblk, int64_t rows_per_block, int64_t max_blocks, int64_t I);
-void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Tensor row_of_pair, torch::Tensor tw,
-                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps);
+                  torch::Tensor out, torch::Tensor part, torch::Tensor counters, int64_t ksplit, int64_t K, int64_t ntiles,
+                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul);
+void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, torch::Tensor nw, torch::Tensor out,
+                  int64_t M, double eps);
 """
 
 _EXT = None
@@ -823,7 +818,7 @@ def build():
         _EXT = load_inline(
             name="okc_moe_w4a16", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_wt_silu_reduce", "moe_finalize"], extra_cuda_cflags=["-O3", "-arch=sm_90a", "--use_fast_math"], verbose=False)
+            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_finalize"], extra_cuda_cflags=["-O3", "-arch=sm_90a", "--use_fast_math"], verbose=False)
     return _EXT
 
 
