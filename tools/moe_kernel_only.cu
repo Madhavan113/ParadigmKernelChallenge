@@ -624,63 +624,71 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
         X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul);
 }
 
-// post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route); dynamic smem
-// 8 x H floats. Rows are loaded in groups of 8 x 16B per lane so the loads overlap.
+// post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route). Phase 1: each
+// warp loads its route's row (all H/256 16B pieces per lane at once) and reduces the sum of squares; phase 2:
+// every thread re-reads 8 elements of all 8 rows (L2-hot) and writes the weighted sum. No shared-memory tile,
+// so the SM keeps its carveout.
+template <int H>
 __global__ void __launch_bounds__(256)
 moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const int* __restrict__ row_of_pair,
-                    const float* __restrict__ tw, const float* __restrict__ nw, __nv_bfloat16* __restrict__ out,
-                    int H, float eps)
+                    const float* __restrict__ tw, const float* __restrict__ nw, __nv_bfloat16* __restrict__ out, float eps)
 {
-    extern __shared__ __align__(16) float red[];              // [8][H]
+    constexpr int NSEG = H / 8 / 32;                     // 16B pieces per lane
     __shared__ float sc_sh[8];
-    constexpr int GS = 8;
+    __shared__ int row_sh[8];
     const int tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = row_of_pair[tok * 8 + warp];
-    const uint4* src = r >= 0 ? reinterpret_cast<const uint4*>(y + (size_t)r * ldy) : nullptr;
-    float* myrow = red + warp * H;
     float ss = 0.f;
-    for (int seg0 = 0; seg0 < H / 8; seg0 += 32 * GS) {
-        uint4 u[GS];
+    if (r >= 0) {
+        const uint4* src = reinterpret_cast<const uint4*>(y + (size_t)r * ldy);
+        uint4 u[NSEG];
         #pragma unroll
-        for (int q = 0; q < GS; ++q) {
-            const int seg = seg0 + lane + 32 * q;
-            u[q] = (src != nullptr && seg < H / 8) ? src[seg] : make_uint4(0u, 0u, 0u, 0u);
+        for (int q = 0; q < NSEG; ++q) u[q] = src[lane + 32 * q];
+        #pragma unroll
+        for (int q = 0; q < NSEG; ++q) {
+            const int seg = lane + 32 * q;
+            const float4 n0 = *reinterpret_cast<const float4*>(nw + seg * 8), n1 = *reinterpret_cast<const float4*>(nw + seg * 8 + 4);
+            const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&u[q]);
+            float2 f0 = __bfloat1622float2(pb[0]), f1 = __bfloat1622float2(pb[1]);
+            float2 f2 = __bfloat1622float2(pb[2]), f3 = __bfloat1622float2(pb[3]);
+            f0.x *= n0.x; f0.y *= n0.y; f1.x *= n0.z; f1.y *= n0.w;
+            f2.x *= n1.x; f2.y *= n1.y; f3.x *= n1.z; f3.y *= n1.w;
+            ss += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y + f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
         }
         #pragma unroll
-        for (int q = 0; q < GS; ++q) {
-            const int seg = seg0 + lane + 32 * q;
-            if (seg < H / 8) {
-                const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&u[q]);
-                const float4 n0 = *reinterpret_cast<const float4*>(nw + seg * 8), n1 = *reinterpret_cast<const float4*>(nw + seg * 8 + 4);
-                float v[8];
-                #pragma unroll
-                for (int k = 0; k < 4; ++k) { const float2 f = __bfloat1622float2(pb[k]); v[2 * k] = f.x; v[2 * k + 1] = f.y; }
-                v[0] *= n0.x; v[1] *= n0.y; v[2] *= n0.z; v[3] *= n0.w; v[4] *= n1.x; v[5] *= n1.y; v[6] *= n1.z; v[7] *= n1.w;
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) ss += v[k] * v[k];
-                *reinterpret_cast<float4*>(myrow + seg * 8) = make_float4(v[0], v[1], v[2], v[3]);
-                *reinterpret_cast<float4*>(myrow + seg * 8 + 4) = make_float4(v[4], v[5], v[6], v[7]);
-            }
-        }
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
     }
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-    if (lane == 0) sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * tw[tok * 8 + warp] : 0.f;
+    if (lane == 0) {
+        sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * tw[tok * 8 + warp] : 0.f;
+        row_sh[warp] = r;
+    }
     __syncthreads();
+    #pragma unroll
     for (int base = threadIdx.x * 8; base < H; base += 256 * 8) {
+        uint4 v[8];
+        #pragma unroll
+        for (int s2 = 0; s2 < 8; ++s2) {
+            const int rs = row_sh[s2];
+            v[s2] = rs >= 0 ? *reinterpret_cast<const uint4*>(y + (size_t)rs * ldy + base) : make_uint4(0u, 0u, 0u, 0u);
+        }
         float acc[8];
         #pragma unroll
         for (int q = 0; q < 8; ++q) acc[q] = 0.f;
         #pragma unroll
         for (int s2 = 0; s2 < 8; ++s2) {
             const float scs = sc_sh[s2];
-            const float4 a = *reinterpret_cast<const float4*>(red + s2 * H + base), b = *reinterpret_cast<const float4*>(red + s2 * H + base + 4);
-            acc[0] += scs * a.x; acc[1] += scs * a.y; acc[2] += scs * a.z; acc[3] += scs * a.w;
-            acc[4] += scs * b.x; acc[5] += scs * b.y; acc[6] += scs * b.z; acc[7] += scs * b.w;
+            const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&v[s2]);
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float2 f = __bfloat1622float2(pb[q]);
+                acc[2 * q] += scs * f.x;
+                acc[2 * q + 1] += scs * f.y;
+            }
         }
+        const float4 n0 = *reinterpret_cast<const float4*>(nw + base), n1 = *reinterpret_cast<const float4*>(nw + base + 4);
         __nv_bfloat162 o[4];
-        o[0] = __floats2bfloat162_rn(acc[0], acc[1]); o[1] = __floats2bfloat162_rn(acc[2], acc[3]);
-        o[2] = __floats2bfloat162_rn(acc[4], acc[5]); o[3] = __floats2bfloat162_rn(acc[6], acc[7]);
+        o[0] = __floats2bfloat162_rn(acc[0] * n0.x, acc[1] * n0.y); o[1] = __floats2bfloat162_rn(acc[2] * n0.z, acc[3] * n0.w);
+        o[2] = __floats2bfloat162_rn(acc[4] * n1.x, acc[5] * n1.y); o[3] = __floats2bfloat162_rn(acc[6] * n1.z, acc[7] * n1.w);
         *reinterpret_cast<uint4*>(out + (size_t)tok * H + base) = *reinterpret_cast<const uint4*>(o);
     }
 }
@@ -705,15 +713,5 @@ template void launch_wt<false, 2, 2, 1, 4, false>(const __half*, int, const int*
 template void launch_wt<false, 1, 4, 1, 4, false>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
 template void launch_wt<false, 2, 4, 1, 2, false>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
 template void launch_wt<false, 2, 4, 1, 4, false>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 2, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 4, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 1, 1, 8, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<true, 1, 2, 1, 4, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 2, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 4, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 1, 1, 1, 8, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 1, 1, 4, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 1, 1, 8, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-template void launch_wt<false, 2, 2, 1, 4, true>(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, const float*, __half*, __nv_bfloat16*, int, float*, int, int, int*, int, int, int, int, float, cudaStream_t);
-void* finalize_ref = (void*)&moe_finalize_kernel;
+void* finalize_ref = (void*)&moe_finalize_kernel<4096>;
 } // namespace

@@ -79,7 +79,7 @@ def _route_kernel(
     sorted_pair_ptr, lids_ptr, npad_ptr,
     M, local_start, n_elems, n_route_ctas, xscale,
     PB: tl.constexpr, CH: tl.constexpr, BM: tl.constexpr, MAXB: tl.constexpr, E: tl.constexpr,
-    TOPK: tl.constexpr, XBLOCK: tl.constexpr, MARLIN: tl.constexpr,
+    TOPK: tl.constexpr, XBLOCK: tl.constexpr, MARLIN: tl.constexpr, MULTI: tl.constexpr,
 ):
     """Sort-free routing. CTA c < n_route_ctas owns pairs [c*PB, (c+1)*PB): each pair's rank among
     the pairs of its expert (how many earlier pairs route there) gives its padded row; every CTA
@@ -111,13 +111,16 @@ def _route_kernel(
         ce_key = tl.where(cl, ce, E)
         cnt = tl.sum((ce_key[None, :] == ex[:, None]).to(tl.int32), 1)     # per-expert pairs in this chunk
         counts += cnt
-        if c0 + CH <= my0:                                  # chunk entirely before this CTA's pairs
-            rank += tl.sum(onehot * cnt[None, :], 1)
-        else:
-            if c0 <= my0:                                   # the chunk holding this CTA's pairs: its earlier pairs
-                rank += tl.sum(((ce_key[None, :] == e_key[:, None]) & (ci[None, :] < my0)).to(tl.int32), 1)
-    # earlier pairs of the same expert within this CTA's own range
-    rank += tl.sum(((e_key[None, :] == e_key[:, None]) & (i[None, :] < i[:, None])).to(tl.int32), 1)
+        if MULTI:
+            if c0 + CH <= my0:                              # chunk entirely before this CTA's pairs
+                rank += tl.sum(onehot * cnt[None, :], 1)
+            else:
+                if c0 <= my0:                               # the chunk holding this CTA's pairs: its earlier pairs
+                    rank += tl.sum(((ce_key[None, :] == e_key[:, None]) & (ci[None, :] < my0)).to(tl.int32), 1)
+        else:                                               # one chunk: direct earlier-pair compare
+            rank += tl.sum(((ce_key[None, :] == e_key[:, None]) & (ci[None, :] < i[:, None])).to(tl.int32), 1)
+    if MULTI:   # earlier pairs of the same expert within this CTA's own range
+        rank += tl.sum(((e_key[None, :] == e_key[:, None]) & (i[None, :] < i[:, None])).to(tl.int32), 1)
     padded = (counts + BM - 1) // BM * BM
     pad_off = tl.cumsum(padded, 0) - padded                 # padded row offset per expert
     row = tl.sum(onehot * pad_off[None, :], 1) + rank
@@ -1068,63 +1071,71 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
         X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul);
 }
 
-// post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route); dynamic smem
-// 8 x H floats. Rows are loaded in groups of 8 x 16B per lane so the loads overlap.
+// post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route). Phase 1: each
+// warp loads its route's row (all H/256 16B pieces per lane at once) and reduces the sum of squares; phase 2:
+// every thread re-reads 8 elements of all 8 rows (L2-hot) and writes the weighted sum. No shared-memory tile,
+// so the SM keeps its carveout.
+template <int H>
 __global__ void __launch_bounds__(256)
 moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const int* __restrict__ row_of_pair,
-                    const float* __restrict__ tw, const float* __restrict__ nw, __nv_bfloat16* __restrict__ out,
-                    int H, float eps)
+                    const float* __restrict__ tw, const float* __restrict__ nw, __nv_bfloat16* __restrict__ out, float eps)
 {
-    extern __shared__ __align__(16) float red[];              // [8][H]
+    constexpr int NSEG = H / 8 / 32;                     // 16B pieces per lane
     __shared__ float sc_sh[8];
-    constexpr int GS = 8;
+    __shared__ int row_sh[8];
     const int tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = row_of_pair[tok * 8 + warp];
-    const uint4* src = r >= 0 ? reinterpret_cast<const uint4*>(y + (size_t)r * ldy) : nullptr;
-    float* myrow = red + warp * H;
     float ss = 0.f;
-    for (int seg0 = 0; seg0 < H / 8; seg0 += 32 * GS) {
-        uint4 u[GS];
+    if (r >= 0) {
+        const uint4* src = reinterpret_cast<const uint4*>(y + (size_t)r * ldy);
+        uint4 u[NSEG];
         #pragma unroll
-        for (int q = 0; q < GS; ++q) {
-            const int seg = seg0 + lane + 32 * q;
-            u[q] = (src != nullptr && seg < H / 8) ? src[seg] : make_uint4(0u, 0u, 0u, 0u);
+        for (int q = 0; q < NSEG; ++q) u[q] = src[lane + 32 * q];
+        #pragma unroll
+        for (int q = 0; q < NSEG; ++q) {
+            const int seg = lane + 32 * q;
+            const float4 n0 = *reinterpret_cast<const float4*>(nw + seg * 8), n1 = *reinterpret_cast<const float4*>(nw + seg * 8 + 4);
+            const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&u[q]);
+            float2 f0 = __bfloat1622float2(pb[0]), f1 = __bfloat1622float2(pb[1]);
+            float2 f2 = __bfloat1622float2(pb[2]), f3 = __bfloat1622float2(pb[3]);
+            f0.x *= n0.x; f0.y *= n0.y; f1.x *= n0.z; f1.y *= n0.w;
+            f2.x *= n1.x; f2.y *= n1.y; f3.x *= n1.z; f3.y *= n1.w;
+            ss += f0.x * f0.x + f0.y * f0.y + f1.x * f1.x + f1.y * f1.y + f2.x * f2.x + f2.y * f2.y + f3.x * f3.x + f3.y * f3.y;
         }
         #pragma unroll
-        for (int q = 0; q < GS; ++q) {
-            const int seg = seg0 + lane + 32 * q;
-            if (seg < H / 8) {
-                const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&u[q]);
-                const float4 n0 = *reinterpret_cast<const float4*>(nw + seg * 8), n1 = *reinterpret_cast<const float4*>(nw + seg * 8 + 4);
-                float v[8];
-                #pragma unroll
-                for (int k = 0; k < 4; ++k) { const float2 f = __bfloat1622float2(pb[k]); v[2 * k] = f.x; v[2 * k + 1] = f.y; }
-                v[0] *= n0.x; v[1] *= n0.y; v[2] *= n0.z; v[3] *= n0.w; v[4] *= n1.x; v[5] *= n1.y; v[6] *= n1.z; v[7] *= n1.w;
-                #pragma unroll
-                for (int k = 0; k < 8; ++k) ss += v[k] * v[k];
-                *reinterpret_cast<float4*>(myrow + seg * 8) = make_float4(v[0], v[1], v[2], v[3]);
-                *reinterpret_cast<float4*>(myrow + seg * 8 + 4) = make_float4(v[4], v[5], v[6], v[7]);
-            }
-        }
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
     }
-    #pragma unroll
-    for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-    if (lane == 0) sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * tw[tok * 8 + warp] : 0.f;
+    if (lane == 0) {
+        sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * tw[tok * 8 + warp] : 0.f;
+        row_sh[warp] = r;
+    }
     __syncthreads();
+    #pragma unroll
     for (int base = threadIdx.x * 8; base < H; base += 256 * 8) {
+        uint4 v[8];
+        #pragma unroll
+        for (int s2 = 0; s2 < 8; ++s2) {
+            const int rs = row_sh[s2];
+            v[s2] = rs >= 0 ? *reinterpret_cast<const uint4*>(y + (size_t)rs * ldy + base) : make_uint4(0u, 0u, 0u, 0u);
+        }
         float acc[8];
         #pragma unroll
         for (int q = 0; q < 8; ++q) acc[q] = 0.f;
         #pragma unroll
         for (int s2 = 0; s2 < 8; ++s2) {
             const float scs = sc_sh[s2];
-            const float4 a = *reinterpret_cast<const float4*>(red + s2 * H + base), b = *reinterpret_cast<const float4*>(red + s2 * H + base + 4);
-            acc[0] += scs * a.x; acc[1] += scs * a.y; acc[2] += scs * a.z; acc[3] += scs * a.w;
-            acc[4] += scs * b.x; acc[5] += scs * b.y; acc[6] += scs * b.z; acc[7] += scs * b.w;
+            const __nv_bfloat162* pb = reinterpret_cast<const __nv_bfloat162*>(&v[s2]);
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) {
+                const float2 f = __bfloat1622float2(pb[q]);
+                acc[2 * q] += scs * f.x;
+                acc[2 * q + 1] += scs * f.y;
+            }
         }
+        const float4 n0 = *reinterpret_cast<const float4*>(nw + base), n1 = *reinterpret_cast<const float4*>(nw + base + 4);
         __nv_bfloat162 o[4];
-        o[0] = __floats2bfloat162_rn(acc[0], acc[1]); o[1] = __floats2bfloat162_rn(acc[2], acc[3]);
-        o[2] = __floats2bfloat162_rn(acc[4], acc[5]); o[3] = __floats2bfloat162_rn(acc[6], acc[7]);
+        o[0] = __floats2bfloat162_rn(acc[0] * n0.x, acc[1] * n0.y); o[1] = __floats2bfloat162_rn(acc[2] * n0.z, acc[3] * n0.w);
+        o[2] = __floats2bfloat162_rn(acc[4] * n1.x, acc[5] * n1.y); o[3] = __floats2bfloat162_rn(acc[6] * n1.z, acc[7] * n1.w);
         *reinterpret_cast<uint4*>(out + (size_t)tok * H + base) = *reinterpret_cast<const uint4*>(o);
     }
 }
@@ -1202,12 +1213,7 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         case 12104: OKC_W(false, 1, 2, 1, 4, false); break;   case 22102: OKC_W(false, 2, 2, 1, 2, false); break;
         case 22104: OKC_W(false, 2, 2, 1, 4, false); break;   case 14104: OKC_W(false, 1, 4, 1, 4, false); break;
         case 24102: OKC_W(false, 2, 4, 1, 2, false); break;   case 24104: OKC_W(false, 2, 4, 1, 4, false); break;
-        // split-K instantiations (the candidate small-batch variants)
-        case 1111102: OKC_W(true, 1, 1, 1, 2, true); break;   case 1111104: OKC_W(true, 1, 1, 1, 4, true); break;
-        case 1111108: OKC_W(true, 1, 1, 1, 8, true); break;   case 1112104: OKC_W(true, 1, 2, 1, 4, true); break;
-        case 1011102: OKC_W(false, 1, 1, 1, 2, true); break;  case 1011104: OKC_W(false, 1, 1, 1, 4, true); break;
-        case 1011108: OKC_W(false, 1, 1, 1, 8, true); break;  case 1021104: OKC_W(false, 2, 1, 1, 4, true); break;
-        case 1021108: OKC_W(false, 2, 1, 1, 8, true); break;  case 1022104: OKC_W(false, 2, 2, 1, 4, true); break;
+        // split-K (SPLITK = true) instantiations removed: measured slower than the plain variants on every shape
         default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage, ksplit)");
     }
 #undef OKC_W
@@ -1217,17 +1223,10 @@ void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, 
                   int64_t M, double eps)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
-    const int H = (int)out.size(1);
-    TORCH_CHECK(H % 2048 == 0, "finalize: H must be a multiple of 2048");
-    const int smem = 8 * H * (int)sizeof(float);
-    static bool attr_set = false;
-    if (!attr_set) {
-        cudaFuncSetAttribute(moe_finalize_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
-        attr_set = true;
-    }
-    moe_finalize_kernel<<<(unsigned)M, 256, smem, stream>>>(
+    TORCH_CHECK(out.size(1) == 4096, "finalize: H must be 4096");
+    moe_finalize_kernel<4096><<<(unsigned)M, 256, 0, stream>>>(
         reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), (int)y.stride(0), row_of_pair.data_ptr<int>(),
-        tw.data_ptr<float>(), nw.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), H, (float)eps);
+        tw.data_ptr<float>(), nw.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (float)eps);
 }
 """
 
@@ -1371,7 +1370,9 @@ def _moe_forward_cuda(x, ids, tw, local_start: int, I: int, state) -> torch.Tens
 
 
 # (token n8 blocks per expert block, GEMM2 m16 tiles per warp, K-split warp groups, cp.async stages, K-split CTAs)
-WT_DEFAULT = {1: (1, 1, 1, 8, 2), 8: (1, 1, 1, 8, 1), 16: (1, 1, 1, 4, 1), 32: (1, 1, 1, 4, 1), 128: (2, 2, 1, 4, 1), 256: (4, 2, 1, 4, 1)}
+# Locked from the in-prepare cold-L2 sweeps (checks f2f756d9, a3d79f15): 8 cp.async stages up to 8 tokens, 4 above;
+# 8-token blocks up to 64 tokens, 16-token (GEMM2: 2 tiles per warp) up to 128, 32-token with 2 stages beyond.
+WT_DEFAULT = {8: (1, 1, 1, 8, 1), 64: (1, 1, 1, 4, 1), 128: (2, 2, 1, 4, 1), 100000: (4, 2, 1, 2, 1)}
 WT_SAFE = (1, 1, 1, 4, 1)
 PART_SPLIT_MAX = 4      # fp32 partial slices for split-K
 PART_ROWS = 1024        # padded rows the partial buffer holds (split-K is a small-batch tool)
@@ -1577,7 +1578,7 @@ def _route(x, ids, local_start: int, BM: int, state, marlin: bool):
         state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
         state["sorted_pair"], state["lids"], state["npad"],
         M, local_start, n_elems, n_route, float(state.get("xscale", 1.0)),
-        PB=PB, CH=CH, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, MARLIN=marlin, num_warps=4,
+        PB=PB, CH=CH, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, MARLIN=marlin, MULTI=NP > CH, num_warps=4,
     )
     return NP, MAXB
 
@@ -1704,7 +1705,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
@@ -1885,9 +1886,7 @@ def _timeit_cold(fn, dev, reps=8):
     return run(True) - run(False)
 
 
-WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 2, 1), (1, 1, 1, 8, 1), (1, 1, 1, 8, 2), (1, 1, 1, 8, 4), (1, 1, 1, 4, 4), (1, 1, 1, 2, 2),
-                    (1, 2, 1, 8, 2), (1, 2, 1, 4, 2), (1, 2, 1, 2, 1), (2, 2, 1, 4, 1), (2, 2, 1, 2, 1),
-                    (4, 2, 1, 4, 1), (4, 2, 1, 2, 1), (2, 1, 1, 2, 1), (4, 1, 1, 4, 1))
+WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (2, 2, 1, 4, 1), (4, 2, 1, 2, 1))
 
 
 def _selftest_wt(state):
@@ -1964,7 +1963,7 @@ def _bench_wt(state, autotune=False):
                   + f"  | local routes {int(((ids >= 0) & (ids < 32)).sum())} distinct {int(torch.unique(ids[(ids < 32)]).numel())}")
         except Exception as e:
             print(f"  wt parts bs{bs} failed: {str(e)[:100]}")
-    small = [(1, 1, 1, 2, 1), (1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 1, 1, 8, 2), (1, 1, 1, 8, 4), (1, 1, 1, 4, 4), (1, 2, 1, 8, 2), (1, 2, 1, 4, 2), (1, 2, 1, 2, 1), (1, 1, 1, 2, 2)]
+    small = [(1, 1, 1, 2, 1), (1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 2, 1, 4, 1), (1, 2, 1, 8, 1)]
     big = [(2, 2, 1, 4, 1), (2, 2, 1, 2, 1), (4, 2, 1, 4, 1), (4, 2, 1, 2, 1), (2, 1, 1, 2, 1), (4, 1, 1, 4, 1)]
     bad = state.get("wt_bad", set())
     best = {}
@@ -1989,7 +1988,7 @@ def _bench_wt(state, autotune=False):
     print(f"BENCH wt done in {time.time() - t0:.0f}s")
 
 
-AUTOTUNE = True    # pick the wt variant per shape from the in-prepare bench (BENCH) instead of WT_DEFAULT
+AUTOTUNE = False   # pick the wt variant per shape from the in-prepare bench (BENCH) instead of WT_DEFAULT
 
 
 def prepare(weights: Weights):

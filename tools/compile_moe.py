@@ -26,8 +26,8 @@ build(S._route_kernel,
       {"ids_ptr": "*i32", "x_ptr": "*bf16", "x16_ptr": "*fp16", "sorted_tok_ptr": "*i32", "row_of_pair_ptr": "*i32",
        "blk_e_ptr": "*i32", "blk_row0_ptr": "*i32", "blk_end_ptr": "*i32", "nblk_ptr": "*i32", "sorted_pair_ptr": "*i32", "lids_ptr": "*i32", "npad_ptr": "*i32",
        "M": "i32", "local_start": "i32",
-       "n_elems": "i32", "n_route_ctas": "i32", "xscale": "fp32", "PB": "constexpr", "CH": "constexpr", "BM": "constexpr", "MAXB": "constexpr", "E": "constexpr", "TOPK": "constexpr", "XBLOCK": "constexpr", "MARLIN": "constexpr"},
-      {"PB": min(NP, 64), "CH": min(NP, 256), "BM": BM, "MAXB": MAXB, "E": 32, "TOPK": 8, "XBLOCK": 4096, "MARLIN": True}, 4, 1, f"route_bs{bs}")
+       "n_elems": "i32", "n_route_ctas": "i32", "xscale": "fp32", "PB": "constexpr", "CH": "constexpr", "BM": "constexpr", "MAXB": "constexpr", "E": "constexpr", "TOPK": "constexpr", "XBLOCK": "constexpr", "MARLIN": "constexpr", "MULTI": "constexpr"},
+      {"PB": min(NP, 64), "CH": min(NP, 256), "BM": BM, "MAXB": MAXB, "E": 32, "TOPK": 8, "XBLOCK": 4096, "MARLIN": True, "MULTI": NP > min(NP, 256)}, 4, 1, f"route_bs{bs}")
 gsig = {"a_ptr": "*fp16", "w_ptr": "*u8", "sf_ptr": "*fp8e4nv", "gs_ptr": "*fp32", "out_ptr": "*fp16", "sorted_tok_ptr": "*i32",
         "blk_e_ptr": "*i32", "blk_row0_ptr": "*i32", "blk_end_ptr": "*i32", "nblk_ptr": "*i32", "stride_am": "i32", "stride_om": "i32",
         "K": "i32", "N": "i32", "stride_we": "i64", "stride_wn": "i32", "stride_se": "i64", "stride_sn": "i32", "up_rows": "i32",

@@ -18,7 +18,7 @@ wsig = ("(const __half*, int, const int*, const int*, const int*, const int*, co
 for g, m, t, s, n, sk in re.findall(r"OKC_W\((true|false), (\d), (\d), (\d), (\d), (true|false)\)", cu):
     inst.append(f"template void launch_wt<{g}, {m}, {t}, {s}, {n}, {sk}>{wsig};")
 # keep the finalize kernel referenced
-inst.append("void* finalize_ref = (void*)&moe_finalize_kernel;")
+inst.append("void* finalize_ref = (void*)&moe_finalize_kernel<4096>;")
 out = body + "\n".join(inst) + "\n} // namespace\n"
 (root / "tools/moe_kernel_only.cu").write_text(out)
 print("wrote", len(out.splitlines()), "lines,", len(inst), "instantiations")
