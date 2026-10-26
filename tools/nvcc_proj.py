@@ -13,5 +13,5 @@ cmd = ["nvcc", "-arch=sm_90a", "-O3", "-std=c++20", "-c", "-o", "/tmp/proj.o", "
 r = subprocess.run(cmd, capture_output=True, text=True)
 out = r.stdout + r.stderr
 lines = [l for l in out.splitlines() if "error" in l.lower() or "Used" in l or "Function properties" in l or "spill" in l or "Compiling entry" in l]
-print("\n".join(lines[-200:]))
+print("\n".join(lines))
 print("rc", r.returncode)

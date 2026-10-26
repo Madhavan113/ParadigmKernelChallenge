@@ -1090,6 +1090,181 @@ void launch_gemv12(const __nv_bfloat16* X, const uint8_t* LO, const uint8_t* NB,
     gemv12_kernel<WARPS, UNROLL, SK><<<dim3(N / 32, SK), WARPS * 32, 0, stream>>>(X, LO, NB, eb, eo, en, ek, ed, out, part, cnt, N, K);
 }
 
+// ---- 12-bit packed tensor-core GEMM, M <= 16 * MT. One CTA = one 32-row n-tile (x SK k-splits);
+// 8 warps = (4 / RPW) row groups of RPW x 8 rows, each row group split KS = 2 * RPW ways over the
+// k-tiles. Per 64-k chunk a lane (g = lane / 4, t = lane % 4) holds row g's real k = 16t .. 16t+15
+// (16 low bytes + 8 nibble bytes); decode4 of its j-th 4-element group gives the B fragment of
+// mma k-step j under the k permutation, and x's A fragments are the same 16-element groups of
+// rows g / g+8 (two 16-byte loads each from L1/L2). Warps reduce through shared memory; the
+// finishing CTA adds the escapes and writes bf16.
+template <int MT, int RPW, int UNROLL, int SK>
+__global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m,
+        const uint8_t* __restrict__ LO, const uint8_t* __restrict__ NB, int eb,
+        const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+        __nv_bfloat16* __restrict__ out, int ldo, float* __restrict__ part, int* __restrict__ cnt, int N, int K)
+{
+    constexpr int GROUPS = 4 / RPW, KS = 8 / GROUPS, MR = 16 * MT;
+    __shared__ float red[32][MR + 1];
+    __shared__ int s_en[64];
+    __shared__ float s_ev[64][MR];
+    __shared__ int s_last;
+    const int pn = blockIdx.x, sk = blockIdx.y;
+    const int KT = K / 256, ktc = KT / SK / KS;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int grp = warp / KS, kp = warp % KS;
+    const int kt0 = sk * (KT / SK) + kp * ktc;                 // this warp's first k-tile
+    const int nchunk = ktc * 4;
+    const uint32_t hb = (uint32_t)(eb >> 1);
+    const uint32_t lut0 = hb | (hb + 1) << 8 | (hb + 2) << 16 | (hb + 3) << 24;
+    const uint32_t lut1 = (hb + 4) | (hb + 5) << 8 | (hb + 6) << 16 | (hb + 7) << 24;
+
+    // weight pointers: row grp * RPW * 8 + 8 r + g of tile (pn, kt0 + c / 4), chunk q = c % 4
+    const uint8_t* lo_base[RPW]; const uint8_t* nb_base[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        const int row = grp * RPW * 8 + 8 * r + g;
+        lo_base[r] = LO + ((size_t)(pn * KT + kt0) * 32 + row) * 256 + 16 * t;
+        nb_base[r] = NB + ((size_t)(pn * KT + kt0) * 32 + row) * 128 + 8 * t;
+    }
+    auto lo_at = [&](int r, int c) { return reinterpret_cast<const uint4*>(lo_base[r] + (size_t)(c >> 2) * 32 * 256 + (c & 3) * 64); };
+    auto nb_at = [&](int r, int c) { return reinterpret_cast<const uint2*>(nb_base[r] + (size_t)(c >> 2) * 32 * 128 + (c & 3) * 32); };
+    // x rows g / g+8 of each m-tile
+    const uint4* xp[MT][2]; bool xok[MT][2];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = 16 * i + g + 8 * h;
+            xok[i][h] = row < m;
+            xp[i][h] = reinterpret_cast<const uint4*>(X + (size_t)(row < m ? row : 0) * ldx + kt0 * 256 + 16 * t);
+        }
+    float acc[MT][RPW][4];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][r][q] = 0.f;
+
+    uint4 cl[UNROLL][RPW]; uint2 cn[UNROLL][RPW];
+    #pragma unroll
+    for (int u = 0; u < UNROLL; ++u)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) { cn[u][r] = *nb_at(r, u); cl[u][r] = ldg_stream(lo_at(r, u)); }
+    for (int c = 0; c < nchunk; c += UNROLL) {
+        const int cnx = c + UNROLL < nchunk ? c + UNROLL : c;
+        uint4 nl[UNROLL][RPW]; uint2 nn[UNROLL][RPW];
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) { nn[u][r] = *nb_at(r, cnx + u); nl[u][r] = ldg_stream(lo_at(r, cnx + u)); }
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            const int cc = c + u;
+            uint4 xa[MT][2][2];      // [m-tile][row g / g+8][elements 0-7 / 8-15]
+            #pragma unroll
+            for (int i = 0; i < MT; ++i)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4* xq = xp[i][h] + (size_t)(cc >> 2) * 32 + (cc & 3) * 8;   // k-tile = 32 uint4, 64-k chunk = 8 uint4
+                    if (xok[i][h]) { xa[i][h][0] = xq[0]; xa[i][h][1] = xq[1]; }
+                    else { xa[i][h][0] = make_uint4(0u, 0u, 0u, 0u); xa[i][h][1] = make_uint4(0u, 0u, 0u, 0u); }
+                }
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                #pragma unroll
+                for (int r = 0; r < RPW; ++r) {
+                    const uint32_t Lw = j == 0 ? cl[u][r].x : j == 1 ? cl[u][r].y : j == 2 ? cl[u][r].z : cl[u][r].w;
+                    const uint32_t n16 = j == 0 ? (cn[u][r].x & 0xFFFFu) : j == 1 ? (cn[u][r].x >> 16) : j == 2 ? (cn[u][r].y & 0xFFFFu) : (cn[u][r].y >> 16);
+                    uint32_t b0, b1;
+                    decode4(Lw, n16, lut0, lut1, b0, b1);
+                    #pragma unroll
+                    for (int i = 0; i < MT; ++i) {
+                        const uint4 ga = xa[i][0][j >> 1], gb = xa[i][1][j >> 1];
+                        const uint32_t a0 = (j & 1) ? ga.z : ga.x, a2 = (j & 1) ? ga.w : ga.y;
+                        const uint32_t a1 = (j & 1) ? gb.z : gb.x, a3 = (j & 1) ? gb.w : gb.y;
+                        mma16816(acc[i][r], a0, a1, a2, a3, b0, b1);
+                    }
+                }
+            }
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) { cl[u][r] = nl[u][r]; cn[u][r] = nn[u][r]; }
+    }
+
+    // reduce the KS warps of each row group: red[n_local][m]
+    for (int idx = threadIdx.x; idx < 32 * (MR + 1); idx += 256) (&red[0][0])[idx] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const int n0 = grp * RPW * 8 + 8 * r + 2 * t;
+            atomicAdd(&red[n0][16 * i + g], acc[i][r][0]);
+            atomicAdd(&red[n0 + 1][16 * i + g], acc[i][r][1]);
+            atomicAdd(&red[n0][16 * i + g + 8], acc[i][r][2]);
+            atomicAdd(&red[n0 + 1][16 * i + g + 8], acc[i][r][3]);
+        }
+    __syncthreads();
+    if (SK > 1) {
+        // partials [SK][MR][N] fp32 of this n-tile, ticket, last CTA sums
+        for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+            const int n = idx & 31, i = idx >> 5;
+            part[((size_t)sk * MR + i) * N + pn * 32 + n] = red[n][i];
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = (atomicAdd(cnt + pn, 1) == SK - 1);
+        __syncthreads();
+        if (!s_last) return;
+        __threadfence();
+        for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+            const int n = idx & 31, i = idx >> 5;
+            float v = 0.f;
+            #pragma unroll
+            for (int s2 = 0; s2 < SK; ++s2) v += __ldcg(part + ((size_t)s2 * MR + i) * N + pn * 32 + n);
+            red[n][i] = v;
+        }
+        __syncthreads();
+    }
+    // escapes: staged 64 at a time (one entry per thread incl. its x column), then row threads scan
+    const int e0 = esc_off[pn], e1 = esc_off[pn + 1];
+    for (int base = e0; base < e1; base += 64) {
+        const int e = base + (int)threadIdx.x;
+        if (threadIdx.x < 64) {
+            if (e < e1) {
+                s_en[threadIdx.x] = esc_n[e];
+                const float d = esc_d[e]; const int kk = esc_k[e];
+                for (int i = 0; i < MR; ++i) s_ev[threadIdx.x][i] = i < m ? d * __bfloat162float(X[(size_t)i * ldx + kk]) : 0.f;
+            } else {
+                s_en[threadIdx.x] = -1;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int cnt_ = min(e1 - base, 64);
+            for (int j = 0; j < cnt_; ++j)
+                if (s_en[j] == (int)threadIdx.x)
+                    for (int i = 0; i < MR; ++i) red[threadIdx.x][i] += s_ev[j][i];
+        }
+        __syncthreads();
+    }
+    for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+        const int n = idx & 31, i = idx >> 5;
+        if (i < m) out[(size_t)i * ldo + pn * 32 + n] = __float2bfloat16(red[n][i]);
+    }
+    if (SK > 1 && threadIdx.x == 0) cnt[pn] = 0;
+}
+
+template <int MT, int RPW, int UNROLL, int SK>
+void launch_mma12(const __nv_bfloat16* X, int ldx, int m, const uint8_t* LO, const uint8_t* NB, int eb, const int* eo, const int* en, const int* ek, const float* ed,
+                  __nv_bfloat16* out, int ldo, float* part, int* cnt, int N, int K, cudaStream_t stream)
+{
+    mma12_kernel<MT, RPW, UNROLL, SK><<<dim3(N / 32, SK), 256, 0, stream>>>(X, ldx, m, LO, NB, eb, eo, en, ek, ed, out, ldo, part, cnt, N, K);
+}
+
 } // namespace
 
 void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t threads, int64_t unroll)
@@ -1231,7 +1406,48 @@ void gemv12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, tor
         GEMV12_CASE(4, 2, 2)
         GEMV12_CASE(4, 2, 4)
         GEMV12_CASE(4, 4, 2)
+        GEMV12_CASE(8, 1, 8)
+        GEMV12_CASE(8, 2, 8)
+        GEMV12_CASE(4, 2, 8)
+        GEMV12_CASE(16, 1, 8)
+        GEMV12_CASE(8, 1, 16)
+        GEMV12_CASE(4, 1, 16)
         default: TORCH_CHECK(false, "unsupported gemv12 config");
+    }
+}
+#define MMA12_CASE(T_, R_, U_, S_) \
+    case (T_ * 1000 + R_ * 100 + U_ * 10 + S_): launch_mma12<T_, R_, U_, S_>(Xp, ldx, m, LOp, NBp, (int)eb, eo, en, ek, ed, ob, ldo, part.data_ptr<float>(), cnt.data_ptr<int>(), N, K, stream); break;
+
+void mma12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
+           torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t unroll, int64_t sk)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int m = (int)X.size(0), K = (int)X.size(1), N = (int)out.size(1);
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const uint8_t* LOp = LO.data_ptr<uint8_t>(); const uint8_t* NBp = NB.data_ptr<uint8_t>();
+    const int* eo = esc_off.data_ptr<int>(); const int* en = esc_n.data_ptr<int>(); const int* ek = esc_k.data_ptr<int>(); const float* ed = esc_d.data_ptr<float>();
+    __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
+    const int key = (int)mt * 1000 + (int)rpw * 100 + (int)unroll * 10 + (int)sk;
+    switch (key) {
+        MMA12_CASE(1, 4, 2, 1)
+        MMA12_CASE(1, 4, 1, 2)
+        MMA12_CASE(1, 4, 2, 2)
+        MMA12_CASE(1, 2, 2, 1)
+        MMA12_CASE(1, 2, 4, 1)
+        MMA12_CASE(1, 2, 2, 2)
+        MMA12_CASE(1, 2, 2, 4)
+        MMA12_CASE(1, 1, 4, 1)
+        MMA12_CASE(1, 1, 4, 2)
+        MMA12_CASE(1, 1, 8, 1)
+        MMA12_CASE(2, 4, 1, 1)
+        MMA12_CASE(2, 4, 1, 2)
+        MMA12_CASE(2, 2, 2, 1)
+        MMA12_CASE(2, 2, 2, 2)
+        MMA12_CASE(2, 2, 1, 4)
+        MMA12_CASE(2, 1, 4, 1)
+        MMA12_CASE(2, 1, 2, 2)
+        default: TORCH_CHECK(false, "unsupported mma12 config");
     }
 }
 """
@@ -1244,6 +1460,7 @@ void gemv(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tensor out,
 void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt, int64_t rpw, int64_t unroll, int64_t ksplit);
 void tgemv(torch::Tensor X, torch::Tensor Wt, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t bn, int64_t warps, int64_t unroll, int64_t sk);
 void gemv12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t warps, int64_t unroll, int64_t sk);
+void mma12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t unroll, int64_t sk);
 """
 
 _EXT = None
@@ -1254,9 +1471,9 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda6", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda7", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
+            functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12", "mma12"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
 
 
@@ -1290,6 +1507,16 @@ def gemv12_usable(m: int, n: int, k: int, warps: int, unroll: int, sk: int) -> b
         return False
     kt = k // 256
     return kt % sk == 0 and (kt // sk) % unroll == 0
+
+
+def mma12_usable(m: int, n: int, k: int, mt: int, rpw: int, unroll: int, sk: int) -> bool:
+    if m > 16 * mt or n % 32 or k % 256:
+        return False
+    ks = 8 // (4 // rpw)
+    kt = k // 256
+    if kt % (sk * ks):
+        return False
+    return (kt // sk // ks * 4) % unroll == 0
 
 
 # == END CUDA ==
@@ -1374,8 +1601,11 @@ GEMV_SHAPES = {
     ("unpooler", 1024, 1): (1, 1, 4, 2),
     ("router", 256, 1): (1, 1, 2, 8),
 }
-# (layer, n, m) -> (warps, unroll, sk): the 12-bit packed GEMV (m = 1)
-G12_SHAPES = {}
+# (layer, n, m) -> (warps, unroll, sk): the 12-bit packed GEMV (m = 1). Check f746ebec (judge protocol):
+# pooler 12.8 vs 17.9 (BF16 Triton); qkv 10.3 vs 10.4 (row GEMV), unpooler slice / o: the row GEMV / Triton win
+G12_SHAPES = {("pooler", 4096, 1): (8, 1, 4)}
+# (layer, n, m) -> (mt, rpw, unroll, sk): the 12-bit packed mma.sync GEMM (m <= 32)
+M12_SHAPES = {}
 # (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
 T12_SHAPES = {}
 T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
@@ -1409,6 +1639,9 @@ def _config(layer: str, m: int, n: int, k: int):
     if (layer, n, m) in G12_SHAPES:
         warps, unroll, sk = G12_SHAPES[(layer, n, m)]
         return dict(g12=True, warps=warps, unroll=unroll, sk=sk)
+    if (layer, n, m) in M12_SHAPES:
+        mt, rpw, unroll, sk = M12_SHAPES[(layer, n, m)]
+        return dict(m12=True, mt=mt, rpw=rpw, unroll=unroll, sk=sk)
     if (layer, n, m) in T12_SHAPES:
         sk, nw, ns = T12_SHAPES[(layer, n, m)]
         return dict(t12=True, BLOCK_M=_block_m(m), BLOCK_N=32, BLOCK_K=256, SPLIT_K=sk, num_warps=nw, num_stages=ns)
@@ -1511,6 +1744,8 @@ def _usable(cfg, m: int, n: int, k: int) -> bool:
         return tgemv_usable(m, n, k, cfg["bn"], cfg["warps"], cfg["unroll"], cfg["sk"])
     if cfg.get("g12"):
         return gemv12_usable(m, n, k, cfg["warps"], cfg["unroll"], cfg["sk"])
+    if cfg.get("m12"):
+        return mma12_usable(m, n, k, cfg["mt"], cfg["rpw"], cfg["unroll"], cfg["sk"]) and (cfg["sk"] == 1 or cfg["sk"] * 16 * cfg["mt"] * n <= PARTIALS_FLOATS)
     if cfg.get("t12"):
         if m > cfg["BLOCK_M"] or n % 32 or k % 256 or (k // 256) % cfg["SPLIT_K"]:
             return False
@@ -1628,6 +1863,13 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
             m, n, k, x.stride(0), out.stride(0), pk["eb"],
             BLOCK_M=cfg["BLOCK_M"], SPLIT_K=cfg["SPLIT_K"], ASM=T12_ASM, INTERP=T12_INTERP,
             num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        return out
+    if cfg.get("m12"):
+        pk = state.get(layer + "_p12")
+        if pk is None:
+            return _launch(x, w, w2, out, state, _triton_config(layer, m, n, k), m, n, k, layer)
+        build().mma12(x, pk["lo"], pk["nib"], pk["eb"], pk["esc_off"], pk["esc_n"], pk["esc_k"], pk["esc_delta"],
+                      out, state["partials"], state["counters"], cfg["mt"], cfg["rpw"], cfg["unroll"], cfg["sk"])
         return out
     if cfg.get("g12"):
         pk = state.get(layer + "_p12")
@@ -1798,29 +2040,30 @@ def _bench(state):
     TAB = {"table": True}
     print("BENCH proj, judge protocol (us per replay minus fixed cost; '!' = rel err above tol)")
     if ext is not None:
-        g12 = [(8, 2, 1), (8, 4, 1), (8, 2, 2), (8, 4, 2), (8, 2, 4), (8, 1, 4), (16, 2, 1), (16, 4, 1), (16, 2, 2), (16, 4, 2),
-               (4, 2, 1), (4, 2, 2), (4, 2, 4), (4, 4, 2)]
-        for layer, n in (("pooler", 4096), ("unpooler", 1024), ("qkv_gate", 2304), ("o", 8192), ("unpooler", 8192)):
+        print("BENCH 12-bit mma GEMM (mt, rpw, unroll, sk) vs the table at m=8/16/32")
+        m12 = {1: [(1, 4, 2, 1), (1, 4, 1, 2), (1, 4, 2, 2), (1, 2, 2, 1), (1, 2, 4, 1), (1, 2, 2, 2), (1, 2, 2, 4), (1, 1, 4, 1), (1, 1, 4, 2), (1, 1, 8, 1)],
+               2: [(2, 4, 1, 1), (2, 4, 1, 2), (2, 2, 2, 1), (2, 2, 2, 2), (2, 2, 1, 4), (2, 1, 4, 1), (2, 1, 2, 2)]}
+        for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192), ("unpooler", 1024)):
+            for m in (8, 16, 32):
+                if not budget():
+                    break
+                if layer == "unpooler" and ((n == 1024) != (m <= 8)):
+                    continue
+                mt = 1 if m <= 16 else 2
+                parts = [row("table", layer, m, n, TAB)]
+                for mt_, rpw, unroll, sk in m12[mt]:
+                    parts.append(row(f"m12 {rpw}/{unroll}/{sk}", layer, m, n, dict(m12=True, mt=mt_, rpw=rpw, unroll=unroll, sk=sk)))
+                print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
+        print("BENCH m=1 12-bit GEMV, more CTAs for qkv / the unpooler slice")
+        for layer, n, cands in (("qkv_gate", 2304, [(8, 1, 4), (8, 1, 8), (8, 2, 8), (4, 2, 8), (16, 1, 4), (16, 1, 8)]),
+                                ("unpooler", 1024, [(8, 2, 4), (8, 1, 8), (8, 2, 8), (8, 1, 16), (4, 2, 8), (4, 1, 16), (16, 1, 8)]),
+                                ("pooler", 4096, [(8, 1, 4), (8, 1, 8), (4, 2, 4), (4, 1, 8), (16, 1, 4)])):
             if not budget():
                 break
             parts = [row("current", layer, 1, n, None), row("triton", layer, 1, n, TAB)]
-            for warps, unroll, sk in g12:
+            for warps, unroll, sk in cands:
                 parts.append(row(f"p12 {warps}/{unroll}/{sk}", layer, 1, n, dict(g12=True, warps=warps, unroll=unroll, sk=sk)))
             print(f"  m=1 {layer:9s} n={n}: " + " | ".join(parts))
-    print("BENCH Triton 12-bit tiled GEMM (SPLIT_K, warps, stages) vs the table at m=8/16/32")
-    t12 = [(1, 4, 4), (1, 4, 6), (1, 2, 6), (1, 8, 4), (2, 4, 4), (1, 4, 3)]
-    t12_qkv = [(4, 4, 4), (4, 4, 3), (8, 4, 4), (2, 4, 6), (4, 2, 4), (4, 8, 4)]
-    for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192), ("unpooler", 1024)):
-        for m in (8, 16, 32):
-            if not budget():
-                break
-            if layer == "unpooler" and ((n == 1024) != (m <= 8)):
-                continue
-            parts = [row("table", layer, m, n, TAB)]
-            for sk, nw, ns in (t12_qkv if layer == "qkv_gate" else t12):
-                cfg = dict(t12=True, BLOCK_M=_block_m(m), BLOCK_N=32, BLOCK_K=256, SPLIT_K=sk, num_warps=nw, num_stages=ns)
-                parts.append(row(f"t12 {sk}/{nw}/{ns}", layer, m, n, cfg))
-            print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
     _OVERRIDE = None
     print(f"BENCH proj done in {time.time() - t0:.0f}s")
 
