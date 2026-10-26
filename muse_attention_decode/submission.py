@@ -29,7 +29,7 @@ dependent K/V loads, so 3-4 stages leave only one tile in flight; 5 gives two). 
 the log2 domain with one FMA per logit and exp2 in fp16 pairs (half the MUFU work); the row
 sum is a packed fp16 add. The merge is two-level above 16 splits (groups of G1), on
 normalized partials. Plan per shape (_plan) from the judge's CUDA-graph timings: check
-0c8c9862c5704a2e, 1.534x over SGLang.
+7e9fc08da010431f, 1.548x over SGLang.
 """
 
 import math
@@ -531,7 +531,7 @@ def _plan(cfg):
 
 
 _PLAN_OVERRIDE = None   # dict of plan keys to force, during benchmarking
-ATTN_BENCH = True       # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
+ATTN_BENCH = False      # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
 _BENCH_DONE = False
 
 
