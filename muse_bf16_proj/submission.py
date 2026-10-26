@@ -1146,11 +1146,24 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
             #pragma unroll
             for (int q = 0; q < 4; ++q) acc[i][r][q] = 0.f;
 
+    // x fragments of a chunk: [m-tile][row g / g+8][elements 0-7 / 8-15], prefetched one chunk ahead
+    auto load_x = [&](int cc, uint4 (&xa)[MT][2][2]) {
+        #pragma unroll
+        for (int i = 0; i < MT; ++i)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint4* xq = xp[i][h] + (size_t)(cc >> 2) * 32 + (cc & 3) * 8;   // k-tile = 32 uint4, 64-k chunk = 8 uint4
+                if (xok[i][h]) { xa[i][h][0] = xq[0]; xa[i][h][1] = xq[1]; }
+                else { xa[i][h][0] = make_uint4(0u, 0u, 0u, 0u); xa[i][h][1] = make_uint4(0u, 0u, 0u, 0u); }
+            }
+    };
     uint4 cl[UNROLL][RPW]; uint2 cn[UNROLL][RPW];
     #pragma unroll
     for (int u = 0; u < UNROLL; ++u)
         #pragma unroll
         for (int r = 0; r < RPW; ++r) { cn[u][r] = *nb_at(r, u); cl[u][r] = ldg_stream(lo_at(r, u)); }
+    uint4 xcur[MT][2][2];
+    load_x(0, xcur);
     for (int c = 0; c < nchunk; c += UNROLL) {
         const int cnx = c + UNROLL < nchunk ? c + UNROLL : c;
         uint4 nl[UNROLL][RPW]; uint2 nn[UNROLL][RPW];
@@ -1161,15 +1174,9 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
             const int cc = c + u;
-            uint4 xa[MT][2][2];      // [m-tile][row g / g+8][elements 0-7 / 8-15]
-            #pragma unroll
-            for (int i = 0; i < MT; ++i)
-                #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const uint4* xq = xp[i][h] + (size_t)(cc >> 2) * 32 + (cc & 3) * 8;   // k-tile = 32 uint4, 64-k chunk = 8 uint4
-                    if (xok[i][h]) { xa[i][h][0] = xq[0]; xa[i][h][1] = xq[1]; }
-                    else { xa[i][h][0] = make_uint4(0u, 0u, 0u, 0u); xa[i][h][1] = make_uint4(0u, 0u, 0u, 0u); }
-                }
+            uint4 xnxt[MT][2][2];
+            load_x(cc + 1 < nchunk ? cc + 1 : cc, xnxt);
+            uint4 (&xa)[MT][2][2] = xcur;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 #pragma unroll
@@ -1187,6 +1194,10 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
                     }
                 }
             }
+            #pragma unroll
+            for (int i = 0; i < MT; ++i)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) { xcur[i][h][0] = xnxt[i][h][0]; xcur[i][h][1] = xnxt[i][h][1]; }
         }
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u)
@@ -1471,7 +1482,7 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda7", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda8", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
             functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12", "mma12"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
@@ -1603,7 +1614,7 @@ GEMV_SHAPES = {
 }
 # (layer, n, m) -> (warps, unroll, sk): the 12-bit packed GEMV (m = 1). Check f746ebec (judge protocol):
 # pooler 12.8 vs 17.9 (BF16 Triton); qkv 10.3 vs 10.4 (row GEMV), unpooler slice / o: the row GEMV / Triton win
-G12_SHAPES = {("pooler", 4096, 1): (8, 1, 4)}
+G12_SHAPES = {("pooler", 4096, 1): (8, 1, 4), ("qkv_gate", 2304, 1): (8, 1, 8)}   # qkv: 9.5 vs 10.6 row GEMV (run 00548e41)
 # (layer, n, m) -> (mt, rpw, unroll, sk): the 12-bit packed mma.sync GEMM (m <= 32)
 M12_SHAPES = {}
 # (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
@@ -2041,8 +2052,8 @@ def _bench(state):
     print("BENCH proj, judge protocol (us per replay minus fixed cost; '!' = rel err above tol)")
     if ext is not None:
         print("BENCH 12-bit mma GEMM (mt, rpw, unroll, sk) vs the table at m=8/16/32")
-        m12 = {1: [(1, 4, 2, 1), (1, 4, 1, 2), (1, 4, 2, 2), (1, 2, 2, 1), (1, 2, 4, 1), (1, 2, 2, 2), (1, 2, 2, 4), (1, 1, 4, 1), (1, 1, 4, 2), (1, 1, 8, 1)],
-               2: [(2, 4, 1, 1), (2, 4, 1, 2), (2, 2, 2, 1), (2, 2, 2, 2), (2, 2, 1, 4), (2, 1, 4, 1), (2, 1, 2, 2)]}
+        m12 = {1: [(1, 4, 2, 1), (1, 4, 1, 2), (1, 2, 2, 1), (1, 2, 4, 1), (1, 2, 2, 2), (1, 2, 2, 4), (1, 1, 4, 1), (1, 1, 8, 1)],
+               2: [(2, 4, 1, 1), (2, 4, 1, 2), (2, 2, 2, 1), (2, 2, 2, 2), (2, 2, 1, 4), (2, 1, 4, 1)]}
         for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192), ("unpooler", 1024)):
             for m in (8, 16, 32):
                 if not budget():
@@ -2055,9 +2066,7 @@ def _bench(state):
                     parts.append(row(f"m12 {rpw}/{unroll}/{sk}", layer, m, n, dict(m12=True, mt=mt_, rpw=rpw, unroll=unroll, sk=sk)))
                 print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
         print("BENCH m=1 12-bit GEMV, more CTAs for qkv / the unpooler slice")
-        for layer, n, cands in (("qkv_gate", 2304, [(8, 1, 4), (8, 1, 8), (8, 2, 8), (4, 2, 8), (16, 1, 4), (16, 1, 8)]),
-                                ("unpooler", 1024, [(8, 2, 4), (8, 1, 8), (8, 2, 8), (8, 1, 16), (4, 2, 8), (4, 1, 16), (16, 1, 8)]),
-                                ("pooler", 4096, [(8, 1, 4), (8, 1, 8), (4, 2, 4), (4, 1, 8), (16, 1, 4)])):
+        for layer, n, cands in (("pooler", 4096, [(8, 1, 4), (8, 1, 8), (4, 2, 4), (16, 1, 2)]), ("qkv_gate", 2304, [(8, 1, 8), (8, 1, 4)])):
             if not budget():
                 break
             parts = [row("current", layer, 1, n, None), row("triton", layer, 1, n, TAB)]

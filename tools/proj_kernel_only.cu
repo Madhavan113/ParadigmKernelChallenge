@@ -592,11 +592,24 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
             #pragma unroll
             for (int q = 0; q < 4; ++q) acc[i][r][q] = 0.f;
 
+    // x fragments of a chunk: [m-tile][row g / g+8][elements 0-7 / 8-15], prefetched one chunk ahead
+    auto load_x = [&](int cc, uint4 (&xa)[MT][2][2]) {
+        #pragma unroll
+        for (int i = 0; i < MT; ++i)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const uint4* xq = xp[i][h] + (size_t)(cc >> 2) * 32 + (cc & 3) * 8;   // k-tile = 32 uint4, 64-k chunk = 8 uint4
+                if (xok[i][h]) { xa[i][h][0] = xq[0]; xa[i][h][1] = xq[1]; }
+                else { xa[i][h][0] = make_uint4(0u, 0u, 0u, 0u); xa[i][h][1] = make_uint4(0u, 0u, 0u, 0u); }
+            }
+    };
     uint4 cl[UNROLL][RPW]; uint2 cn[UNROLL][RPW];
     #pragma unroll
     for (int u = 0; u < UNROLL; ++u)
         #pragma unroll
         for (int r = 0; r < RPW; ++r) { cn[u][r] = *nb_at(r, u); cl[u][r] = ldg_stream(lo_at(r, u)); }
+    uint4 xcur[MT][2][2];
+    load_x(0, xcur);
     for (int c = 0; c < nchunk; c += UNROLL) {
         const int cnx = c + UNROLL < nchunk ? c + UNROLL : c;
         uint4 nl[UNROLL][RPW]; uint2 nn[UNROLL][RPW];
@@ -607,15 +620,9 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
             const int cc = c + u;
-            uint4 xa[MT][2][2];      // [m-tile][row g / g+8][elements 0-7 / 8-15]
-            #pragma unroll
-            for (int i = 0; i < MT; ++i)
-                #pragma unroll
-                for (int h = 0; h < 2; ++h) {
-                    const uint4* xq = xp[i][h] + (size_t)(cc >> 2) * 32 + (cc & 3) * 8;   // k-tile = 32 uint4, 64-k chunk = 8 uint4
-                    if (xok[i][h]) { xa[i][h][0] = xq[0]; xa[i][h][1] = xq[1]; }
-                    else { xa[i][h][0] = make_uint4(0u, 0u, 0u, 0u); xa[i][h][1] = make_uint4(0u, 0u, 0u, 0u); }
-                }
+            uint4 xnxt[MT][2][2];
+            load_x(cc + 1 < nchunk ? cc + 1 : cc, xnxt);
+            uint4 (&xa)[MT][2][2] = xcur;
             #pragma unroll
             for (int j = 0; j < 4; ++j) {
                 #pragma unroll
@@ -633,6 +640,10 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
                     }
                 }
             }
+            #pragma unroll
+            for (int i = 0; i < MT; ++i)
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) { xcur[i][h][0] = xnxt[i][h][0]; xcur[i][h][1] = xnxt[i][h][1]; }
         }
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u)
