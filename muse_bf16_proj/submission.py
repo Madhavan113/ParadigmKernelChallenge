@@ -2794,7 +2794,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
