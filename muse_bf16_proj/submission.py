@@ -1521,6 +1521,8 @@ void launch_mma12cp(const __nv_bfloat16* X, int ldx, int m, const uint8_t* LO, c
 // L0 then L1 order), grouped by 4 tiles: [N/64][K/128][4][3 KB]. Decode per step: decode4 (PRMT LUT of the
 // high byte, sign OR'd, L/H bytes interleaved) twice -> a0..a3 bf16x2, mma bf16 -> fp32. The CTA writes its
 // fp32 partial slice part[z][i][n]; w12_reduce sums the slices, adds the escapes and writes bf16.
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
 __device__ __forceinline__ void ldsm_x4(uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3, uint32_t addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
                  : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
@@ -1627,6 +1629,7 @@ w12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* _
             }
         }
     }
+    pdl_trigger();                                                        // the reduce may start launching
     cp_async_wait<0>();
     if (CH == 2) {
         #pragma unroll
@@ -1646,16 +1649,17 @@ w12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* _
             }
 }
 
-// sum the KSPLIT partial slices of one 32-row pack tile, add its escapes (n_local, k, delta) * x[i][k], write bf16
+// sum the KSPLIT partial slices of one 32-row pack tile, add its escapes (n_local, k, delta) * x[i][k] in parallel
+// over (escape, token) pairs (shared-memory atomics), write bf16. Launched with PDL: waits for the GEMM's partials.
 __global__ void __launch_bounds__(256)
 w12_reduce_kernel(const float* __restrict__ part, int ksplit, int m, int N, const __nv_bfloat16* __restrict__ X, int ldx,
                   const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k,
                   const float* __restrict__ esc_d, __nv_bfloat16* __restrict__ out, int ldo)
 {
     __shared__ float red[32][33];
-    __shared__ int s_en[64];
-    __shared__ float s_ev[64][32];
     const int pn = blockIdx.x;
+    const int e0 = esc_off[pn], e1 = esc_off[pn + 1];                 // the escape list is prepare() data
+    pdl_wait();
     for (int idx = threadIdx.x; idx < 32 * m; idx += 256) {
         const int n = idx & 31, i = idx >> 5;
         float v = 0.f;
@@ -1663,27 +1667,12 @@ w12_reduce_kernel(const float* __restrict__ part, int ksplit, int m, int N, cons
         red[n][i] = v;
     }
     __syncthreads();
-    const int e0 = esc_off[pn], e1 = esc_off[pn + 1];
-    for (int base = e0; base < e1; base += 64) {
-        const int e = base + (int)threadIdx.x;
-        if (threadIdx.x < 64) {
-            if (e < e1) {
-                s_en[threadIdx.x] = esc_n[e];
-                const float d = esc_d[e]; const int kk = esc_k[e];
-                for (int i = 0; i < m; ++i) s_ev[threadIdx.x][i] = d * __bfloat162float(X[(size_t)i * ldx + kk]);
-            } else {
-                s_en[threadIdx.x] = -1;
-            }
-        }
-        __syncthreads();
-        if (threadIdx.x < 32) {
-            const int cnt_ = min(e1 - base, 64);
-            for (int jj = 0; jj < cnt_; ++jj)
-                if (s_en[jj] == (int)threadIdx.x)
-                    for (int i = 0; i < m; ++i) red[threadIdx.x][i] += s_ev[jj][i];
-        }
-        __syncthreads();
+    const int cnt = e1 - e0;
+    for (int idx = threadIdx.x; idx < cnt * m; idx += 256) {
+        const int e = e0 + idx / m, i = idx - (idx / m) * m;
+        atomicAdd(&red[esc_n[e]][i], esc_d[e] * __bfloat162float(X[(size_t)i * ldx + esc_k[e]]));
     }
+    __syncthreads();
     for (int idx = threadIdx.x; idx < 32 * m; idx += 256) {
         const int n = idx & 31, i = idx >> 5;
         out[(size_t)i * ldo + pn * 32 + n] = __float2bfloat16(red[n][i]);
@@ -1952,8 +1941,19 @@ void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, to
         default: TORCH_CHECK(false, "unsupported w12 config (nt, nstage, sk)");
     }
     if (mode == 1) return;
-    w12_reduce_kernel<<<(unsigned)(n / 32), 256, 0, stream>>>(pp, (int)sk, (int)m, (int)n, Xp, ldx, esc_off.data_ptr<int>(),
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((unsigned)(n / 32));
+    cfg.blockDim = dim3(256);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = (mode == 2) ? 0 : 1;                      // PDL only when the GEMM precedes it in this stream
+    cudaError_t err = cudaLaunchKernelEx(&cfg, w12_reduce_kernel, pp, (int)sk, (int)m, (int)n, Xp, ldx, esc_off.data_ptr<int>(),
         esc_n.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (int)out.stride(0));
+    TORCH_CHECK(err == cudaSuccess, "w12 reduce launch failed: ", cudaGetErrorString(err));
 }
 """
 
