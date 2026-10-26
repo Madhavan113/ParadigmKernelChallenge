@@ -1113,7 +1113,7 @@ def _plan(cfg):
 
 
 _PLAN_OVERRIDE = None   # dict of plan keys to force, during benchmarking
-ATTN_BENCH = True       # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
+ATTN_BENCH = False      # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
 _BENCH_DONE = False
 
 

@@ -1,0 +1,38 @@
+BENCH attention: us per graph replay after an L2 flush (median), plan overrides
+  B1 L1 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'cuda': False, 'splits': 16}      15.2 us
+  B1 L1 sliding   {'cuda': True}                                                                   17.4 us
+  B1 L1 sliding   {'cuda': True}                                                                   17.8 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 1}                                                        17.1 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 2}                                                        15.5 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 4}                                                        16.2 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 8}                                                        15.6 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 16}                                                       17.1 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 32}                                                       14.8 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 64}                                                       16.8 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 128}                                                      15.9 us
+  B1 L1 sliding   {'cuda': True, 'cabl': 255}                                                       8.9 us
+  B16 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'splits': 8}      16.5 us
+  B16 L1 sliding  {'cuda': True}                                                                   30.6 us
+  B16 L1 sliding  {'cuda': True}                                                                   30.9 us
+  B32 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'splits': 8}      19.9 us
+  B32 L1 sliding  {'cuda': True}                                                                   45.1 us
+  B32 L1 sliding  {'cuda': True}                                                                   44.6 us
+  B1 L8 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'warps': 8, 'splits': 32}      22.6 us
+  B1 L8 sliding   {'cuda': True}                                                                   41.1 us
+  B1 L8 sliding   {'cuda': True}                                                                   41.1 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 1}                                                        42.5 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 2}                                                        34.7 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 4}                                                        34.6 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 8}                                                        32.4 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 16}                                                       38.7 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 32}                                                       28.0 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 64}                                                       36.1 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 128}                                                      37.9 us
+  B1 L8 sliding   {'cuda': True, 'cabl': 255}                                                       8.9 us
+  B16 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'warps': 8, 'splits': 8}      25.3 us
+  B16 L8 sliding  {'cuda': True}                                                                   73.1 us
+  B16 L8 sliding  {'cuda': True}                                                                   73.1 us
+  B32 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'warps': 8, 'splits': 4}      29.1 us
+  B32 L8 sliding  {'cuda': True}                                                                  106.6 us
+  B32 L8 sliding  {'cuda': True}                                                                  107.0 us
+BENCH attention done in 49s
