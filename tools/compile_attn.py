@@ -7,7 +7,7 @@ from triton.backends.compiler import GPUTarget
 import submission as S
 
 a = sys.argv[1:]
-L, WINDOW, SPLITS, BLOCK_T, HQ, HKV, PS, NW, NS, HP, BD, EX2H, PV8, CTAS, MAXNREG = [int(x) for x in (a + ["1", "2048", "16", "64", "16", "2", "1", "4", "3", "1", "0", "0", "0", "16", "0"][len(a):])]
+L, WINDOW, SPLITS, BLOCK_T, HQ, HKV, PS, NW, NS, HP, BD, EX2H, PV8, CTAS, MAXNREG, QK8, ASM = [int(x) for x in (a + ["1", "2048", "16", "64", "16", "2", "1", "4", "3", "1", "0", "0", "0", "16", "0", "-1", "1"][len(a):])]
 D = 64
 RB = max(16, triton.next_power_of_2(L * (HQ // HKV) * (HP if BD else 1)))
 sig = {"qkv_ptr": "*bf16", "loc_ptr": "*i64", "seq_ptr": "*i32", "pt_ptr": "*i32", "kc_ptr": "*fp8e4nv", "vc_ptr": "*fp8e4nv",
@@ -16,7 +16,7 @@ sig = {"qkv_ptr": "*bf16", "loc_ptr": "*i64", "seq_ptr": "*i32", "pt_ptr": "*i32
        "L": "constexpr", "HQ": "constexpr", "HKV": "constexpr", "D": "constexpr", "PS": "constexpr", "WINDOW": "constexpr",
        "ROPE": "constexpr", "SPLITS": "constexpr", "RB": "constexpr", "LB": "constexpr", "BLOCK_T": "constexpr", "ACT": "constexpr", "FP8_ASM": "constexpr", "CH": "constexpr", "QK_FP8": "constexpr", "HP": "constexpr", "BD": "constexpr", "EX2H": "constexpr", "PV8": "constexpr", "G1": "constexpr"}
 consts = {"L": L, "HQ": HQ, "HKV": HKV, "D": D, "PS": PS, "WINDOW": WINDOW, "ROPE": WINDOW > 0, "SPLITS": SPLITS,
-          "RB": RB, "LB": 32 if PV8 else 16, "BLOCK_T": BLOCK_T, "ACT": tl.float16, "FP8_ASM": True, "CH": min(SPLITS, 8 if RB <= 16 else 4), "QK_FP8": RB > 16, "HP": HP, "BD": bool(BD), "EX2H": bool(EX2H), "PV8": bool(PV8), "G1": {1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 8, 64: 8, 128: 16}[SPLITS]}
+          "RB": RB, "LB": 32 if PV8 else 16, "BLOCK_T": BLOCK_T, "ACT": tl.float16, "FP8_ASM": bool(ASM), "CH": min(SPLITS, 8 if RB <= 16 else 4), "QK_FP8": (RB > 16) if QK8 < 0 else bool(QK8), "HP": HP, "BD": bool(BD), "EX2H": bool(EX2H), "PV8": bool(PV8), "G1": {1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 8, 64: 8, 128: 16}[SPLITS]}
 names = list(sig)
 attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if sig[n].startswith("*")}
 src = ASTSource(fn=S._attn_decode_kernel, signature=sig, constexprs=consts, attrs=attrs)
@@ -29,5 +29,5 @@ print("ttgir: async_copy", count(r"async_copy_global_to_local", ttgir), "| warp_
 print("ptx: cp.async", count(r"cp\.async\.c", ptx), "| wgmma", count(r"wgmma\.mma_async", ptx), "| mma.sync", count(r"mma\.sync", ptx),
       "| ld.global", count(r"ld\.global", ptx), "| cvt e4m3", count(r"e4m3", ptx), "| local(spill)", bool(re.search(r"\.local", ptx)),
       "| shared", k.metadata.shared, "B")
-open(f"/work/tools/out_attn_{L}_{WINDOW}_{SPLITS}_{BLOCK_T}_{HQ}_{PS}_{NW}_{NS}_{HP}{BD}{EX2H}{PV8}_{CTAS}_{MAXNREG}.ptx", "w").write(ptx)
-open(f"/work/tools/out_attn_{L}_{WINDOW}_{SPLITS}_{BLOCK_T}_{HQ}_{PS}_{NW}_{NS}_{HP}{BD}{EX2H}{PV8}_{CTAS}_{MAXNREG}.ttgir", "w").write(ttgir)
+open(f"/work/tools/out_attn_{L}_{WINDOW}_{SPLITS}_{BLOCK_T}_{HQ}_{PS}_{NW}_{NS}_{HP}{BD}{EX2H}{PV8}_{CTAS}_{MAXNREG}_{QK8}_{ASM}.ptx", "w").write(ptx)
+open(f"/work/tools/out_attn_{L}_{WINDOW}_{SPLITS}_{BLOCK_T}_{HQ}_{PS}_{NW}_{NS}_{HP}{BD}{EX2H}{PV8}_{CTAS}_{MAXNREG}_{QK8}_{ASM}.ttgir", "w").write(ttgir)
