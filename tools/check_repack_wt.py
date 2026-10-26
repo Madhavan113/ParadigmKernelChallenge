@@ -1,4 +1,4 @@
-"""CPU check of repack_weights_wt + the kernel's dequant arithmetic (mask/shift spread, E4M3 -> fp16,
+"""CPU check of repack_weights_wt + the kernel's dequant arithmetic (mask/shift + PRMT fp16 placement,
 fp16 scale multiply) against nvfp4.dequantize. Run in the judge image: python3 check_repack_wt.py"""
 import sys, math
 sys.path.insert(0, '/work/muse_moe_w4a16')
@@ -9,12 +9,23 @@ from nvfp4 import dequantize, random_weights
 E, N, K = 2, 64, 512
 gen = torch.Generator().manual_seed(1)
 w, sf, gs = random_weights(N, K, generator=gen, device="cpu", leading=(E,))
+import os
+if os.environ.get("TINY_SCALES"):
+    # every E4M3 byte value (subnormals 0x01-0x07 included), as a harder exactness test
+    sf = torch.randint(0, 127, sf.shape, generator=gen).to(torch.uint8).view(torch.float8_e4m3fn)
+    gs = torch.tensor(1.0)
 ref = dequantize(w, sf, gs)                       # [E, N, K] fp32
 Wr, Sr = repack_weights_wt(w, sf)
 NTL, NC = N // 16, K // 128
-words = Wr.view(E, NTL // 4, NC, 4, 2, 32, 4, 4).permute(0, 1, 3, 2, 4, 5, 6, 7).reshape(E, NTL, NC, 2, 32, 16).contiguous().view(torch.int32).view(E, NTL, NC, 2, 32, 4)
-Sr = Sr.view(E, NTL // 4, NC, 4, 8, 16).permute(0, 1, 3, 2, 4, 5).reshape(E, NTL, NC, 8, 16)
-gsf = float(gs) * 64.0            # applied to the fp32 sums in the kernel; here to each exact fp16 weight
+words = Wr.contiguous().view(torch.int32).view(E, NTL, NC, 2, 32, 4)     # [E, NTL, NC, half, lane, step4]
+Sr = Sr.view(E, NTL, NC, 8, 16)                                            # [E, NTL, NC, g, (step, rh)]
+gsf = float(gs) * 16384.0         # applied to the fp32 sums in the kernel; here to each exact fp16 weight
+
+
+def placed_f16x2(m, b0):
+    # prmt(m, 0, 0x1404 / 0x3424): bytes b0, b0+1 of m become the high bytes of two fp16 (low bytes 0)
+    h = np.array([((m >> (8 * b0)) & 0xFF) << 8, ((m >> (8 * (b0 + 1))) & 0xFF) << 8], dtype=np.uint16)
+    return torch.from_numpy(h.view(np.float16))
 
 
 def e4m3x2_to_f16x2(v16):
@@ -35,10 +46,10 @@ for e in range(E):
                     sb = Sr[e, tile, c, g]
                     sp = e4m3x2_to_f16x2(int(sb[2 * s]) | (int(sb[2 * s + 1]) << 8))
                     S0, S1 = sp[0], sp[1]
-                    elo = wv & 0x9C9C9C9C
-                    ehi = ((wv << 2) & 0x8C8C8C8C) | ((wv >> 2) & 0x10101010)
-                    pairs = [(e4m3x2_to_f16x2(elo & 0xFFFF), S0, 0, 0), (e4m3x2_to_f16x2(elo >> 16), S1, 8, 0),
-                             (e4m3x2_to_f16x2(ehi & 0xFFFF), S0, 0, 8), (e4m3x2_to_f16x2(ehi >> 16), S1, 8, 8)]
+                    ma = wv & 0x8E8E8E8E
+                    mb = ((wv << 1) & 0x82828282) | ((wv >> 2) & 0x0C0C0C0C)
+                    pairs = [(placed_f16x2(ma, 0), S0, 0, 0), (placed_f16x2(ma, 2), S1, 8, 0),
+                             (placed_f16x2(mb, 0), S0, 0, 8), (placed_f16x2(mb, 2), S1, 8, 8)]
                     for p, (half, S, row_off, k_off) in enumerate(pairs):
                         got = (half * S).to(torch.float16).float() * gsf
                         row = tile * 16 + g + row_off

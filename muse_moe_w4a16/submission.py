@@ -769,13 +769,15 @@ void launch(const __half* A, int lda, const int* st, const int* be, const int* b
 // and the token tile); KS = 2 splits each chunk's 8 k16 steps across two 4-warp groups.
 //
 // Weight words (repack_weights_wt): per lane and k16 step one 32-bit word holds the 8 nibbles of its
-// A fragment; byte b carries nibble A_b pre-spread into E4M3 position (s<<7 | e1<<4 | e0<<3 | m<<2,
-// exactly e2m1 * 2^-6) and nibble B_b at (e1<<6 | s<<5 | e0<<1 | m), so the dequant is
-//   elo = w & 0x9C9C9C9C                                   bytes A_0..A_3
-//   ehi = (w << 2) & 0x8C8C8C8C | (w >> 2) & 0x10101010    bytes B_0..B_3 (now E4M3-placed)
-// and four cvt.rn.f16x2.e4m3x2: (A_0,A_1) = a0 rows g k 2t,2t+1; (A_2,A_3) = a1 rows g+8; (B_0,B_1) = a2
-// rows g k 2t+8,2t+9; (B_2,B_3) = a3 rows g+8. Each pair is multiplied by its row's E4M3 block scale (as fp16:
-// the product has <= 6 significant bits, so the fp16 weights are exact) and gs * 2^6 scales the fp32 sums.
+// A fragment; byte b carries nibble A_b at the fp16 high-byte positions (s<<7 | e1<<3 | e0<<2 | m<<1) and
+// nibble B_b in the free bits (s<<6 | e1<<5 | e0<<4 | m), so the dequant is
+//   ma = w & 0x8E8E8E8E                                    bytes A_0..A_3
+//   mb = (w << 1) & 0x82828282 | (w >> 2) & 0x0C0C0C0C     bytes B_0..B_3 (now fp16-placed)
+// and four PRMT byte-expands (byte -> high byte of an fp16, low byte 0): (A_0,A_1) = a0 rows g k 2t,2t+1;
+// (A_2,A_3) = a1 rows g+8; (B_0,B_1) = a2 rows g k 2t+8,2t+9; (B_2,B_3) = a3 rows g+8. Such an fp16 is
+// exactly e2m1 * 2^-14 (exponent-aligned placement, subnormals included); times the row's E4M3 block scale
+// (as fp16) the product has <= 8 significant bits and stays in range, so the fp16 weights are exact, and
+// gs * 2^14 scales the fp32 sums. No cvt instruction: the 16-lane/clk conversion pipe was the bottleneck.
 // ---------------------------------------------------------------------------------------------
 
 __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
@@ -892,7 +894,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             #pragma unroll
             for (int q = 0; q < 4; ++q) acc[i][n][q] = 0.f;
 
-    const float gsf = gs[e] * gs_mul;                                   // gs * 64: applied to the fp32 sums
+    const float gsf = gs[e] * gs_mul;                                   // gs * 2^14: applied to the fp32 sums
 
     #pragma unroll
     for (int st = 0; st < NSTAGE - 1; ++st) {
@@ -900,15 +902,18 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         cp_async_commit();
     }
 
+    int stage = 0, stage_n = NSTAGE - 1;                              // ring slots of chunk c and of chunk c + NSTAGE - 1
     for (int c = 0; c < NC; ++c) {
         cp_async_wait<NSTAGE - 2>();
         __syncthreads();
         {
             const int cn = c + NSTAGE - 1;
-            if (cn < NC) issue(cn, cn % NSTAGE);
+            if (cn < NC) issue(cn, stage_n);
             cp_async_commit();
         }
-        const uint8_t* ws = wt_smem + (c % NSTAGE) * STAGE_BYTES;
+        const uint8_t* ws = wt_smem + stage * STAGE_BYTES;
+        stage = stage + 1 == NSTAGE ? 0 : stage + 1;
+        stage_n = stage_n + 1 == NSTAGE ? 0 : stage_n + 1;
         const uint8_t* ss = ws + W_STAGE;
         const __half* xs = reinterpret_cast<const __half*>(ss + S_STAGE);
         #pragma unroll
@@ -937,16 +942,21 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                         const uint32_t w = s == 0 ? wq[i].x : s == 1 ? wq[i].y : s == 2 ? wq[i].z : wq[i].w;
                         const uint32_t sw = ps == 0 ? sq[i].x : sq[i].y;
                         const uint32_t sp = q == 0 ? e4m3x2_lo16_to_f16x2(sw) : e4m3x2_hi16_to_f16x2(sw);   // (s_g, s_g8)
-                        const uint32_t S0 = prmt(sp, sp, 0x1010u);          // row g   block scale, both halves
-                        const uint32_t S1 = prmt(sp, sp, 0x3232u);          // row g+8
-                        // fp16 weights = e2m1 * 2^-6 * blockscale: <= 6 significant bits, exact
-                        const uint32_t elo = w & 0x9C9C9C9Cu;
-                        const uint32_t ehi = ((w << 2) & 0x8C8C8C8Cu) | ((w >> 2) & 0x10101010u);
+                        uint32_t S0, S1;                                     // row g / row g+8 block scale, both halves
+                        asm("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %2; mov.b32 %0, {lo, lo}; mov.b32 %1, {hi, hi}; }\n"
+                            : "=r"(S0), "=r"(S1) : "r"(sp));
+                        // Conversion-free dequant: byte b of the word holds nibble A_b at bits (s:7, e1:3, e0:2, m:1)
+                        // and nibble B_b at (s:6, e1:5, e0:4, m:0). Masked and byte-expanded into the high byte of
+                        // each fp16 (PRMT), the fp16 is s<<15 | e1e0<<10 | m<<9 = e2m1 * 2^-14 exactly (subnormals
+                        // included); x the E4M3 block scale is exact in fp16 (a multiple of 2^-24 below 0.18, for
+                        // any E4M3 scale). No cvt on the 16-lane/clk conversion pipe; gs * 2^14 scales the sums.
+                        const uint32_t ma = w & 0x8E8E8E8Eu;
+                        const uint32_t mb = ((w << 1) & 0x82828282u) | ((w >> 2) & 0x0C0C0C0Cu);
                         uint32_t a[4];
-                        a[0] = f16x2_mul(e4m3x2_lo16_to_f16x2(elo), S0);
-                        a[1] = f16x2_mul(e4m3x2_hi16_to_f16x2(elo), S1);
-                        a[2] = f16x2_mul(e4m3x2_lo16_to_f16x2(ehi), S0);
-                        a[3] = f16x2_mul(e4m3x2_hi16_to_f16x2(ehi), S1);
+                        a[0] = f16x2_mul(prmt(ma, 0u, 0x1404u), S0);        // (A_0, A_1): row g,   k 2t, 2t+1
+                        a[1] = f16x2_mul(prmt(ma, 0u, 0x3424u), S1);        // (A_2, A_3): row g+8
+                        a[2] = f16x2_mul(prmt(mb, 0u, 0x1404u), S0);        // (B_0, B_1): row g,   k 2t+8, 2t+9
+                        a[3] = f16x2_mul(prmt(mb, 0u, 0x3424u), S1);        // (B_2, B_3): row g+8
                         #pragma unroll
                         for (int nb = 0; nb < NT; ++nb) {
                             if (nb < ntb) mma16816(acc[i][nb * CH + (CH == 2 ? q : 0)], a, b[nb][2 * q], b[nb][2 * q + 1]);
@@ -1206,6 +1216,7 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         case 111102: OKC_W(true, 1, 1, 1, 2, false); break;   case 111104: OKC_W(true, 1, 1, 1, 4, false); break;
         case 111108: OKC_W(true, 1, 1, 1, 8, false); break;
         case 112102: OKC_W(true, 1, 2, 1, 2, false); break;   case 112104: OKC_W(true, 1, 2, 1, 4, false); break;
+        case 112103: OKC_W(true, 1, 2, 1, 3, false); break;   case 22103: OKC_W(false, 2, 2, 1, 3, false); break;
         case 114102: OKC_W(true, 1, 4, 1, 2, false); break;   case 114104: OKC_W(true, 1, 4, 1, 4, false); break;
         case 11102: OKC_W(false, 1, 1, 1, 2, false); break;   case 11104: OKC_W(false, 1, 1, 1, 4, false); break;
         case 11108: OKC_W(false, 1, 1, 1, 8, false); break;
@@ -1294,9 +1305,9 @@ def repack_weights(w: torch.Tensor, sf: torch.Tensor):
 def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
     """w uint8 [E, N, K/2] packed E2M1 (low nibble = even k), sf fp8 [E, N, K/16] ->
     Wr uint8 [E, N/16, K/128, 2, 32, 16]: per (expert, m16 tile, chunk, half, lane) 4 words = the lane's
-    A-fragment nibbles for k16 steps 4*half .. 4*half+3 (byte b: nibble A_b at bits {7,4,3,2} = E4M3
-    position, nibble B_b at (e1:6, s:5, e0:1, m:0); A_0,A_1 = row g k 2t,2t+1; A_2,A_3 = row g+8 k 2t,2t+1;
-    B_0,B_1 = row g k 2t+8,2t+9; B_2,B_3 = row g+8 k 2t+8,2t+9);
+    A-fragment nibbles for k16 steps 4*half .. 4*half+3 (byte b: nibble A_b at bits (s:7, e1:3, e0:2, m:1)
+    = the fp16 high-byte placement, nibble B_b at (s:6, e1:5, e0:4, m:0); A_0,A_1 = row g k 2t,2t+1;
+    A_2,A_3 = row g+8 k 2t,2t+1; B_0,B_1 = row g k 2t+8,2t+9; B_2,B_3 = row g+8 k 2t+8,2t+9);
     Sr uint8 [E, N/16, K/128, 8, 16]: per g the 8 steps' (scale row g, scale row g+8) byte pairs.
     A permutation of the stored bits: lossless."""
     E, N, K2 = w.shape
@@ -1318,10 +1329,10 @@ def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
                 v = sel[:, rh, :, :, :, :, q]
                 b = rh * 2 + (q & 1)
                 sgn, e1, e0, m = (v >> 3) & 1, (v >> 2) & 1, (v >> 1) & 1, v & 1
-                if q < 2:   # A: E4M3 placement
-                    byte = (sgn << 7) | (e1 << 4) | (e0 << 3) | (m << 2)
-                else:       # B
-                    byte = (e1 << 6) | (sgn << 5) | (e0 << 1) | m
+                if q < 2:   # A: fp16 high-byte placement (s:7, e1:3, e0:2, m:1)
+                    byte = (sgn << 7) | (e1 << 3) | (e0 << 2) | (m << 1)
+                else:       # B: the free bits (s:6, e1:5, e0:4, m:0); the kernel shifts s, m up and e1 e0 down
+                    byte = (sgn << 6) | (e1 << 5) | (e0 << 4) | m
                 word |= byte << (8 * b)
         word = word.view(NTL, 8, NC, 2, 4, 4).permute(0, 2, 3, 1, 5, 4).contiguous()   # tile, chunk, half, g, t, step4
         Wr[e] = word.view(NTL, NC, 2, 32, 4).view(torch.uint8).view(NTL, NC, 2, 32, 16)
@@ -1520,7 +1531,10 @@ def _moe_state(weights) -> dict:
             state["Wt2"], state["St2"] = repack_weights_wt(weights["w2"][:LOCAL], weights["w2_sf"][:LOCAL])
             state["gs13"] = weights["w13_gs"][:LOCAL].float().contiguous()
             state["gs2"] = weights["w2_gs"][:LOCAL].float().contiguous()
-            state["gs_mul"] = 64.0   # the E4M3 placement is e2m1 * 2^-6; applied with gs to the fp32 sums
+            state["gs_mul"] = 16384.0   # the fp16 placement is e2m1 * 2^-14; applied with gs to the fp32 sums
+            for nm in ("w13_sf", "w2_sf"):   # the fp16 products are exact for every E4M3 scale; the stats are for the log
+                sfv = weights[nm][:LOCAL].float()
+                print(f"{nm}: block scales min {float(sfv.min()):.4g} max {float(sfv.max()):.4g}, below 2^-6: {int((sfv < 2.0 ** -6).sum())}")
             state["xscale"] = 1.0
             state["part"] = torch.empty((PART_SPLIT_MAX, PART_ROWS, 2 * I), dtype=torch.float32, device=dev)   # split-K partials
             state["counters"] = torch.zeros((maxb * 64,), dtype=torch.int32, device=dev)   # split-K arrival counters (self-resetting)
@@ -1705,7 +1719,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = True      # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
@@ -1886,7 +1900,7 @@ def _timeit_cold(fn, dev, reps=8):
     return run(True) - run(False)
 
 
-WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (2, 2, 1, 4, 1), (4, 2, 1, 2, 1))
+WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (2, 2, 1, 4, 1), (2, 2, 1, 3, 1), (4, 2, 1, 2, 1))
 
 
 def _selftest_wt(state):
@@ -1914,7 +1928,7 @@ def _selftest_wt(state):
                 _WT_OVERRIDE = None
             worst[v] = max(worst.get(v, 0.0), err)
         print(f"  selftest bs={bs:3d} {dist:6s}: " + " ".join(f"{v}:{worst[v]:.2e}" for v in WT_TEST_VARIANTS))
-    bad = {v for v, e in worst.items() if not e < 6e-3}
+    bad = {v for v, e in worst.items() if not e < 1.2e-2}   # a broken variant is off by O(1); Marlin itself differs by ~6e-3
     state["wt_bad"] = bad
     state["wt_ok"] = WT_SAFE not in bad
     print(f"selftest wt: bad variants {sorted(bad)} -> {'enabled' if state['wt_ok'] else 'DISABLED'} ({time.time() - t0:.0f}s)")
@@ -1953,9 +1967,9 @@ def _bench_wt(state, autotune=False):
         parts = {
             "route": lambda: _route(x, ids, 0, BM, state, marlin=False),
             "gemm1": lambda: ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                              state["Wt13"], state["St13"], state["gs13"], state["inter"], part, counters, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, 64.0),
+                                              state["Wt13"], state["St13"], state["gs13"], state["inter"], part, counters, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, state["gs_mul"]),
             "gemm2": lambda: ext.moe_w4a16_wt(state["inter"], state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                              state["Wt2"], state["St2"], state["gs2"], state["y"], part, counters, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, 64.0),
+                                              state["Wt2"], state["St2"], state["gs2"], state["y"], part, counters, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, state["gs_mul"]),
             "finalize": lambda: ext.moe_finalize(state["y"], state["row_of_pair"], tw, state["norm_w"], out, bs, POST_NORM_EPS),
         }
         try:
@@ -1963,12 +1977,13 @@ def _bench_wt(state, autotune=False):
                   + f"  | local routes {int(((ids >= 0) & (ids < 32)).sum())} distinct {int(torch.unique(ids[(ids < 32)]).numel())}")
         except Exception as e:
             print(f"  wt parts bs{bs} failed: {str(e)[:100]}")
-    small = [(1, 1, 1, 2, 1), (1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 2, 1, 4, 1), (1, 2, 1, 8, 1)]
-    big = [(2, 2, 1, 4, 1), (2, 2, 1, 2, 1), (4, 2, 1, 4, 1), (4, 2, 1, 2, 1), (2, 1, 1, 2, 1), (4, 1, 1, 4, 1)]
+    small = [(1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 2, 1, 4, 1)]
+    mid = [(1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 2, 1, 4, 1), (2, 1, 1, 4, 1), (2, 2, 1, 4, 1), (2, 2, 1, 3, 1)]
+    big = [(2, 2, 1, 4, 1), (2, 2, 1, 3, 1), (2, 2, 1, 2, 1), (4, 2, 1, 4, 1), (4, 2, 1, 2, 1), (2, 1, 1, 4, 1)]
     bad = state.get("wt_bad", set())
     best = {}
     for bs in shapes:
-        cands = [v for v in (small if bs <= 32 else big) if v not in bad]
+        cands = [v for v in (small if bs <= 8 else mid if bs <= 32 else big) if v not in bad]
         row = []
         for v in cands:
             _WT_OVERRIDE = v
