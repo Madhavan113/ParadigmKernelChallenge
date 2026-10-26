@@ -985,7 +985,7 @@ constexpr int W12_KC = 128, W12_XSTRIDE = W12_KC + 8;   // token tile row stride
 constexpr int W12_TILE_BYTES = 3072;                   // per (m16 tile, chunk)
 __host__ __device__ constexpr int w12_stage_bytes(int nt) { return 4 * W12_TILE_BYTES + 8 * nt * W12_XSTRIDE * 2; }
 
-template <int NT, int NSTAGE, bool SPLITK>
+template <int NT, int NSTAGE, bool SPLITK, int MODE = 0>
 __global__ void __launch_bounds__(128)
 w12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ W, int eb,
            float* __restrict__ part, int N, int K)
@@ -1048,6 +1048,10 @@ w12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* _
         }
         const uint8_t* ws = w12_smem + (c % NSTAGE) * STAGE_BYTES + warp * W12_TILE_BYTES;
         const __half* xs = reinterpret_cast<const __half*>(w12_smem + (c % NSTAGE) * STAGE_BYTES + W_STAGE);
+        if constexpr (MODE == 1) {                                        // loads only
+            if (lane == 0) acc[0][0] += __uint_as_float(*reinterpret_cast<const uint32_t*>(ws + warp * 16) & 0x007FFFFFu);
+            continue;
+        }
         #pragma unroll
         for (int h = 0; h < 2; ++h) {                                     // steps 4h..4h+3
             uint4 lo[2]; uint4 nb;
@@ -1142,13 +1146,13 @@ w12_reduce_kernel(const float* __restrict__ part, int ksplit, int m, int N, cons
     }
 }
 
-template <int NT, int NSTAGE, bool SPLITK>
+template <int NT, int NSTAGE, bool SPLITK, int MODE = 0>
 void launch_w12(const __nv_bfloat16* X, int ldx, int m, const uint8_t* W, int eb, float* part, int N, int K, int sk, cudaStream_t stream)
 {
     constexpr int smem = NSTAGE * w12_stage_bytes(NT);
     static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(w12_kernel<NT, NSTAGE, SPLITK>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
-    w12_kernel<NT, NSTAGE, SPLITK><<<dim3(N / 64, sk), 128, smem, stream>>>(X, ldx, m, W, eb, part, N, K);
+    if (!attr) { cudaFuncSetAttribute(w12_kernel<NT, NSTAGE, SPLITK, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    w12_kernel<NT, NSTAGE, SPLITK, MODE><<<dim3(N / 64, sk), 128, smem, stream>>>(X, ldx, m, W, eb, part, N, K);
 }
 
 } // namespace
@@ -1370,7 +1374,7 @@ void mma12cp(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, to
 }
 
 void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
-         torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t nstage, int64_t sk)
+         torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t nstage, int64_t sk, int64_t mode)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(n % 64 == 0 && k % 128 == 0 && (k / 128) % sk == 0 && m <= 8 * nt, "w12: shape/config mismatch");
@@ -1382,7 +1386,13 @@ void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, to
     float* pp = part.data_ptr<float>();
     const int ldx = (int)X.stride(0);
     const int key = (int)nt * 100 + (int)nstage * 10 + (sk > 1 ? 1 : 0);
-    switch (key) {
+    if (mode == 3) {   // loads-only ablation of the GEMM (nt 1/4 stages or the given nt with 4 stages)
+        if (nt == 1) launch_w12<1, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream);
+        else if (nt == 2) launch_w12<2, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream);
+        else launch_w12<4, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream);
+        return;
+    }
+    if (mode != 2) switch (key) {
         case 140: launch_w12<1, 4, false>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, 1, stream); break;
         case 141: launch_w12<1, 4, true>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream); break;
         case 180: launch_w12<1, 8, false>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, 1, stream); break;
@@ -1397,6 +1407,7 @@ void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, to
         case 421: launch_w12<4, 2, true>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream); break;
         default: TORCH_CHECK(false, "unsupported w12 config (nt, nstage, sk)");
     }
+    if (mode == 1) return;
     w12_reduce_kernel<<<(unsigned)(n / 32), 256, 0, stream>>>(pp, (int)sk, (int)m, (int)n, Xp, ldx, esc_off.data_ptr<int>(),
         esc_n.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (int)out.stride(0));
 }
@@ -1413,7 +1424,7 @@ void gemv12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, tor
 void mma12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t unroll, int64_t sk);
 void mma12cp(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t nstage, int64_t sk);
 void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
-         torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t nstage, int64_t sk);
+         torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t nstage, int64_t sk, int64_t mode);
 """
 
 _EXT = None
