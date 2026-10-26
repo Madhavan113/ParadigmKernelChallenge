@@ -17,6 +17,18 @@ try:
         functions=["sliding_attn"],
         extra_cuda_cflags=["-O3", "-arch=sm_90a", "-Xptxas", "-v"], verbose=True)
     print("BUILD OK", ext)
+    # SASS size per kernel: instructions x 16 B (H100 L1.5 instruction cache ~128 KB per SM)
+    import subprocess, collections
+    sass = subprocess.run(["cuobjdump", "-sass", ext.__file__], capture_output=True, text=True).stdout
+    func, counts = None, collections.OrderedDict()
+    for line in sass.splitlines():
+        m = re.match(r"\s*Function : (\S+)", line)
+        if m:
+            func = m.group(1); counts[func] = 0
+        elif func and re.match(r"\s*/\*[0-9a-f]{4,}\*/", line):
+            counts[func] += 1
+    for f, n in counts.items():
+        print(f"SASS {n:6d} instructions = {n * 16 / 1024:7.1f} KB  {f[:90]}")
 except Exception as e:
     msg = str(e)
     print("BUILD FAILED")
