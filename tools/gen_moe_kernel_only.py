@@ -17,8 +17,7 @@ wsig = ("(const __half*, int, const int*, const int*, const int*, const int*, co
         "const float*, __half*, __nv_bfloat16*, int, float*, int, int, int, int, int, int, float, bool, cudaStream_t)")
 for g, m, t, s, n, sk, tm in re.findall(r"OKC_W\((true|false), (\d), (\d), (\d), (\d), (true|false), (true|false)\)", cu):
     inst.append(f"template void launch_wt<{g}, {m}, {t}, {s}, {n}, {sk}, {tm}, 0>{wsig};")
-for g, md in re.findall(r"OKC_WM\((true|false), (\d)\)", cu):
-    inst.append(f"template void launch_wt<{g}, 1, 1, 1, 8, false, false, {md}>{wsig};")
+
 # keep the finalize kernel referenced
 inst.append("void* finalize_ref1 = (void*)&moe_finalize_kernel<4096, 1>;")
 inst.append("void* finalize_ref4 = (void*)&moe_finalize_kernel<4096, 4>;")

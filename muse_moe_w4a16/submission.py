@@ -837,8 +837,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     float* __restrict__ part, int ldp, int part_rows,
                     int K, int NTILES, float gs_mul)
 {
-    // Weights: Wr[e][chunk][tile/4][tile%4][1 KB], scales Sr[e][chunk][tile/4][tile%4][128 B]: an expert's chunk is
-    // one contiguous 512 KB (+64 KB) region that all of its CTAs sweep together.
+    // Weights: Wr[e][tile/4][chunk][tile%4][1 KB], scales Sr[e][tile/4][chunk][tile%4][128 B]: a 4-tile group's
+    // chunk is 4 KB contiguous (a chunk-major layout measured no better).
     // PDL: GATED (GEMM1) waits for the routing lists first; else (GEMM2) the weights only need the lists (already
     // complete) so their prologue is issued before waiting for GEMM1's inter. TMA: thread 0 issues cp.async.bulk copies (per chunk: TPC/4 weight groups, TPC/4
     // scale groups, the valid token rows) tracked by one mbarrier per stage; else 16 B cp.async by all threads.
@@ -885,9 +885,9 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     };
     const size_t ebase = (size_t)e * NG;
     // global address of (tile, chunk c) weights / scales
-    const size_t WCH = (size_t)NG * 4096, SCH = (size_t)NG * 512;    // bytes per expert chunk
-    auto waddr = [&](int tile, int c) { return Wr + ((size_t)e * NC_ALL + c) * WCH + (tile >> 2) * 4096 + (tile & 3) * 1024; };
-    auto saddr = [&](int tile, int c) { return Sr + ((size_t)e * NC_ALL + c) * SCH + (tile >> 2) * 512 + (tile & 3) * 128; };
+    constexpr size_t WCH = 4096, SCH = 512;             // bytes per (group, chunk): the chunk stride within a group
+    auto waddr = [&](int tile, int c) { return Wr + ((ebase + (tile >> 2)) * NC_ALL + c) * 4096 + (tile & 3) * 1024; };
+    auto saddr = [&](int tile, int c) { return Sr + ((ebase + (tile >> 2)) * NC_ALL + c) * 512 + (tile & 3) * 128; };
 
     const uint32_t smem_base = smem_u32(wt_smem);
     const uint32_t bars = smem_base + NSTAGE * STAGE_BYTES;      // TMA: one mbarrier per stage
@@ -947,8 +947,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         if (warp < NGRP) {
             int grp = blockIdx.x * MW + (warp % MW);
             if (GATED && warp >= MW) grp += NG / 2;
-            wgrp_src = Wr + ((size_t)e * NC_ALL + c0) * WCH + grp * 4096;
-            sgrp_src = Sr + ((size_t)e * NC_ALL + c0) * SCH + grp * 512;
+            wgrp_src = Wr + ((ebase + grp) * NC_ALL + c0) * 4096;
+            sgrp_src = Sr + ((ebase + grp) * NC_ALL + c0) * 512;
         }
         if (tid == 0) {
             #pragma unroll
@@ -1400,6 +1400,7 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
         pp, ldp, prow, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
     const int mode = ks >= 10 ? (int)ks - 10 : 0;          // bench ablations: ks = 10 + MODE on the (1,1,1,8) variant
+#ifdef OKC_ABLATE
     if (mode > 0) {
         TORCH_CHECK(mw == 1 && nt == 1 && nstage == 8 && !tma && ksplit == 1, "ablation modes: (1,1,1,8) only");
 #define OKC_WM(G, MD) launch_wt<G, 1, 1, 1, 8, false, false, MD>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(),         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo,         pp, ldp, prow, 1, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
@@ -1408,6 +1409,9 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
 #undef OKC_WM
         return;
     }
+#else
+    TORCH_CHECK(mode == 0, "ablation modes need -DOKC_ABLATE");
+#endif
     const int key = (tma ? 10000000 : 0) + (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
     switch (key) {
         case 111104: OKC_W(true, 1, 1, 1, 4, false, false); break;   case 111108: OKC_W(true, 1, 1, 1, 8, false, false); break;
@@ -1532,7 +1536,7 @@ def repack_weights(w: torch.Tensor, sf: torch.Tensor):
 
 def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
     """w uint8 [E, N, K/2] packed E2M1 (low nibble = even k), sf fp8 [E, N, K/16] ->
-    Wr uint8 [E, K/128, N/64, 4, 1024] (per expert, chunk, 4-tile group, tile slot: 2 halves x 32 lanes x 16 B): per
+    Wr uint8 [E, N/64, K/128, 4, 1024] (per expert, 4-tile group, chunk, tile slot: 2 halves x 32 lanes x 16 B): per
     (tile, chunk, half, lane) 4 words = the lane's
     A-fragment nibbles for k16 steps 4*half .. 4*half+3 (byte b: nibble A_b at bits {7,4,3,2} = E4M3
     position, nibble B_b at (e1:6, s:5, e0:1, m:0); A_0,A_1 = row g k 2t,2t+1; A_2,A_3 = row g+8 k 2t,2t+1;
@@ -1568,10 +1572,9 @@ def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
         del nib, n6, sel, word
     sfu = sf.view(torch.uint8).view(E, NTL, 2, 8, NC, 8)                            # e, tile, rh, g, chunk, step
     Sr = sfu.permute(0, 1, 4, 3, 5, 2).contiguous().view(E, NTL, NC, 8, 16)         # e, tile, chunk, g, (step, rh)
-    # chunk-major: an expert's chunk c (all N/16 tiles' 1 KB blocks, grouped by 4) is one contiguous region, so the
-    # CTAs of an expert sweep memory together
-    Wr = Wr.view(E, NTL // 4, 4, NC, 1024).permute(0, 3, 1, 2, 4).contiguous()      # e, chunk, group, slot, 1 KB
-    Sr = Sr.view(E, NTL // 4, 4, NC, 128).permute(0, 3, 1, 2, 4).contiguous()       # e, chunk, group, slot, 128 B
+    # 4-tile groups: a group's chunk is 4 KB (weights) / 512 B (scales) contiguous
+    Wr = Wr.view(E, NTL // 4, 4, NC, 1024).permute(0, 1, 3, 2, 4).contiguous()      # e, group, chunk, slot, 1 KB
+    Sr = Sr.view(E, NTL // 4, 4, NC, 128).permute(0, 1, 3, 2, 4).contiguous()       # e, group, chunk, slot, 128 B
     return Wr, Sr
 
 # == END CUDA ==
@@ -1614,9 +1617,10 @@ def _moe_forward_cuda(x, ids, tw, local_start: int, I: int, state) -> torch.Tens
 
 
 # (token n8 blocks per expert block, GEMM2 m16 tiles per warp, K-split warp groups, stages, K-split CTAs, TMA bulk copies)
-# Locked from the in-prepare cold-L2 sweeps (checks f2f756d9, a3d79f15): 8 cp.async stages up to 8 tokens, 4 above;
-# 8-token blocks up to 64 tokens, 16-token (GEMM2: 2 tiles per warp) up to 128, 32-token with 2 stages beyond.
-WT_DEFAULT = {8: (1, 1, 1, 8, 1, 0), 64: (1, 1, 1, 4, 1, 0), 128: (2, 2, 1, 4, 1, 0), 100000: (4, 2, 1, 2, 1, 0)}
+# Locked from the in-prepare cold-L2 sweeps (checks a3d79f15, 626fd074, c8719ecb, d655b6f4): 8 cp.async stages up to
+# 8 tokens, 4 above; 8-token blocks up to 64 tokens (GEMM2 with 2 tiles per warp from 17), 16-token blocks up to 128,
+# 32-token blocks with 2 stages beyond. Split-K, TMA bulk copies and a chunk-major layout all measured slower.
+WT_DEFAULT = {8: (1, 1, 1, 8, 1, 0), 16: (1, 1, 1, 4, 1, 0), 64: (1, 2, 1, 4, 1, 0), 128: (2, 2, 1, 4, 1, 0), 100000: (4, 2, 1, 2, 1, 0)}
 WT_SAFE = (1, 1, 1, 4, 1, 0)
 PART_SPLIT_MAX = 8      # fp32 partial slices for split-K
 PART_ROWS = 1024        # padded rows the partial buffer holds (split-K is a small-batch tool)
@@ -1952,7 +1956,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
