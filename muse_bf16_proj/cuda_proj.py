@@ -181,6 +181,126 @@ void launch_gemv(const __nv_bfloat16* X, int ldx, int m, const __nv_bfloat16* W,
     gemv_kernel<M, RPW, UNROLL, KSPLIT, TWO_W><<<N / ROWS, 256, 0, stream>>>(X, ldx, m, W, W2, ldw, ob, of, ldo, K);
 }
 
+__device__ __forceinline__ void mma16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// ---- tensor-core skinny GEMM, M <= 16 * MT, no shared-memory staging of the weight: a lane's
+// 16-byte load of W (row n0 + 8r + g, k = 8t .. 8t+7 of a 32-wide k chunk) is the B fragment of two
+// mma.m16n8k16 steps under a k permutation, and x's A fragments are loaded with the same
+// permutation (two 16-byte loads per m-tile from L1/L2). KSPLIT warps share RPW 8-row tiles and
+// reduce through shared memory; UNROLL chunks of W per lane stay in flight (register double-buffer).
+template <int MT, int RPW, int UNROLL, int KSPLIT>
+__global__ void __launch_bounds__(256) skinny_mma_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m,
+                                                         const __nv_bfloat16* __restrict__ W, int ldw,
+                                                         __nv_bfloat16* __restrict__ out, int ldo, int K)
+{
+    constexpr int WARPS = 8, GROUPS = WARPS / KSPLIT, TROWS = RPW * 8, ROWS = GROUPS * TROWS;
+    __shared__ float red[KSPLIT > 1 ? GROUPS : 1][MT * 16][TROWS];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int grp = warp / KSPLIT, kp = warp % KSPLIT;
+    const int n0 = blockIdx.x * ROWS + grp * TROWS;
+    const int kc = K / KSPLIT, steps = kc / 32, kbeg = kp * kc;
+
+    float acc[MT][RPW][4];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][r][q] = 0.f;
+
+    const uint4* wp[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; ++r) wp[r] = reinterpret_cast<const uint4*>(W + (size_t)(n0 + 8 * r + g) * ldw + kbeg + 8 * t);
+    const uint4* xp[MT][2];
+    bool xok[MT][2];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = i * 16 + g + 8 * h;
+            xok[i][h] = row < m;
+            xp[i][h] = reinterpret_cast<const uint4*>(X + (size_t)(row < m ? row : 0) * ldx + kbeg + 8 * t);
+        }
+
+    uint4 cur[UNROLL][RPW];
+    #pragma unroll
+    for (int u = 0; u < UNROLL; ++u)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) cur[u][r] = ldg_stream(wp[r] + 4 * u);
+    for (int s = 0; s < steps; s += UNROLL) {
+        const int sn = s + UNROLL < steps ? s + UNROLL : s;
+        uint4 nxt[UNROLL][RPW];
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) nxt[u][r] = ldg_stream(wp[r] + 4 * (sn + u));
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            uint4 xa[MT], xb[MT];
+            #pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                xa[i] = xok[i][0] ? xp[i][0][4 * (s + u)] : make_uint4(0u, 0u, 0u, 0u);
+                xb[i] = xok[i][1] ? xp[i][1][4 * (s + u)] : make_uint4(0u, 0u, 0u, 0u);
+            }
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                #pragma unroll
+                for (int i = 0; i < MT; ++i) {
+                    mma16816(acc[i][r], xa[i].x, xb[i].x, xa[i].y, xb[i].y, cur[u][r].x, cur[u][r].y);
+                    mma16816(acc[i][r], xa[i].z, xb[i].z, xa[i].w, xb[i].w, cur[u][r].z, cur[u][r].w);
+                }
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) cur[u][r] = nxt[u][r];
+    }
+
+    if (KSPLIT == 1) {
+        #pragma unroll
+        for (int i = 0; i < MT; ++i)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                const int col = n0 + 8 * r + 2 * t;
+                const int ra = i * 16 + g, rb = ra + 8;
+                if (ra < m) *reinterpret_cast<__nv_bfloat162*>(out + (size_t)ra * ldo + col) = __floats2bfloat162_rn(acc[i][r][0], acc[i][r][1]);
+                if (rb < m) *reinterpret_cast<__nv_bfloat162*>(out + (size_t)rb * ldo + col) = __floats2bfloat162_rn(acc[i][r][2], acc[i][r][3]);
+            }
+        return;
+    }
+    constexpr int RED = GROUPS * MT * 16 * TROWS;
+    for (int idx = threadIdx.x; idx < RED; idx += 256) (&red[0][0][0])[idx] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const int col = 8 * r + 2 * t;
+            atomicAdd(&red[grp][i * 16 + g][col], acc[i][r][0]);
+            atomicAdd(&red[grp][i * 16 + g][col + 1], acc[i][r][1]);
+            atomicAdd(&red[grp][i * 16 + g + 8][col], acc[i][r][2]);
+            atomicAdd(&red[grp][i * 16 + g + 8][col + 1], acc[i][r][3]);
+        }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < RED / 2; idx += 256) {
+        const int c2 = idx % (TROWS / 2), row = (idx / (TROWS / 2)) % (MT * 16), gq = idx / (TROWS / 2 * MT * 16);
+        if (row >= m) continue;
+        const float* v = &red[gq][row][2 * c2];
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)row * ldo + blockIdx.x * ROWS + gq * TROWS + 2 * c2) = __floats2bfloat162_rn(v[0], v[1]);
+    }
+}
+
+template <int MT, int RPW, int UNROLL, int KSPLIT>
+void launch_mma(const __nv_bfloat16* X, int ldx, int m, const __nv_bfloat16* W, int ldw, __nv_bfloat16* out, int ldo, int K, int N, cudaStream_t stream)
+{
+    constexpr int ROWS = (8 / KSPLIT) * RPW * 8;
+    skinny_mma_kernel<MT, RPW, UNROLL, KSPLIT><<<N / ROWS, 256, 0, stream>>>(X, ldx, m, W, ldw, out, ldo, K);
+}
+
 } // namespace
 
 void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t threads, int64_t unroll)
@@ -218,27 +338,52 @@ void gemv(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tensor out,
     const int ldx = (int)X.stride(0), ldw = (int)W.stride(0), ldo = (int)out.stride(0);
     const int key = (int)mpad * 100000 + (int)rpw * 10000 + (int)unroll * 100 + (int)ksplit * 10 + (two_w ? 1 : 0);
     switch (key) {
-        GEMV_CASE(1, 1, 8, 1, false)
-        GEMV_CASE(1, 2, 8, 1, false)
-        GEMV_CASE(1, 4, 4, 1, false)
-        GEMV_CASE(1, 4, 8, 1, false)
-        GEMV_CASE(1, 1, 4, 1, false)
         GEMV_CASE(1, 2, 4, 1, false)
         GEMV_CASE(1, 1, 4, 2, false)
         GEMV_CASE(1, 2, 2, 2, false)
-        GEMV_CASE(1, 1, 8, 2, false)
+        GEMV_CASE(1, 2, 4, 2, false)
+        GEMV_CASE(1, 4, 2, 2, false)
         GEMV_CASE(1, 1, 4, 4, false)
+        GEMV_CASE(1, 2, 2, 4, false)
+        GEMV_CASE(1, 2, 4, 4, false)
+        GEMV_CASE(1, 1, 2, 4, false)
+        GEMV_CASE(1, 1, 2, 8, false)
         GEMV_CASE(1, 1, 4, 8, true)
         GEMV_CASE(1, 1, 2, 8, true)
-        GEMV_CASE(1, 1, 8, 4, true)
-        GEMV_CASE(8, 1, 4, 1, false)
-        GEMV_CASE(8, 1, 8, 1, false)
-        GEMV_CASE(8, 2, 4, 1, false)
-        GEMV_CASE(8, 1, 2, 2, false)
-        GEMV_CASE(8, 1, 4, 2, false)
-        GEMV_CASE(8, 1, 4, 8, true)
-        GEMV_CASE(8, 1, 2, 8, true)
+        GEMV_CASE(1, 2, 2, 8, true)
         default: TORCH_CHECK(false, "unsupported gemv config");
+    }
+}
+#define MMA_CASE(T_, R_, U_, S_) \
+    case (T_ * 10000 + R_ * 1000 + U_ * 10 + S_): launch_mma<T_, R_, U_, S_>(Xp, ldx, m, Wp, ldw, ob, ldo, K, N, stream); break;
+
+void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt, int64_t rpw, int64_t unroll, int64_t ksplit)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int m = (int)X.size(0), K = (int)X.size(1), N = (int)W.size(0);
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const __nv_bfloat16* Wp = reinterpret_cast<const __nv_bfloat16*>(W.data_ptr());
+    __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int ldx = (int)X.stride(0), ldw = (int)W.stride(0), ldo = (int)out.stride(0);
+    const int key = (int)mt * 10000 + (int)rpw * 1000 + (int)unroll * 10 + (int)ksplit;
+    switch (key) {
+        MMA_CASE(1, 4, 4, 8)
+        MMA_CASE(1, 2, 8, 8)
+        MMA_CASE(1, 2, 4, 8)
+        MMA_CASE(1, 1, 8, 8)
+        MMA_CASE(1, 2, 4, 4)
+        MMA_CASE(1, 4, 2, 8)
+        MMA_CASE(1, 1, 4, 4)
+        MMA_CASE(1, 4, 2, 4)
+        MMA_CASE(2, 4, 4, 8)
+        MMA_CASE(2, 2, 8, 8)
+        MMA_CASE(2, 2, 4, 8)
+        MMA_CASE(2, 1, 8, 8)
+        MMA_CASE(2, 2, 4, 4)
+        MMA_CASE(2, 4, 2, 8)
+        MMA_CASE(2, 1, 4, 4)
+        MMA_CASE(2, 4, 2, 4)
+        default: TORCH_CHECK(false, "unsupported mma config");
     }
 }
 """
@@ -248,6 +393,7 @@ CPP_SRC = """
 #include <ATen/cuda/CUDAContext.h>
 void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t threads, int64_t unroll);
 void gemv(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tensor out, int64_t mpad, int64_t rpw, int64_t unroll, int64_t ksplit, bool two_w);
+void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt, int64_t rpw, int64_t unroll, int64_t ksplit);
 """
 
 _EXT = None
@@ -258,9 +404,9 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_gemv", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda2", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["stream_bytes", "gemv"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
+            functions=["stream_bytes", "gemv", "skinny_mma"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
 
 
@@ -269,4 +415,12 @@ def gemv_usable(m: int, n: int, k: int, mpad: int, rpw: int, unroll: int, ksplit
     if m > mpad or n % rows or k % (ksplit * 256):
         return False
     steps = k // ksplit // 256
+    return steps % unroll == 0
+
+
+def mma_usable(m: int, n: int, k: int, mt: int, rpw: int, unroll: int, ksplit: int) -> bool:
+    rows = (8 // ksplit) * rpw * 8
+    if m > 16 * mt or n % rows or k % (ksplit * 32):
+        return False
+    steps = k // ksplit // 32
     return steps % unroll == 0

@@ -528,6 +528,126 @@ void launch_gemv(const __nv_bfloat16* X, int ldx, int m, const __nv_bfloat16* W,
     gemv_kernel<M, RPW, UNROLL, KSPLIT, TWO_W><<<N / ROWS, 256, 0, stream>>>(X, ldx, m, W, W2, ldw, ob, of, ldo, K);
 }
 
+__device__ __forceinline__ void mma16816(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+                 : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
+                 : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+
+// ---- tensor-core skinny GEMM, M <= 16 * MT, no shared-memory staging of the weight: a lane's
+// 16-byte load of W (row n0 + 8r + g, k = 8t .. 8t+7 of a 32-wide k chunk) is the B fragment of two
+// mma.m16n8k16 steps under a k permutation, and x's A fragments are loaded with the same
+// permutation (two 16-byte loads per m-tile from L1/L2). KSPLIT warps share RPW 8-row tiles and
+// reduce through shared memory; UNROLL chunks of W per lane stay in flight (register double-buffer).
+template <int MT, int RPW, int UNROLL, int KSPLIT>
+__global__ void __launch_bounds__(256) skinny_mma_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m,
+                                                         const __nv_bfloat16* __restrict__ W, int ldw,
+                                                         __nv_bfloat16* __restrict__ out, int ldo, int K)
+{
+    constexpr int WARPS = 8, GROUPS = WARPS / KSPLIT, TROWS = RPW * 8, ROWS = GROUPS * TROWS;
+    __shared__ float red[KSPLIT > 1 ? GROUPS : 1][MT * 16][TROWS];
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int grp = warp / KSPLIT, kp = warp % KSPLIT;
+    const int n0 = blockIdx.x * ROWS + grp * TROWS;
+    const int kc = K / KSPLIT, steps = kc / 32, kbeg = kp * kc;
+
+    float acc[MT][RPW][4];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][r][q] = 0.f;
+
+    const uint4* wp[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; ++r) wp[r] = reinterpret_cast<const uint4*>(W + (size_t)(n0 + 8 * r + g) * ldw + kbeg + 8 * t);
+    const uint4* xp[MT][2];
+    bool xok[MT][2];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = i * 16 + g + 8 * h;
+            xok[i][h] = row < m;
+            xp[i][h] = reinterpret_cast<const uint4*>(X + (size_t)(row < m ? row : 0) * ldx + kbeg + 8 * t);
+        }
+
+    uint4 cur[UNROLL][RPW];
+    #pragma unroll
+    for (int u = 0; u < UNROLL; ++u)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) cur[u][r] = ldg_stream(wp[r] + 4 * u);
+    for (int s = 0; s < steps; s += UNROLL) {
+        const int sn = s + UNROLL < steps ? s + UNROLL : s;
+        uint4 nxt[UNROLL][RPW];
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) nxt[u][r] = ldg_stream(wp[r] + 4 * (sn + u));
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u) {
+            uint4 xa[MT], xb[MT];
+            #pragma unroll
+            for (int i = 0; i < MT; ++i) {
+                xa[i] = xok[i][0] ? xp[i][0][4 * (s + u)] : make_uint4(0u, 0u, 0u, 0u);
+                xb[i] = xok[i][1] ? xp[i][1][4 * (s + u)] : make_uint4(0u, 0u, 0u, 0u);
+            }
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r)
+                #pragma unroll
+                for (int i = 0; i < MT; ++i) {
+                    mma16816(acc[i][r], xa[i].x, xb[i].x, xa[i].y, xb[i].y, cur[u][r].x, cur[u][r].y);
+                    mma16816(acc[i][r], xa[i].z, xb[i].z, xa[i].w, xb[i].w, cur[u][r].z, cur[u][r].w);
+                }
+        }
+        #pragma unroll
+        for (int u = 0; u < UNROLL; ++u)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) cur[u][r] = nxt[u][r];
+    }
+
+    if (KSPLIT == 1) {
+        #pragma unroll
+        for (int i = 0; i < MT; ++i)
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                const int col = n0 + 8 * r + 2 * t;
+                const int ra = i * 16 + g, rb = ra + 8;
+                if (ra < m) *reinterpret_cast<__nv_bfloat162*>(out + (size_t)ra * ldo + col) = __floats2bfloat162_rn(acc[i][r][0], acc[i][r][1]);
+                if (rb < m) *reinterpret_cast<__nv_bfloat162*>(out + (size_t)rb * ldo + col) = __floats2bfloat162_rn(acc[i][r][2], acc[i][r][3]);
+            }
+        return;
+    }
+    constexpr int RED = GROUPS * MT * 16 * TROWS;
+    for (int idx = threadIdx.x; idx < RED; idx += 256) (&red[0][0][0])[idx] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const int col = 8 * r + 2 * t;
+            atomicAdd(&red[grp][i * 16 + g][col], acc[i][r][0]);
+            atomicAdd(&red[grp][i * 16 + g][col + 1], acc[i][r][1]);
+            atomicAdd(&red[grp][i * 16 + g + 8][col], acc[i][r][2]);
+            atomicAdd(&red[grp][i * 16 + g + 8][col + 1], acc[i][r][3]);
+        }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < RED / 2; idx += 256) {
+        const int c2 = idx % (TROWS / 2), row = (idx / (TROWS / 2)) % (MT * 16), gq = idx / (TROWS / 2 * MT * 16);
+        if (row >= m) continue;
+        const float* v = &red[gq][row][2 * c2];
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)row * ldo + blockIdx.x * ROWS + gq * TROWS + 2 * c2) = __floats2bfloat162_rn(v[0], v[1]);
+    }
+}
+
+template <int MT, int RPW, int UNROLL, int KSPLIT>
+void launch_mma(const __nv_bfloat16* X, int ldx, int m, const __nv_bfloat16* W, int ldw, __nv_bfloat16* out, int ldo, int K, int N, cudaStream_t stream)
+{
+    constexpr int ROWS = (8 / KSPLIT) * RPW * 8;
+    skinny_mma_kernel<MT, RPW, UNROLL, KSPLIT><<<N / ROWS, 256, 0, stream>>>(X, ldx, m, W, ldw, out, ldo, K);
+}
+
 } // namespace
 
 void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t threads, int64_t unroll)
@@ -565,27 +685,52 @@ void gemv(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tensor out,
     const int ldx = (int)X.stride(0), ldw = (int)W.stride(0), ldo = (int)out.stride(0);
     const int key = (int)mpad * 100000 + (int)rpw * 10000 + (int)unroll * 100 + (int)ksplit * 10 + (two_w ? 1 : 0);
     switch (key) {
-        GEMV_CASE(1, 1, 8, 1, false)
-        GEMV_CASE(1, 2, 8, 1, false)
-        GEMV_CASE(1, 4, 4, 1, false)
-        GEMV_CASE(1, 4, 8, 1, false)
-        GEMV_CASE(1, 1, 4, 1, false)
         GEMV_CASE(1, 2, 4, 1, false)
         GEMV_CASE(1, 1, 4, 2, false)
         GEMV_CASE(1, 2, 2, 2, false)
-        GEMV_CASE(1, 1, 8, 2, false)
+        GEMV_CASE(1, 2, 4, 2, false)
+        GEMV_CASE(1, 4, 2, 2, false)
         GEMV_CASE(1, 1, 4, 4, false)
+        GEMV_CASE(1, 2, 2, 4, false)
+        GEMV_CASE(1, 2, 4, 4, false)
+        GEMV_CASE(1, 1, 2, 4, false)
+        GEMV_CASE(1, 1, 2, 8, false)
         GEMV_CASE(1, 1, 4, 8, true)
         GEMV_CASE(1, 1, 2, 8, true)
-        GEMV_CASE(1, 1, 8, 4, true)
-        GEMV_CASE(8, 1, 4, 1, false)
-        GEMV_CASE(8, 1, 8, 1, false)
-        GEMV_CASE(8, 2, 4, 1, false)
-        GEMV_CASE(8, 1, 2, 2, false)
-        GEMV_CASE(8, 1, 4, 2, false)
-        GEMV_CASE(8, 1, 4, 8, true)
-        GEMV_CASE(8, 1, 2, 8, true)
+        GEMV_CASE(1, 2, 2, 8, true)
         default: TORCH_CHECK(false, "unsupported gemv config");
+    }
+}
+#define MMA_CASE(T_, R_, U_, S_) \
+    case (T_ * 10000 + R_ * 1000 + U_ * 10 + S_): launch_mma<T_, R_, U_, S_>(Xp, ldx, m, Wp, ldw, ob, ldo, K, N, stream); break;
+
+void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt, int64_t rpw, int64_t unroll, int64_t ksplit)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int m = (int)X.size(0), K = (int)X.size(1), N = (int)W.size(0);
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const __nv_bfloat16* Wp = reinterpret_cast<const __nv_bfloat16*>(W.data_ptr());
+    __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int ldx = (int)X.stride(0), ldw = (int)W.stride(0), ldo = (int)out.stride(0);
+    const int key = (int)mt * 10000 + (int)rpw * 1000 + (int)unroll * 10 + (int)ksplit;
+    switch (key) {
+        MMA_CASE(1, 4, 4, 8)
+        MMA_CASE(1, 2, 8, 8)
+        MMA_CASE(1, 2, 4, 8)
+        MMA_CASE(1, 1, 8, 8)
+        MMA_CASE(1, 2, 4, 4)
+        MMA_CASE(1, 4, 2, 8)
+        MMA_CASE(1, 1, 4, 4)
+        MMA_CASE(1, 4, 2, 4)
+        MMA_CASE(2, 4, 4, 8)
+        MMA_CASE(2, 2, 8, 8)
+        MMA_CASE(2, 2, 4, 8)
+        MMA_CASE(2, 1, 8, 8)
+        MMA_CASE(2, 2, 4, 4)
+        MMA_CASE(2, 4, 2, 8)
+        MMA_CASE(2, 1, 4, 4)
+        MMA_CASE(2, 4, 2, 4)
+        default: TORCH_CHECK(false, "unsupported mma config");
     }
 }
 """
@@ -595,6 +740,7 @@ CPP_SRC = """
 #include <ATen/cuda/CUDAContext.h>
 void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t threads, int64_t unroll);
 void gemv(torch::Tensor X, torch::Tensor W, torch::Tensor W2, torch::Tensor out, int64_t mpad, int64_t rpw, int64_t unroll, int64_t ksplit, bool two_w);
+void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt, int64_t rpw, int64_t unroll, int64_t ksplit);
 """
 
 _EXT = None
@@ -605,9 +751,9 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_gemv", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda2", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["stream_bytes", "gemv"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
+            functions=["stream_bytes", "gemv", "skinny_mma"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
 
 
@@ -616,6 +762,14 @@ def gemv_usable(m: int, n: int, k: int, mpad: int, rpw: int, unroll: int, ksplit
     if m > mpad or n % rows or k % (ksplit * 256):
         return False
     steps = k // ksplit // 256
+    return steps % unroll == 0
+
+
+def mma_usable(m: int, n: int, k: int, mt: int, rpw: int, unroll: int, ksplit: int) -> bool:
+    rows = (8 // ksplit) * rpw * 8
+    if m > 16 * mt or n % rows or k % (ksplit * 32):
+        return False
+    steps = k // ksplit // 32
     return steps % unroll == 0
 
 
@@ -691,25 +845,47 @@ USE_TMA = False  # fetch tiles with TMA descriptors (box inner dim <= 256 elemen
 _OVERRIDE = None   # a config dict, during in-prepare benchmarking
 
 
-# (layer, n, m) -> (mpad, rows per warp, unroll, ksplit): the CUDA register GEMV (m <= 8)
-GEMV_SHAPES = {}
-# (layer, n, m) -> SPLIT_K: cuBLAS batched split-K (bmm over K chunks) + fp32 partial sum
-BMM_SHAPES = {}
+# (layer, n, m) -> (mpad, rows per warp, unroll, ksplit): the CUDA register GEMV (m = 1). Check
+# 2a945e84 (cold L2): pooler 22.1 vs 24.2 Triton, qkv 14.9 vs 17.9, unpooler slice 6.2 vs 7.4,
+# router 5.6 vs 7.2; o (K = 1024) stays Triton.
+GEMV_SHAPES = {
+    ("pooler", 4096, 1): (1, 2, 2, 2),
+    ("qkv_gate", 2304, 1): (1, 1, 4, 2),
+    ("unpooler", 1024, 1): (1, 1, 4, 2),
+    ("router", 256, 1): (1, 1, 2, 8),
+}
+# (layer, n, m) -> (mt, rows per warp / 8, unroll, ksplit): the CUDA mma.sync register-streaming GEMM (m <= 32)
+MMA_SHAPES = {}
+# (layer, n, m) -> SPLIT_K: cuBLAS batched split-K (bmm over K chunks) + fp32 partial sum. Check
+# 2a945e84: qkv 18.6 vs 20.6 (m=128), 21.6 vs 24.5 (m=256); pooler m=256 32.4 vs 34.0.
+BMM_SHAPES = {("qkv_gate", 2304, 128): 4, ("qkv_gate", 2304, 256): 4, ("pooler", 4096, 256): 2}
 # m -> config for the router above 64 tokens (Triton two-weight GEMM); missing: cuBLAS over [hi | lo]
-ROUTER_BIG = {}
+ROUTER_BIG = {256: dict(BLOCK_M=128, BLOCK_N=32, BLOCK_K=128, SPLIT_K=8, num_warps=8, num_stages=4, tma=True)}   # 12.8 vs 14.2
 
 
 def _config(layer: str, m: int, n: int, k: int):
     if _OVERRIDE is not None:
-        return None if _OVERRIDE.get("none") else dict(_OVERRIDE)
+        if _OVERRIDE.get("none"):
+            return None
+        if _OVERRIDE.get("table"):
+            return _triton_config(layer, m, n, k)
+        return dict(_OVERRIDE)
     if (layer, n, m) in GEMV_SHAPES:
         mpad, rpw, unroll, ksplit = GEMV_SHAPES[(layer, n, m)]
         return dict(gemv=True, mpad=mpad, rpw=rpw, unroll=unroll, ksplit=ksplit)
+    if (layer, n, m) in MMA_SHAPES:
+        mt, rpw, unroll, ksplit = MMA_SHAPES[(layer, n, m)]
+        return dict(mma=True, mt=mt, rpw=rpw, unroll=unroll, ksplit=ksplit)
     if (layer, n, m) in BMM_SHAPES:
         return dict(bmm=True, SPLIT_K=BMM_SHAPES[(layer, n, m)])
     if layer == "router" and m > MAX_TRITON_M:
         cfg = ROUTER_BIG.get(m)
         return dict(cfg) if cfg else None
+    return _triton_config(layer, m, n, k)
+
+
+def _triton_config(layer: str, m: int, n: int, k: int):
+    """The Triton per-shape table (SWEEP / defaults), tiled packing and shared-memory clamp."""
     cfg = _config_table(layer, m, n, k)
     if cfg is None:
         return None
@@ -784,6 +960,8 @@ def _usable(cfg, m: int, n: int, k: int) -> bool:
         return False
     if cfg.get("gemv"):
         return gemv_usable(m, n, k, cfg["mpad"], cfg["rpw"], cfg["unroll"], cfg["ksplit"])
+    if cfg.get("mma"):
+        return mma_usable(m, n, k, cfg["mt"], cfg["rpw"], cfg["unroll"], cfg["ksplit"])
     if cfg.get("bmm"):
         return k % (cfg["SPLIT_K"] * 64) == 0
     if n % cfg["BLOCK_N"] or k % cfg["SPLIT_K"]:
@@ -871,6 +1049,9 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
         two_w = layer == "router"
         ext.gemv(x, w, w2 if two_w else w, out, cfg["mpad"], cfg["rpw"], cfg["unroll"], cfg["ksplit"], two_w)
         return out
+    if cfg.get("mma"):
+        build().skinny_mma(x, w, out, cfg["mt"], cfg["rpw"], cfg["unroll"], cfg["ksplit"])
+        return out
     if cfg.get("bmm"):
         sk = cfg["SPLIT_K"]
         if layer == "router":
@@ -950,6 +1131,21 @@ def _bench(state):
               "router": (256, 8192)}
     xs = {(m, k): torch.randn((m, k), device=dev).to(torch.bfloat16) for m in (1, 8, 16, 32, 128, 256) for k in (8192, 1024, 4096)}
     flush = torch.empty((128 << 20,), dtype=torch.uint8, device=dev)
+    sink = torch.empty((4096 * 16,), dtype=torch.int32, device=dev)
+    ext = None
+    try:
+        ext = build()
+        print(f"  cuda built {time.time() - t0:.0f}s")
+    except Exception as e:
+        print("  cuda build failed:", repr(e)[:300])
+
+    def do_flush():
+        # as the judge: a read of a buffer larger than L2 (a write would leave dirty lines whose
+        # write-back overlaps the timed kernel: run 2a945e84 measured ~5.5 us too high)
+        if ext is not None:
+            ext.stream_bytes(flush, sink, 1056, 512, 8)
+        else:
+            flush.fill_(1)
 
     def _graph_time(fn, reps):
         g = torch.cuda.CUDAGraph()
@@ -967,11 +1163,10 @@ def _bench(state):
         return best
 
     def timeit(fn, reps=10):
-        # as the judge: CUDA-graph replays, each preceded by an L2 flush (its cost measured and removed)
         fn(); fn()
         torch.cuda.synchronize()
-        t_flush = _graph_time(lambda: flush.fill_(1), reps)
-        t_both = _graph_time(lambda: (flush.fill_(1), fn()), reps)
+        t_flush = _graph_time(do_flush, reps)
+        t_both = _graph_time(lambda: (do_flush(), fn()), reps)
         return t_both - t_flush
 
     def budget():
@@ -998,7 +1193,7 @@ def _bench(state):
         x = xs[(m, layers[layer][1])]
         _OVERRIDE = cfg
         try:
-            if cfg is not None and not cfg.get("none") and not _usable(cfg, m, n, layers[layer][1]):
+            if cfg is not None and not cfg.get("none") and not cfg.get("table") and not _usable(cfg, m, n, layers[layer][1]):
                 return f"{label} n/a"
             out = _proj_forward(x, layer, n, state)
             t = timeit(lambda: _proj_forward(x, layer, n, state))
@@ -1009,98 +1204,72 @@ def _bench(state):
         finally:
             _OVERRIDE = None
 
-    print("BENCH proj (us per call, cold L2; '!' = rel err above tol)")
-    try:
-        ext = build()
-        print(f"  cuda built {time.time() - t0:.0f}s")
-        # ---- A. streaming ceiling: dot-free reads of the pooler weight (67 MB)
+    TAB = {"table": True}
+    print("BENCH proj (us per call, cold L2 by a read flush; '!' = rel err above tol)")
+    if ext is not None:
+        # ---- A. streaming ceiling (dot-free) with the read flush
         wbuf = state["pooler"]; nbytes = wbuf.numel() * 2
-        sink = torch.empty((4096 * 16,), dtype=torch.int32, device=dev)
-        for threads, unroll in ((256, 4), (256, 8), (256, 16), (512, 8), (128, 16)):
+        for threads, unroll in ((512, 8), (256, 8), (256, 4)):
             parts = []
-            for grid in (132, 264, 528, 1056, 2112):
+            for grid in (264, 528, 1056, 2112):
                 t = timeit(lambda: ext.stream_bytes(wbuf, sink, grid, threads, unroll))
                 parts.append(f"g{grid} {t:5.1f} ({nbytes / t / 1e6:.2f})")
             print(f"  stream t{threads} u{unroll}: " + " | ".join(parts))
-        obuf = state["o"]
-        parts = []
-        for grid in (264, 528, 1056):
-            t = timeit(lambda: ext.stream_bytes(obuf, sink, grid, 256, 8))
-            parts.append(f"g{grid} {t:5.1f} ({obuf.numel() * 2 / t / 1e6:.2f})")
-        print("  stream o-weight 16MB t256 u8: " + " | ".join(parts))
-        # ---- B. register GEMV at m=1 / m=8 vs the Triton config in use
-        gemv1 = [(1, 1, 8, 1), (1, 2, 8, 1), (1, 4, 4, 1), (1, 4, 8, 1), (1, 2, 4, 1), (1, 1, 4, 2), (1, 1, 8, 2), (1, 1, 4, 4), (1, 2, 2, 2)]
-        gemv1_router = [(1, 1, 4, 8), (1, 1, 8, 4), (1, 1, 2, 8)]
-        gemv8 = [(8, 1, 4, 1), (8, 1, 8, 1), (8, 2, 4, 1), (8, 1, 4, 2), (8, 1, 2, 2)]
-        gemv8_router = [(8, 1, 4, 8), (8, 1, 2, 8)]
-        for m, cands, cands_r in ((1, gemv1, gemv1_router), (8, gemv8, gemv8_router)):
-            for layer in ("pooler", "qkv_gate", "o", "unpooler", "router"):
+        # ---- B. m=1: Triton table vs register GEMV candidates
+        gemv1 = [(1, 2, 4, 1), (1, 1, 4, 2), (1, 2, 2, 2), (1, 2, 4, 2), (1, 4, 2, 2), (1, 1, 4, 4), (1, 2, 2, 4), (1, 2, 4, 4), (1, 1, 2, 4), (1, 1, 2, 8)]
+        gemv1_router = [(1, 1, 4, 8), (1, 1, 2, 8), (1, 2, 2, 8)]
+        for layer in ("pooler", "qkv_gate", "o", "unpooler", "router"):
+            if not budget():
+                break
+            N, K = layers[layer]
+            n = 1024 if layer == "unpooler" else N
+            parts = [row("triton", layer, 1, n, TAB)]
+            for mpad, rpw, unroll, ksplit in (gemv1_router if layer == "router" else gemv1):
+                parts.append(row(f"g{rpw}/{unroll}/{ksplit}", layer, 1, n, dict(gemv=True, mpad=mpad, rpw=rpw, unroll=unroll, ksplit=ksplit)))
+            print(f"  m=1 {layer:9s}: " + " | ".join(parts))
+        # ---- F. m=8/16/32: Triton table vs mma.sync register-streaming GEMM (mt, rpw, unroll, ksplit)
+        print("BENCH mma m=8/16/32: mma<rpw>/<unroll>/<ksplit> (mt = 1 for m <= 16, 2 for m = 32)")
+        mma_cfgs = [(4, 4, 8), (2, 8, 8), (2, 4, 8), (1, 8, 8), (2, 4, 4), (4, 2, 8), (1, 4, 4), (4, 2, 4)]
+        for layer in ("pooler", "qkv_gate", "unpooler", "o"):
+            N, K = layers[layer]
+            for m in (8, 16, 32):
                 if not budget():
                     break
-                N, K = layers[layer]
                 n = 1024 if (layer == "unpooler" and m <= 8) else N
-                parts = [row("triton", layer, m, n, None)]
-                for mpad, rpw, unroll, ksplit in (cands_r if layer == "router" else cands):
-                    parts.append(row(f"g{rpw}/{unroll}/{ksplit}", layer, m, n, dict(gemv=True, mpad=mpad, rpw=rpw, unroll=unroll, ksplit=ksplit)))
-                print(f"  m={m} {layer:9s}: " + " | ".join(parts))
-    except Exception as e:
-        print("  cuda part failed:", repr(e)[:200])
+                mt = 1 if m <= 16 else 2
+                parts = [row("triton", layer, m, n, TAB)]
+                for rpw, unroll, ksplit in mma_cfgs:
+                    parts.append(row(f"mma{rpw}/{unroll}/{ksplit}", layer, m, n, dict(mma=True, mt=mt, rpw=rpw, unroll=unroll, ksplit=ksplit)))
+                print(f"  m={m:2d} {layer:9s}: " + " | ".join(parts))
     _OVERRIDE = None
-    # ---- D. m=128/256: cuBLAS vs batched split-K vs Triton wgmma (row-major TMA and (128,64) tiles)
-    print("BENCH m=128/256 (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tiled, swap)")
-    big = [(128, 64, 4, 8, 4, True, False), (128, 64, 4, 8, 6, True, False), (128, 64, 2, 8, 6, True, False),
-           (128, 64, 4, 8, 4, False, False), (128, 64, 4, 8, 6, False, False), (128, 64, 4, 8, 6, True, True),
-           (64, 64, 4, 4, 8, True, True), (256, 64, 8, 8, 4, False, False)]
+    # ---- D. m=128/256: cuBLAS vs batched split-K vs 256-row wgmma tiles
+    print("BENCH m=128/256 (BLOCK_M, BLOCK_N, BLOCK_K, SPLIT_K, warps, stages)")
+    big = [(256, 128, 64, 4, 8, 4), (256, 64, 64, 4, 8, 4), (256, 64, 64, 2, 4, 4), (128, 128, 64, 4, 4, 6), (128, 128, 64, 2, 8, 6)]
     for layer in ("pooler", "unpooler", "qkv_gate", "o"):
         N, K = layers[layer]
         for m in (128, 256):
             if not budget():
                 break
             parts = [row("cuBLAS", layer, m, N, {"none": True})]
-            for sk in (2, 4, 8):
+            for sk in (2, 4):
                 parts.append(row(f"bmm{sk}", layer, m, N, dict(bmm=True, SPLIT_K=sk)))
-            for bn, bk, sk, nw, ns, tiled, swap in big:
-                cfg = dict(BLOCK_M=128, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tma=True, big=True,
-                           tiled=tiled, swap_mn=swap)
-                parts.append(row(f"{(bn, bk, sk, nw, ns, int(tiled), int(swap))}", layer, m, N, cfg))
+            for bm, bn, bk, sk, nw, ns in big:
+                if bm > m:
+                    continue
+                cfg = dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tma=True, big=True, tiled=True)
+                parts.append(row(f"{(bm, bn, bk, sk, nw, ns)}", layer, m, N, cfg))
             print(f"  {layer:9s} m={m}: " + " | ".join(parts))
-    # ---- E. router m=128/256: cat + cuBLAS vs bmm(hi, lo) vs Triton two-weight GEMM
-    print("BENCH router m=128/256 (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tiled)")
-    rbig = [(32, 64, 16, 8, 4, False), (32, 64, 16, 8, 6, False), (64, 64, 8, 8, 4, False), (32, 128, 8, 8, 4, False),
-            (32, 64, 16, 8, 6, True), (32, 128, 16, 8, 4, True), (64, 64, 16, 8, 4, False)]
+    # ---- E. router m=128/256
+    print("BENCH router m=128/256 (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages)")
+    rbig = [(32, 128, 8, 8, 4), (32, 128, 8, 8, 6), (32, 128, 16, 8, 4), (64, 128, 8, 8, 4), (32, 256, 8, 8, 3)]
     for m in (128, 256):
         if not budget():
             break
-        parts = [row("cat+mm", "router", m, 256, {"none": True}), row("bmm2", "router", m, 256, dict(bmm=True, SPLIT_K=2))]
-        for bn, bk, sk, nw, ns, tiled in rbig:
-            cfg = dict(BLOCK_M=128, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tma=True, tiled=tiled)
-            parts.append(row(f"{(bn, bk, sk, nw, ns, int(tiled))}", "router", m, 256, cfg))
+        parts = [row("cat+mm", "router", m, 256, {"none": True})]
+        for bn, bk, sk, nw, ns in rbig:
+            cfg = dict(BLOCK_M=128, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tma=True)
+            parts.append(row(f"{(bn, bk, sk, nw, ns)}", "router", m, 256, cfg))
         print(f"  router m={m}: " + " | ".join(parts))
-    # ---- C. Triton m=16/32: deeper / narrower pipelines (tiled packings), 2 CTAs per SM, m-tile pairs
-    print("BENCH m=16/32 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma); m32/bm16 = two m-tiles, m-fastest grid")
-    plan = {
-        "pooler":   [(32, 128, 1, 4, 8, True), (32, 128, 1, 4, 12, True), (32, 128, 2, 4, 8, True), (64, 128, 1, 4, 6, True),
-                     (32, 128, 1, 4, 8, False)],
-        "qkv_gate": [(32, 128, 4, 4, 8, True), (32, 128, 2, 4, 8, True), (64, 128, 2, 4, 6, True), (32, 128, 4, 4, 8, False),
-                     (32, 256, 2, 4, 6, True)],
-        "unpooler": [(32, 128, 1, 4, 8, True), (32, 128, 2, 4, 8, True), (64, 128, 1, 4, 6, True)],
-        "o":        [(32, 128, 1, 4, 8, True), (64, 128, 1, 4, 6, True), (32, 256, 1, 4, 6, True)],
-        "router":   [(32, 128, 16, 4, 6, True), (32, 64, 16, 4, 8, True), (32, 128, 8, 4, 8, True)],
-    }
-    full = ("pooler", "qkv_gate")
-    for layer, cfgs in plan.items():
-        N, K = layers[layer]
-        cur = f"cur m16 {row('', layer, 16, N, None)} m32 {row('', layer, 32, N, None)}"
-        for bn, bk, sk, nw, ns, tma in cfgs:
-            if not budget():
-                break
-            parts = []
-            for m, bm, swap in ((16, 16, False), (32, 32, False), (32, 16, True)):
-                if bm == 32 and layer not in full:
-                    continue
-                cfg = dict(BLOCK_M=bm, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma, swap_mn=swap)
-                parts.append(row(f"m{m}/bm{bm}", layer, m, N, cfg))
-            print(f"  {layer:9s} {str((bn, bk, sk, nw, ns, tma)):30s} {cur} | " + " | ".join(parts))
     _OVERRIDE = None
     print(f"BENCH proj done in {time.time() - t0:.0f}s")
 

@@ -9,6 +9,7 @@ import torch
 import reference as R
 import submission as S
 S.BENCH = False
+S.GEMV_SHAPES = {}; S.MMA_SHAPES = {}; S.BMM_SHAPES = {}   # CUDA-only paths
 
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"
 dev = "cpu"

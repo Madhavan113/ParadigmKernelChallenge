@@ -7,7 +7,7 @@ s = open("/tmp/proj.sass").read()
 funcs = re.split(r"\n\s*Function : ", s)
 want = sys.argv[1:] or ["stream_kernelILi16ELi256", "stream_kernelILi4ELi256", "gemv_kernelILi1ELi1ELi8ELi1ELb0",
                         "gemv_kernelILi1ELi4ELi4ELi1", "gemv_kernelILi8ELi1ELi4ELi1ELb0", "gemv_kernelILi1ELi1ELi4ELi8ELb1"]
-keep = {"LDG", "FFMA", "LOP3", "SHF", "BRA", "BAR", "SHFL", "STG", "PRMT", "FADD", "LDS", "STS", "RED", "ATOMS", "DEPBAR", "LDGSTS"}
+keep = {"HMMA", "LDG", "FFMA", "LOP3", "SHF", "BRA", "BAR", "SHFL", "STG", "PRMT", "FADD", "LDS", "STS", "RED", "ATOMS", "DEPBAR", "LDGSTS"}
 for f in funcs[1:]:
     name = f.split("\n")[0]
     if not any(w in name for w in want):
@@ -26,5 +26,5 @@ for f in funcs[1:]:
             out[-1][1] += 1
         else:
             out.append([op, 1])
-    print("==", re.search(r"(stream_kernel|gemv_kernel)\w+", name).group(0)[:48], len(seq), "instrs")
+    print("==", re.search(r"(stream_kernel|gemv_kernel|skinny_mma_kernel)\w+", name).group(0)[:48], len(seq), "instrs")
     print("  ", " ".join(f"{o}x{c}" if c > 1 else o for o, c in out if o in keep))
