@@ -524,7 +524,7 @@ def _plan(cfg):
 
 
 _PLAN_OVERRIDE = None   # dict of plan keys to force, during benchmarking
-ATTN_BENCH = False      # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
+ATTN_BENCH = True       # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
 _BENCH_DONE = False
 
 
@@ -584,22 +584,22 @@ def _attn_bench(data):
              "B16 L8 sliding": (16, 8, W), "B16 L8 full": (16, 8, 0), "B32 L8 sliding": (32, 8, W), "B32 L8 full": (32, 8, 0)}
     bd = dict(hp=2, bd=True, stages=5, block_t=64)                   # both heads per CTA, whole 128B rows
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128)      # one head per CTA
+    w8 = dict(nw, block_t=64, warps=8)
+    sq = dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=4)
     plans = {
-        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16, abl=1), dict(bd, splits=16, abl=2), dict(bd, splits=16, qk8=True, abl=1),
-                        dict(bd, splits=16, rb=64), dict(bd, splits=16, rb=64, stages=7), dict(bd, splits=16, rb=64, block_t=128),
-                        dict(nw, splits=16, rb=64), dict(nw, splits=16, rb=64, block_t=64), dict(bd, splits=32, rb=64),
-                        dict(bd, splits=16, stages=8), dict(bd, splits=16, rb=64, abl=1)],
-        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=8, abl=1), dict(bd, splits=8, rb=64), dict(bd, splits=16, rb=64),
-                        dict(bd, splits=8, rb=64, stages=7)],
-        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, abl=1), dict(nw, splits=8, abl=2), dict(nw, splits=8, stages=8),
-                        dict(bd, splits=8, warps=8), dict(bd, splits=16, warps=8), dict(bd, splits=4, warps=8), dict(bd, splits=8, warps=8, stages=7),
-                        dict(bd, splits=8, warps=8, block_t=128), dict(bd, splits=8, warps=8, abl=1), dict(bd, splits=8, warps=16),
-                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=8, splits=8),
-                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=128, warps=8, splits=8),
-                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=8, splits=16)],
-        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, abl=1), dict(nw, splits=4, abl=2), dict(bd, splits=4, warps=8),
-                        dict(bd, splits=8, warps=8), dict(bd, splits=4, warps=16),
-                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=8, splits=4)],
+        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, ch=16), dict(nw, splits=16, ch=4), dict(nw, splits=8, ch=8)],
+        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=128, ch=16), dict(nw, splits=64, ch=16), dict(nw, splits=128, g1=8, ch=16)],
+        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16, stages=8), dict(bd, splits=16, stages=6), dict(bd, splits=16, stages=8, pf=False)],
+        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=8, stages=8), dict(bd, splits=8, stages=6)],
+        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, ch=8), dict(w8, splits=32, g1=4), dict(w8, splits=32, g1=4, ch=8),
+                          dict(w8, splits=32, ch=2), dict(w8, splits=16, ch=8), dict(w8, splits=32, g1=8, ch=8)],
+        "B1 L8 full": [dict(nw, splits=64, warps=8), dict(nw, splits=64, warps=8, ch=8), dict(nw, splits=64, warps=8, g1=16, ch=8),
+                       dict(nw, splits=128, warps=8, ch=8), dict(nw, splits=64, warps=8, g1=8, ch=8)],
+        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, ch=8)],
+        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, stages=8), dict(nw, splits=8, stages=6), dict(sq, splits=8), dict(sq, splits=16),
+                        dict(nw, splits=8, stages=8, pf=False)],
+        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, ch=8)],
+        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, stages=8), dict(nw, splits=4, stages=6), dict(sq, splits=4)],
     }
     cases = {k: v for k, v in cases.items() if k in plans}
     for name, (B, L, window) in cases.items():
@@ -659,7 +659,7 @@ def _attention_forward(data) -> torch.Tensor:
     page_table = data["page_table"]
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
-    ch = min(max(g1, g2), 8 if rb <= 16 else (4 if rb <= 64 else 1))   # partial sets merged per load group
+    ch = min(max(g1, g2), int(plan.get("ch") or (8 if rb <= 16 else (4 if rb <= 64 else 1))))   # partial sets merged per load group
     extra = {}
     if plan.get("maxnreg"):
         extra["maxnreg"] = plan["maxnreg"]
