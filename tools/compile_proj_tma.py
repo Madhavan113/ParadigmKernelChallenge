@@ -22,4 +22,4 @@ print("ttgir: async_tma_copy", count(r"async_tma_copy_global_to_local", ttgir), 
       "| warp_group_dot", count(r"warp_group_dot", ttgir), "| local_alloc", count(r"local_alloc", ttgir))
 print("ptx: cp.async.bulk.tensor", count(r"cp\.async\.bulk\.tensor", ptx), "| mbarrier", count(r"mbarrier", ptx), "| wgmma", count(r"wgmma\.mma_async", ptx),
       "| mma.sync", count(r"mma\.sync", ptx), "| ldmatrix", count(r"ldmatrix", ptx), "| shared", k.metadata.shared, "| local", bool(re.search(r"\.local", ptx)))
-open(f"/work/tools/out_tma_{BM}_{BN}_{BK}_{SK}_{TW}_{NW}_{NS}.ptx", "w").write(ptx)
+open(f"/work/tools/out_tma_{BM}_{BN}_{BK}_{SK}_{TW}_{NW}_{NS}.ptx", "w").write(ptx); open(f"/work/tools/out_tma_{BM}_{BN}_{BK}_{SK}_{TW}_{NW}_{NS}.ttgir", "w").write(ttgir)
