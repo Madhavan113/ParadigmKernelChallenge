@@ -14,6 +14,7 @@ import triton.language as tl
 S.ACT_DTYPE = tl.float16
 S.FP8_ASM = False
 S.ATTN_BENCH = False
+S.SLIDING_CUDA = False   # the CUDA kernel cannot run under the interpreter
 
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"
 dev = "cpu"
