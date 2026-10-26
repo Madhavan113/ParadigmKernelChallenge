@@ -1584,7 +1584,7 @@ _PDL_OVERRIDE = None   # bench: False forces plain launches
 WT_BIG = {128: (4, 2, 1, 2, 1), 100000: (4, 2, 1, 2, 1)}
 MIXED_MIN_TOKENS = 1000000000
 _MIXED_OVERRIDE = None
-L2PF_MAX_TOKENS = 0   # up to this many tokens GEMM2 prefetches its W2 slice into L2 while GEMM1 runs (PDL)
+L2PF_MAX_TOKENS = 0   # the W2 L2-prefetch experiment was removed from the kernel (illegal-instruction fault): inert
 _L2PF_OVERRIDE = None
 
 
