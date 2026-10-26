@@ -2623,23 +2623,7 @@ def _bench(state):
     TAB = {"table": True}
     print("BENCH proj, judge protocol (us per replay minus fixed cost; '!' = rel err above tol)")
     if ext is not None:
-        print("BENCH 12-bit cp.async mma GEMM (rpw, nstage, sk) vs the table at m=8/16/32")
-        m12 = {1: [(1, 4, 4, 1), (1, 4, 3, 2), (1, 2, 4, 1), (1, 2, 3, 2), (1, 1, 4, 1)],
-               2: [(2, 4, 2, 1), (2, 2, 3, 1), (2, 1, 3, 1), (2, 2, 2, 2)]}
-        m12r = {1: [(1, 4, 2, 1), (1, 2, 4, 1), (1, 2, 2, 2), (1, 1, 4, 1)], 2: [(2, 4, 1, 1), (2, 2, 2, 1), (2, 1, 4, 1)]}
-        for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192), ("unpooler", 1024)):
-            for m in (8, 16, 32):
-                if not budget():
-                    break
-                if layer == "unpooler" and ((n == 1024) != (m <= 8)):
-                    continue
-                mt = 1 if m <= 16 else 2
-                parts = [row("table", layer, m, n, TAB)]
-                for mt_, rpw, nstage, sk in m12[mt]:
-                    parts.append(row(f"cp {rpw}/{nstage}/{sk}", layer, m, n, dict(m12cp=True, mt=mt_, rpw=rpw, nstage=nstage, sk=sk)))
-                for mt_, rpw, unroll, sk in m12r[mt]:
-                    parts.append(row(f"rg {rpw}/{unroll}/{sk}", layer, m, n, dict(m12=True, mt=mt_, rpw=rpw, unroll=unroll, sk=sk)))
-                print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
+        # (the mma12 / mma12cp sweep is off: its rpw=1 configs raise a sticky misaligned-address error)
         print("BENCH w12 (MoE-style weights-as-M 12-bit GEMM; nt/nstage/sk) vs the table at m=8/16/32")
         w12c = {"pooler": [4, 8], "unpooler": [2, 4, 8], "qkv_gate": [8, 16], "o": [2, 4]}
         for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192), ("unpooler", 1024)):
@@ -2655,14 +2639,6 @@ def _bench(state):
                     for ns in ((4, 8) if nt == 1 else (2, 4)):
                         parts.append(row(f"w12 {nt}/{ns}/{sk}", layer, m, n, dict(w12=True, nt=nt, nstage=ns, sk=sk)))
                 print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
-        print("BENCH m=1 12-bit GEMV, more CTAs for qkv / the unpooler slice")
-        for layer, n, cands in (("pooler", 4096, [(8, 1, 4), (8, 1, 8), (4, 2, 4), (16, 1, 2)]), ("qkv_gate", 2304, [(8, 1, 8), (8, 1, 4)])):
-            if not budget():
-                break
-            parts = [row("current", layer, 1, n, None), row("triton", layer, 1, n, TAB)]
-            for warps, unroll, sk in cands:
-                parts.append(row(f"p12 {warps}/{unroll}/{sk}", layer, 1, n, dict(g12=True, warps=warps, unroll=unroll, sk=sk)))
-            print(f"  m=1 {layer:9s} n={n}: " + " | ".join(parts))
     _OVERRIDE = None
     print(f"BENCH proj done in {time.time() - t0:.0f}s")
 
