@@ -2168,7 +2168,7 @@ M12_SHAPES = {}
 # (layer, n, m) -> (mt, rpw, nstage, sk): the cp.async-staged 12-bit mma GEMM (m <= 32)
 M12CP_SHAPES = {}
 # w12: the MoE-style weights-as-M 12-bit GEMM: (layer, n, m) -> (nt, nstage, sk); empty until the judge shows a win
-W12_SHAPES = {("pooler", 4096, 8): (1, 4, 4), ("qkv_gate", 2304, 8): (1, 4, 8)}   # check 7aded91c: 17.1 vs 18.0, 11.1 vs 11.4;
+W12_SHAPES = {}   # w12 ties the table at m=8 on the judge (check a6b2bd96: pooler 18.34 vs 18.18, qkv 14.36 vs 14.28) and loses at
 # m=16/32 stay on the table (the w12 GEMM alone is at the memory wall, ~13-17 us, but its K-split reduce launch costs 3-5 us)
 # (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
 T12_SHAPES = {}
