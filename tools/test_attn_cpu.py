@@ -31,7 +31,10 @@ if not fast:
         (1, 4000, "tp8", "full", 1, "fixed", "coherent", 1, 1.0),
         (2, 1500, "dp", "full", 8, "mixed", "normal", 64, 1.0),
     ]
-for i, (batch, ctx, heads, layer, q_len, spread, dist, page, kv_scale) in enumerate(cases):
+# every case with the default plan (2 heads per CTA), then the fast cases again with 1 head per CTA
+runs = [(c, None) for c in cases] + [(c, dict(hp=1)) for c in cases[:5]]
+for i, ((batch, ctx, heads, layer, q_len, spread, dist, page, kv_scale), override) in enumerate(runs):
+    S._PLAN_OVERRIDE = override
     data = R.generate_input(batch, ctx, heads, layer, seed=1000 + i, q_len=q_len, spread=spread,
                             dist=dist, page=page, kv_scale=kv_scale, device=dev)
     t = time.time()
@@ -46,7 +49,7 @@ for i, (batch, ctx, heads, layer, q_len, spread, dist, page, kv_scale) in enumer
     raw = R.collect(data, out)
     ok, msg = R.check_implementation(data, raw)
     print(f"b={batch} ctx={ctx} {heads} {layer:7s} L={q_len} {spread:6s} {dist:8s} page={page:2d} "
-          f"kv={kv_scale:<8g} {time.time()-t:6.1f}s -> {ok} {msg}", flush=True)
+          f"kv={kv_scale:<8g} plan={override} {time.time()-t:6.1f}s -> {ok} {msg}", flush=True)
     cnt = [v for k, v in S._WS.items()]
     for _, _, c in cnt:
         assert int(c.abs().sum()) == 0, "tickets not reset"
