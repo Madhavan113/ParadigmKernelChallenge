@@ -361,12 +361,33 @@ __device__ __forceinline__ uint32_t e4m3x2_hi16_to_f16x2(uint32_t w) {
     return r;
 }
 
+__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(bar), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+    asm volatile("{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+                 :: "r"(bar), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+__device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void fence_mbar_init() { asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory"); }
+
+// programmatic dependent launch (no-ops when the kernel was launched without the attribute)
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
+
 constexpr int WT_NWARPS = 4;
 __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
     return tpw * WT_NWARPS * 1024 + tpw * WT_NWARPS * 128 + 8 * nt * A_STRIDE * 2;
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, bool TMA, int MODE = 0>
 __global__ void __launch_bounds__(128 * KS)
 moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     const int* __restrict__ sorted_tok,
@@ -374,21 +395,28 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     const int* __restrict__ blk_end, const int* __restrict__ nblk,
                     const uint8_t* __restrict__ Wr, const uint8_t* __restrict__ Sr, const float* __restrict__ gs,
                     __half* __restrict__ out16, __nv_bfloat16* __restrict__ out_bf, int ldo,
-                    float* __restrict__ part, int ldp, int part_rows, int* __restrict__ counters,
+                    float* __restrict__ part, int ldp, int part_rows,
                     int K, int NTILES, float gs_mul)
 {
-    // gridDim.z > 1: split-K; CTA z owns chunks [z*NC/KSPLIT, (z+1)*NC/KSPLIT) and writes its fp32 partial
-    // sums (times gs) to part[z][row][col] (GATED: gate at col, up at col + N/2); the last CTA to arrive at
-    // counters[(y, x)] sums the slices and writes the output (the counter resets itself).
+    // Weights: Wr[e][tile/4][chunk][tile%4][1 KB], scales Sr[e][tile/4][chunk][tile%4][128 B]: a 4-tile group's
+    // chunk is 4 KB contiguous (a chunk-major layout measured no better).
+    // PDL: GATED (GEMM1) waits for the routing lists first; else (GEMM2) the weights only need the lists (already
+    // complete) so their prologue is issued before waiting for GEMM1's inter. TMA: thread 0 issues cp.async.bulk copies (per chunk: TPC/4 weight groups, TPC/4
+    // scale groups, the valid token rows) tracked by one mbarrier per stage; else 16 B cp.async by all threads.
+    // SPLITK: gridDim.z CTAs split K; CTA z owns chunks [z*NC/KSPLIT, (z+1)*NC/KSPLIT) and stores its fp32
+    // partial sums (times gs) to part[z][row][col] (GATED: gate at col, up at col + N/2) for the reduce kernels.
     constexpr int TPW = (GATED ? 2 : 1) * MW;        // m16 weight tiles per warp
     constexpr int TPC = TPW * WT_NWARPS;              // per CTA
+    constexpr int GT = WT_NWARPS * MW;                // gate (or all) tiles per CTA = 4-tile groups * 4
+    constexpr int NGRP = TPC / 4;                     // 4-tile groups per CTA
     constexpr int W_STAGE = TPC * 1024;
     constexpr int S_STAGE = TPC * 128;
     constexpr int STAGE_BYTES = wt_stage_bytes(TPW, NT);
     constexpr int NTHR = 128 * KS;
     constexpr int CH = NT == 1 ? 2 : 1;               // accumulator chains per tile (latency)
-    extern __shared__ __align__(16) uint8_t wt_smem[];
+    extern __shared__ __align__(128) uint8_t wt_smem[];
 
+    if (GATED) pdl_wait();                            // the routing lists come from the previous launch
     const int j = blockIdx.y;
     if (j >= *nblk) return;
     const int e = blk_e[j];
@@ -402,52 +430,108 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     const int NC_ALL = K / KC;
     const int NC = NC_ALL / KSPLIT;                   // chunks of this CTA
     const int c0 = SPLITK ? (int)blockIdx.z * NC : 0;
+    const int NG = NTILES / 4;                        // 4-tile groups per expert
 
-    // CTA tile ti (0..TPC-1) -> global m16 tile index
+    // CTA tile ti = warp * TPW + i -> global m16 tile and its smem slot (TMA lands whole groups: gate groups first)
     auto tile_of = [&](int ti) {
         const int w = ti / TPW, i = ti % TPW;
         int tile = (blockIdx.x * WT_NWARPS + w) * MW + (i % MW);
         if (GATED && i >= MW) tile += NTILES / 2;
         return tile;
     };
-    const size_t ebase = (size_t)e * NTILES;
+    auto slot_of = [&](int ti) {
+        if (!TMA) return ti;
+        const int w = ti / TPW, i = ti % TPW;
+        return (GATED && i >= MW ? GT : 0) + w * MW + (i % MW);
+    };
+    const size_t ebase = (size_t)e * NG;
+    // global address of (tile, chunk c) weights / scales
+    constexpr size_t WCH = 4096, SCH = 512;             // bytes per (group, chunk): the chunk stride within a group
+    auto waddr = [&](int tile, int c) { return Wr + ((ebase + (tile >> 2)) * NC_ALL + c) * 4096 + (tile & 3) * 1024; };
+    auto saddr = [&](int tile, int c) { return Sr + ((ebase + (tile >> 2)) * NC_ALL + c) * 512 + (tile & 3) * 128; };
 
-    // cp.async segments of this thread, per chunk: WSEG weight segments (16B), one scale segment
-    // (threads < TPC*8) and XSEG token-row segments; sources advance by a constant per chunk.
+    const uint32_t smem_base = smem_u32(wt_smem);
+    const uint32_t bars = smem_base + NSTAGE * STAGE_BYTES;      // TMA: one mbarrier per stage
+
+    // ---- cp.async issue (all threads) ----
     constexpr int WSEG = TPC * 64 / NTHR;
     constexpr int XSEG = (NT * 128 + NTHR - 1) / NTHR;
-    const uint8_t* wsrc[WSEG];
-    #pragma unroll
-    for (int i = 0; i < WSEG; ++i) {
-        const int sidx = tid + i * NTHR;
-        wsrc[i] = Wr + ((ebase + tile_of(sidx >> 6)) * NC_ALL + c0) * 1024 + (sidx & 63) * 16;
+    const uint8_t* wsrc[TMA ? 1 : WSEG];
+    const uint8_t* ssrc = nullptr;
+    const __half* xsrc[TMA ? 1 : XSEG]; int xbytes[TMA ? 1 : XSEG];
+    if constexpr (!TMA) {
+        #pragma unroll
+        for (int i = 0; i < WSEG; ++i) {
+            const int sidx = tid + i * NTHR;
+            wsrc[i] = waddr(tile_of(sidx >> 6), c0) + (sidx & 63) * 16;
+        }
+        ssrc = saddr(tile_of((tid & (TPC * 8 - 1)) >> 3), c0) + (tid & 7) * 16;
+        #pragma unroll
+        for (int i = 0; i < XSEG; ++i) {
+            const int sidx = tid + i * NTHR;
+            const int r = sidx >> 4;
+            const bool valid = (sidx < NT * 128) && (r < nrows);
+            const int tok = valid ? (GATED ? sorted_tok[row0 + r] : row0 + r) : 0;
+            xsrc[i] = X + (size_t)tok * ldx + c0 * KC + (sidx & 15) * 8;
+            xbytes[i] = (valid && MODE != 4) ? 16 : 0;
+        }
     }
-    const uint8_t* ssrc = Sr + ((ebase + tile_of((tid & (TPC * 8 - 1)) >> 3)) * NC_ALL + c0) * 128 + (tid & 7) * 16;
-    const __half* xsrc[XSEG]; int xbytes[XSEG];
-    #pragma unroll
-    for (int i = 0; i < XSEG; ++i) {
-        const int sidx = tid + i * NTHR;
-        const int r = sidx >> 4;
-        const bool valid = (sidx < NT * 128) && (r < nrows);
-        const int tok = valid ? (GATED ? sorted_tok[row0 + r] : row0 + r) : 0;
-        xsrc[i] = X + (size_t)tok * ldx + c0 * KC + (sidx & 15) * 8;
-        xbytes[i] = valid ? 16 : 0;
-    }
-    const uint32_t smem_base = smem_u32(wt_smem);
-
-    auto issue = [&](int c, int stage) {
+    auto issue_w = [&](int c, int stage) {
         const uint32_t ws = smem_base + stage * STAGE_BYTES;
         const uint32_t ss = ws + W_STAGE;
-        const uint32_t xs = ss + S_STAGE;
         #pragma unroll
         for (int i = 0; i < WSEG; ++i)
-            cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 1024, 16);
-        if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * 128, 16);
+            cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * WCH, 16);
+        if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * SCH, 16);
+    };
+    auto issue_x = [&](int c, int stage) {
+        const uint32_t xs = smem_base + stage * STAGE_BYTES + W_STAGE + S_STAGE;
         #pragma unroll
         for (int i = 0; i < XSEG; ++i) {
             const int sidx = tid + i * NTHR;
             if (sidx < NT * 128)
                 cp_async16(xs + ((sidx >> 4) * A_STRIDE + (sidx & 15) * 8) * 2, xsrc[i] + c * KC, xbytes[i]);
+        }
+    };
+    auto issue = [&](int c, int stage) { issue_w(c, stage); issue_x(c, stage); };
+
+    // ---- TMA issue, distributed: lane 0 of warps 0..NGRP-1 copies one weight group (+ scales), the lanes of the
+    // last warp copy one token row each, thread 0 registers the stage's byte count on the stage's mbarrier ----
+    const int nvalid = nrows < 8 * NT ? nrows : 8 * NT;
+    const __half* xrow_lane = nullptr;                      // last warp, lane r < nvalid: token row r
+    const uint8_t* wgrp_src = nullptr; const uint8_t* sgrp_src = nullptr;   // warps < NGRP, lane 0
+    if constexpr (TMA) {
+        if (warp == WT_NWARPS - 1 && lane < nvalid) {
+            const int tok = GATED ? sorted_tok[row0 + lane] : row0 + lane;
+            xrow_lane = X + (size_t)tok * ldx + c0 * KC;
+        }
+        if (warp < NGRP) {
+            int grp = blockIdx.x * MW + (warp % MW);
+            if (GATED && warp >= MW) grp += NG / 2;
+            wgrp_src = Wr + ((ebase + grp) * NC_ALL + c0) * 4096;
+            sgrp_src = Sr + ((ebase + grp) * NC_ALL + c0) * 512;
+        }
+        if (tid == 0) {
+            #pragma unroll
+            for (int st = 0; st < NSTAGE; ++st) mbar_init(bars + 8 * st, 1);
+            fence_mbar_init();
+        }
+        __syncthreads();
+    }
+    auto issue_tma = [&](int c, int stage) {
+        const uint32_t ws = smem_base + stage * STAGE_BYTES;
+        const uint32_t ss = ws + W_STAGE;
+        const uint32_t xs = ss + S_STAGE;
+        const uint32_t bar = bars + 8 * stage;
+        if (tid == 0) mbar_expect_tx(bar, (uint32_t)(W_STAGE + S_STAGE + nvalid * KC * 2));
+        if (lane == 0 && warp < NGRP) {
+            fence_proxy_async();
+            bulk_g2s(ws + warp * 4096, wgrp_src + (size_t)c * WCH, 4096, bar);
+            bulk_g2s(ss + warp * 512, sgrp_src + (size_t)c * SCH, 512, bar);
+        }
+        if (warp == WT_NWARPS - 1 && lane < nvalid) {
+            fence_proxy_async();
+            bulk_g2s(xs + lane * A_STRIDE * 2, xrow_lane + c * KC, KC * 2, bar);
         }
     };
 
@@ -461,38 +545,71 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
 
     const float gsf = gs[e] * gs_mul;                                   // gs * 64: applied to the fp32 sums
 
-    #pragma unroll
-    for (int st = 0; st < NSTAGE - 1; ++st) {
-        if (st < NC) issue(st, st);
+    if constexpr (TMA) {
+        if (!GATED) pdl_wait();
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st)
+            if (st < NC) issue_tma(st, st);
+    } else if (GATED) {
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st) {
+            if (st < NC) issue(st, st);
+            cp_async_commit();
+        }
+    } else {
+        // weights first (one group), then wait for GEMM1's inter, then the token rows (one group)
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st)
+            if (st < NC) issue_w(st, st);
+        cp_async_commit();
+        pdl_wait();
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st)
+            if (st < NC) issue_x(st, st);
         cp_async_commit();
     }
 
     for (int c = 0; c < NC; ++c) {
-        cp_async_wait<NSTAGE - 2>();
-        __syncthreads();
-        {
+        const int stage = c % NSTAGE;
+        if constexpr (TMA) {
+            __syncthreads();                                         // everyone is done with stage (c-1) % NSTAGE
+            {
+                const int cn = c + NSTAGE - 1;
+                if (cn < NC) issue_tma(cn, cn % NSTAGE);
+            }
+            mbar_wait(bars + 8 * stage, (uint32_t)((c / NSTAGE) & 1));
+        } else {
+            if (!GATED && c == 0) cp_async_wait<0>();     // the two prologue groups
+            else cp_async_wait<NSTAGE - 2>();
+            __syncthreads();
             const int cn = c + NSTAGE - 1;
             if (cn < NC) issue(cn, cn % NSTAGE);
             cp_async_commit();
         }
-        const uint8_t* ws = wt_smem + (c % NSTAGE) * STAGE_BYTES;
+        const uint8_t* ws = wt_smem + stage * STAGE_BYTES;
         const uint8_t* ss = ws + W_STAGE;
         const __half* xs = reinterpret_cast<const __half*>(ss + S_STAGE);
+        if constexpr (MODE == 1) {                                   // loads only: touch one word per warp
+            if (lane == 0) acc[0][0][0] += __uint_as_float(*reinterpret_cast<const uint32_t*>(ws + warp * 16)) * 1e-30f;
+            continue;
+        }
         #pragma unroll
         for (int hh = 0; hh < 2 / KS; ++hh) {
             const int h = KS == 1 ? hh : gidx;                       // half chunk: k16 steps 4h..4h+3
             uint4 wq[TPW]; uint2 sq[TPW];
             #pragma unroll
             for (int i = 0; i < TPW; ++i) {
-                wq[i] = *reinterpret_cast<const uint4*>(ws + ((warp * TPW + i) * 2 + h) * 512 + lane * 16);
-                sq[i] = *reinterpret_cast<const uint2*>(ss + (warp * TPW + i) * 128 + g * 16 + h * 8);
+                const int sl = slot_of(warp * TPW + i);
+                wq[i] = *reinterpret_cast<const uint4*>(ws + (sl * 2 + h) * 512 + lane * 16);
+                sq[i] = *reinterpret_cast<const uint2*>(ss + sl * 128 + g * 16 + h * 8);
             }
             #pragma unroll
             for (int ps = 0; ps < 2; ++ps) {                         // steps 2ps, 2ps+1 of the half
                 uint32_t b[NT][4];
                 #pragma unroll
                 for (int nb = 0; nb < NT; ++nb) {
-                    if (nb < ntb)
+                    if (MODE == 4) { b[nb][0] = b[nb][1] = b[nb][2] = b[nb][3] = 0u; }
+                    else if (nb < ntb)
                         ldmatrix_x4(b[nb][0], b[nb][1], b[nb][2], b[nb][3],
                                     smem_u32(xs + (nb * 8 + (lane & 7)) * A_STRIDE + h * 64 + ps * 32 + (lane >> 3) * 8));
                 }
@@ -510,20 +627,29 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                         const uint32_t elo = w & 0x9C9C9C9Cu;
                         const uint32_t ehi = ((w << 2) & 0x8C8C8C8Cu) | ((w >> 2) & 0x10101010u);
                         uint32_t a[4];
-                        a[0] = f16x2_mul(e4m3x2_lo16_to_f16x2(elo), S0);
-                        a[1] = f16x2_mul(e4m3x2_hi16_to_f16x2(elo), S1);
-                        a[2] = f16x2_mul(e4m3x2_lo16_to_f16x2(ehi), S0);
-                        a[3] = f16x2_mul(e4m3x2_hi16_to_f16x2(ehi), S1);
-                        #pragma unroll
-                        for (int nb = 0; nb < NT; ++nb) {
-                            if (nb < ntb) mma16816(acc[i][nb * CH + (CH == 2 ? q : 0)], a, b[nb][2 * q], b[nb][2 * q + 1]);
+                        if constexpr (MODE == 2) {                   // no dequant: raw words as fragments
+                            a[0] = w; a[1] = sw; a[2] = elo; a[3] = ehi;
+                        } else {
+                            a[0] = f16x2_mul(e4m3x2_lo16_to_f16x2(elo), S0);
+                            a[1] = f16x2_mul(e4m3x2_hi16_to_f16x2(elo), S1);
+                            a[2] = f16x2_mul(e4m3x2_lo16_to_f16x2(ehi), S0);
+                            a[3] = f16x2_mul(e4m3x2_hi16_to_f16x2(ehi), S1);
+                        }
+                        if constexpr (MODE == 3) {                   // no MMA: keep the fragments live
+                            acc[i][0][0] += __uint_as_float((a[0] ^ a[1] ^ a[2] ^ a[3]) & 0x007FFFFFu);
+                        } else {
+                            #pragma unroll
+                            for (int nb = 0; nb < NT; ++nb) {
+                                if (nb < ntb) mma16816(acc[i][nb * CH + (CH == 2 ? q : 0)], a, b[nb][2 * q], b[nb][2 * q + 1]);
+                            }
                         }
                     }
                 }
             }
         }
     }
-    cp_async_wait<0>();
+    pdl_trigger();                                    // main loop done: the next kernel may start launching
+    if constexpr (!TMA) cp_async_wait<0>();
 
     if (KS == 2) {
         __syncthreads();                                   // the ring is free: reuse it for the reduction
@@ -554,7 +680,6 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
 
     // C fragment: rows (weight rows) g, g+8 of the tile -> output column; cols (tokens) 2t, 2t+1
     if constexpr (SPLITK) {
-        __shared__ int s_last;
         #pragma unroll
         for (int i = 0; i < MW; ++i) {
             const int tile = (blockIdx.x * WT_NWARPS + warp) * MW + i;
@@ -573,16 +698,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     }
                 }
         }
-        __threadfence();
-        __syncthreads();
-        if (tid == 0) {
-            const int old = atomicAdd(counters + blockIdx.y * gridDim.x + blockIdx.x, 1);
-            s_last = (old == KSPLIT - 1);
-            if (old == KSPLIT - 1) counters[blockIdx.y * gridDim.x + blockIdx.x] = 0;
-        }
-        __syncthreads();
-        if (!s_last) return;
-        __threadfence();
+        return;
     }
     #pragma unroll
     for (int i = 0; i < MW; ++i) {
@@ -596,16 +712,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                 for (int cc = 0; cc < 2; ++cc) {
                     const int tok = nb * 8 + 2 * t + cc;
                     if (tok >= nrows) continue;
-                    float gv = acc[i][nb * CH][2 * hr + cc] * gsf;
-                    float uv = GATED ? acc[MW + i][nb * CH][2 * hr + cc] * gsf : 0.f;
-                    if constexpr (SPLITK) {
-                        for (int z = 0; z < KSPLIT; ++z) {
-                            if (z == (int)blockIdx.z) continue;
-                            const float* pp = part + ((size_t)z * part_rows + row0 + tok) * ldp + col;
-                            gv += __ldcg(pp);
-                            if (GATED) uv += __ldcg(pp + (size_t)NTILES * 8);
-                        }
-                    }
+                    const float gv = acc[i][nb * CH][2 * hr + cc] * gsf;
+                    const float uv = GATED ? acc[MW + i][nb * CH][2 * hr + cc] * gsf : 0.f;
                     const size_t o = (size_t)(row0 + tok) * ldo + col;
                     if (GATED) {
                         const float hv = gv / (1.f + __expf(-gv)) * uv;
@@ -619,45 +727,375 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, bool TMA, int MODE = 0>
 void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
-               float* part, int ldp, int part_rows, int* counters, int ksplit,
-               int K, int ntiles, int max_blocks, float gs_mul, cudaStream_t stream)
+               float* part, int ldp, int part_rows, int ksplit,
+               int K, int ntiles, int max_blocks, float gs_mul, bool pdl, cudaStream_t stream)
 {
     constexpr int TPW = (GATED ? 2 : 1) * MW;
-    constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT);
+    constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT) + (TMA ? NSTAGE * 8 : 0);
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         attr_set = true;
     }
     const int n_x = (GATED ? ntiles / 2 : ntiles) / (WT_NWARPS * MW);
-    dim3 grid(n_x, max_blocks, ksplit);
-    moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK><<<grid, 128 * KS, smem, stream>>>(
-        X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul);
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(n_x, max_blocks, ksplit);
+    cfg.blockDim = dim3(128 * KS);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA, MODE>,
+        X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, K, ntiles, gs_mul);
+    TORCH_CHECK(err == cudaSuccess, "wt launch failed: ", cudaGetErrorString(err));
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// Register-streaming variant for small batches: no shared-memory staging of weights. CTA = 4 warps, one m16 weight
+// tile per warp (GATED: warps 0,1 gate tiles t0,t0+1 and warps 2,3 the matching up tiles; the up accumulators cross
+// to the gate warps through smem for the fused SiLU). Each lane streams its tile's K range: per chunk 2 x 16 B of
+// fragment-ordered nibbles + 16 B of scales, in an unrolled ring of U chunks in flight (ld.global.nc, L1 bypass).
+// The 8*NT-token tile goes through an XST-stage cp.async ring (2 KB per chunk, L2-resident). SPLITK: gridDim.z CTAs
+// split K and store fp32 partial slices for the reduce kernels. MODE 1: loads only (bench ablation).
+// ---------------------------------------------------------------------------------------------
+__device__ __forceinline__ uint4 ldg_stream(const uint8_t* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+
+template <bool GATED, int NT, int U, bool SPLITK, int MODE>
+__global__ void __launch_bounds__(128)
+moe_w4a16_rs_kernel(const __half* __restrict__ X, int ldx,
+                    const int* __restrict__ sorted_tok,
+                    const int* __restrict__ blk_e, const int* __restrict__ blk_row0,
+                    const int* __restrict__ blk_end, const int* __restrict__ nblk,
+                    const uint8_t* __restrict__ Wr, const uint8_t* __restrict__ Sr, const float* __restrict__ gs,
+                    __half* __restrict__ out16, __nv_bfloat16* __restrict__ out_bf, int ldo,
+                    float* __restrict__ part, int ldp, int part_rows,
+                    int K, int NTILES, float gs_mul)
+{
+    constexpr int XST = 4;                            // token-tile stages
+    constexpr int X_STAGE = 8 * NT * A_STRIDE * 2;
+    constexpr int CH = NT == 1 ? 2 : 1;
+    __shared__ __align__(16) uint8_t xs_all[XST * X_STAGE];
+    __shared__ float xch[GATED ? 2 * 128 * NT * CH * 4 : 1];     // up accumulators of warps 2,3
+
+    if (GATED) pdl_wait();
+    const int j = blockIdx.y;
+    if (j >= *nblk) return;
+    const int e = blk_e[j];
+    const int row0 = blk_row0[j];
+    const int nrows = blk_end[j] - row0;
+    const int ntb = (nrows + 7) >> 3;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KSPLIT = SPLITK ? (int)gridDim.z : 1;
+    const int NC_ALL = K / KC;
+    const int NC = NC_ALL / KSPLIT;
+    const int c0 = SPLITK ? (int)blockIdx.z * NC : 0;
+    const int NG = NTILES / 4;
+    // this warp's tile: GATED: gate tiles 2*bx + (warp & 1), up tiles + NTILES/2 for warps 2,3; else 4*bx + warp
+    int tile = GATED ? blockIdx.x * 2 + (warp & 1) : blockIdx.x * 4 + warp;
+    if (GATED && warp >= 2) tile += NTILES / 2;
+    const size_t ebase = (size_t)e * NG;
+    const uint8_t* wbase = Wr + ((ebase + (tile >> 2)) * NC_ALL + c0) * 4096 + (tile & 3) * 1024 + lane * 16;
+    const uint8_t* sbase = Sr + ((ebase + (tile >> 2)) * NC_ALL + c0) * 512 + (tile & 3) * 128 + g * 16;
+
+    // token-tile ring (cp.async, all threads): segment sidx = tid (+128) -> row sidx>>4, 16 B piece sidx&15
+    constexpr int XSEG = NT;
+    const __half* xsrc[XSEG]; int xbytes[XSEG];
+    #pragma unroll
+    for (int i = 0; i < XSEG; ++i) {
+        const int sidx = tid + i * 128;
+        const int r = sidx >> 4;
+        const bool valid = r < nrows;
+        const int tok = valid ? (GATED ? sorted_tok[row0 + r] : row0 + r) : 0;
+        xsrc[i] = X + (size_t)tok * ldx + c0 * KC + (sidx & 15) * 8;
+        xbytes[i] = (valid && MODE != 4) ? 16 : 0;
+    }
+    const uint32_t xs_base = smem_u32(xs_all);
+    auto issue_x = [&](int c, int stage) {
+        #pragma unroll
+        for (int i = 0; i < XSEG; ++i) {
+            const int sidx = tid + i * 128;
+            cp_async16(xs_base + stage * X_STAGE + ((sidx >> 4) * A_STRIDE + (sidx & 15) * 8) * 2, xsrc[i] + c * KC, xbytes[i]);
+        }
+    };
+    if (!GATED) pdl_wait();                           // inter comes from GEMM1 (the weights above did not)
+    #pragma unroll
+    for (int st = 0; st < XST - 1; ++st) {
+        if (st < NC) issue_x(st, st);
+        cp_async_commit();
+    }
+
+    // weight register ring: U chunks in flight per lane
+    uint4 wr[U][2]; uint4 sr[U];
+    #pragma unroll
+    for (int u = 0; u < U; ++u) {
+        if (u < NC) {
+            wr[u][0] = ldg_stream(wbase + (size_t)u * 4096);
+            wr[u][1] = ldg_stream(wbase + (size_t)u * 4096 + 512);
+            sr[u] = __ldg(reinterpret_cast<const uint4*>(sbase + (size_t)u * 512));
+        }
+    }
+
+    float acc[NT * CH][4];
+    #pragma unroll
+    for (int n = 0; n < NT * CH; ++n)
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) acc[n][q] = 0.f;
+    const float gsf = gs[e] * gs_mul;
+
+    for (int cb = 0; cb < NC; cb += U) {
+        #pragma unroll
+        for (int u = 0; u < U; ++u) {
+            const int c = cb + u;
+            if (c < NC) {
+                const int stage = c % XST;
+                cp_async_wait<XST - 2>();
+                __syncthreads();
+                {
+                    const int cn = c + XST - 1;
+                    if (cn < NC) issue_x(cn, cn % XST);
+                    cp_async_commit();
+                }
+                const __half* xs = reinterpret_cast<const __half*>(xs_all + stage * X_STAGE);
+                const uint4 w0 = wr[u][0], w1 = wr[u][1], sq = sr[u];
+                // refill this ring slot with chunk c + U
+                if (c + U < NC) {
+                    wr[u][0] = ldg_stream(wbase + (size_t)(c + U) * 4096);
+                    wr[u][1] = ldg_stream(wbase + (size_t)(c + U) * 4096 + 512);
+                    sr[u] = __ldg(reinterpret_cast<const uint4*>(sbase + (size_t)(c + U) * 512));
+                }
+                if constexpr (MODE == 1) {
+                    if (lane == 0) acc[0][0] += __uint_as_float((w0.x ^ w1.x ^ sq.x) & 0x007FFFFFu) * 1e-30f;
+                    continue;
+                }
+                #pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const uint4 wq = h == 0 ? w0 : w1;
+                    const uint2 sq2 = h == 0 ? make_uint2(sq.x, sq.y) : make_uint2(sq.z, sq.w);
+                    #pragma unroll
+                    for (int ps = 0; ps < 2; ++ps) {
+                        uint32_t b[NT][4];
+                        #pragma unroll
+                        for (int nb = 0; nb < NT; ++nb) {
+                            if (nb < ntb)
+                                ldmatrix_x4(b[nb][0], b[nb][1], b[nb][2], b[nb][3],
+                                            smem_u32(xs + (nb * 8 + (lane & 7)) * A_STRIDE + h * 64 + ps * 32 + (lane >> 3) * 8));
+                        }
+                        #pragma unroll
+                        for (int q = 0; q < 2; ++q) {
+                            const int sidx = 2 * ps + q;
+                            const uint32_t w = sidx == 0 ? wq.x : sidx == 1 ? wq.y : sidx == 2 ? wq.z : wq.w;
+                            const uint32_t sw = ps == 0 ? sq2.x : sq2.y;
+                            const uint32_t sp = q == 0 ? e4m3x2_lo16_to_f16x2(sw) : e4m3x2_hi16_to_f16x2(sw);
+                            const uint32_t S0 = prmt(sp, sp, 0x1010u);
+                            const uint32_t S1 = prmt(sp, sp, 0x3232u);
+                            const uint32_t elo = w & 0x9C9C9C9Cu;
+                            const uint32_t ehi = ((w << 2) & 0x8C8C8C8Cu) | ((w >> 2) & 0x10101010u);
+                            uint32_t a[4];
+                            a[0] = f16x2_mul(e4m3x2_lo16_to_f16x2(elo), S0);
+                            a[1] = f16x2_mul(e4m3x2_hi16_to_f16x2(elo), S1);
+                            a[2] = f16x2_mul(e4m3x2_lo16_to_f16x2(ehi), S0);
+                            a[3] = f16x2_mul(e4m3x2_hi16_to_f16x2(ehi), S1);
+                            #pragma unroll
+                            for (int nb = 0; nb < NT; ++nb) {
+                                if (nb < ntb) mma16816(acc[nb * CH + (CH == 2 ? q : 0)], a, b[nb][2 * q], b[nb][2 * q + 1]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pdl_trigger();
+    cp_async_wait<0>();
+    if (CH == 2) {
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) acc[0][q] += acc[1][q];
+    }
+
+    // epilogue: C fragment rows g, g+8 of the tile -> output column; cols (tokens) 2t, 2t+1
+    const int gtile = GATED ? blockIdx.x * 2 + (warp & 1) : tile;      // output column tile (gate tile for GATED)
+    if constexpr (SPLITK) {
+        #pragma unroll
+        for (int nb = 0; nb < NT; ++nb)
+            #pragma unroll
+            for (int hr = 0; hr < 2; ++hr) {
+                const int col = gtile * 16 + g + 8 * hr + (GATED && warp >= 2 ? NTILES * 8 : 0);   // up: + N/2
+                #pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int tok = nb * 8 + 2 * t + cc;
+                    if (tok >= nrows) continue;
+                    part[((size_t)blockIdx.z * part_rows + row0 + tok) * ldp + col] = acc[nb * CH][2 * hr + cc] * gsf;
+                }
+            }
+        return;
+    }
+    if constexpr (GATED) {
+        if (warp >= 2) {
+            #pragma unroll
+            for (int n = 0; n < NT; ++n)
+                #pragma unroll
+                for (int q = 0; q < 4; ++q) xch[(((warp - 2) * NT + n) * 4 + q) * 32 + lane] = acc[n * CH][q];
+        }
+        __syncthreads();
+        if (warp >= 2) return;
+    }
+    #pragma unroll
+    for (int nb = 0; nb < NT; ++nb) {
+        #pragma unroll
+        for (int hr = 0; hr < 2; ++hr) {
+            const int col = gtile * 16 + g + 8 * hr;
+            #pragma unroll
+            for (int cc = 0; cc < 2; ++cc) {
+                const int tok = nb * 8 + 2 * t + cc;
+                if (tok >= nrows) continue;
+                const float gv = acc[nb * CH][2 * hr + cc] * gsf;
+                const size_t o = (size_t)(row0 + tok) * ldo + col;
+                if constexpr (GATED) {
+                    const float uv = xch[((warp * NT + nb) * 4 + 2 * hr + cc) * 32 + lane] * gsf;
+                    const float hv = gv / (1.f + __expf(-gv)) * uv;
+                    out16[o] = __float2half(__bfloat162float(__float2bfloat16(hv)));
+                } else {
+                    out_bf[o] = __float2bfloat16(gv);
+                }
+            }
+        }
+    }
+}
+
+template <bool GATED, int NT, int U, bool SPLITK, int MODE>
+void launch_rs(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
+               const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
+               float* part, int ldp, int part_rows, int ksplit, int K, int ntiles, int max_blocks, float gs_mul, bool pdl,
+               cudaStream_t stream)
+{
+    const int n_x = GATED ? ntiles / 4 : ntiles / 4;   // GATED: 2 gate tiles (+2 up) per CTA over N/2 tiles; else 4 tiles
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(n_x, max_blocks, ksplit);
+    cfg.blockDim = dim3(128);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_rs_kernel<GATED, NT, U, SPLITK, MODE>,
+        X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, K, ntiles, gs_mul);
+    TORCH_CHECK(err == cudaSuccess, "rs launch failed: ", cudaGetErrorString(err));
+}
+
+// split-K reduce of GEMM1's fp32 partial slices + SiLU(gate) * up -> inter (bf16 values in an fp16 container).
+// grid (rows per block, blocks); one row per CTA, 16 columns per thread, all slice loads in flight.
+template <int KSPLIT>
+__global__ void __launch_bounds__(256)
+wt_silu_reduce_kernel(const float* __restrict__ part, int ldp, int part_rows, __half* __restrict__ out, int ldo,
+                      const int* __restrict__ blk_row0, const int* __restrict__ blk_end, const int* __restrict__ nblk, int I)
+{
+    const int j = blockIdx.y;
+    if (j >= *nblk) return;
+    const int r = blk_row0[j] + blockIdx.x;
+    if (r >= blk_end[j]) return;
+    for (int c = threadIdx.x * 16; c < I; c += 256 * 16) {
+        #pragma unroll
+        for (int half = 0; half < 2; ++half) {
+            const int cc = c + half * 8;
+            float4 ga[KSPLIT][2], ua[KSPLIT][2];
+            #pragma unroll
+            for (int z = 0; z < KSPLIT; ++z) {
+                const float* row = part + ((size_t)z * part_rows + r) * ldp;
+                ga[z][0] = __ldcg(reinterpret_cast<const float4*>(row + cc));
+                ga[z][1] = __ldcg(reinterpret_cast<const float4*>(row + cc + 4));
+                ua[z][0] = __ldcg(reinterpret_cast<const float4*>(row + I + cc));
+                ua[z][1] = __ldcg(reinterpret_cast<const float4*>(row + I + cc + 4));
+            }
+            float gsum[8], usum[8];
+            #pragma unroll
+            for (int q = 0; q < 8; ++q) { gsum[q] = 0.f; usum[q] = 0.f; }
+            #pragma unroll
+            for (int z = 0; z < KSPLIT; ++z) {
+                gsum[0] += ga[z][0].x; gsum[1] += ga[z][0].y; gsum[2] += ga[z][0].z; gsum[3] += ga[z][0].w;
+                gsum[4] += ga[z][1].x; gsum[5] += ga[z][1].y; gsum[6] += ga[z][1].z; gsum[7] += ga[z][1].w;
+                usum[0] += ua[z][0].x; usum[1] += ua[z][0].y; usum[2] += ua[z][0].z; usum[3] += ua[z][0].w;
+                usum[4] += ua[z][1].x; usum[5] += ua[z][1].y; usum[6] += ua[z][1].z; usum[7] += ua[z][1].w;
+            }
+            __half hv[8];
+            #pragma unroll
+            for (int q = 0; q < 8; ++q) {
+                const float h = gsum[q] / (1.f + __expf(-gsum[q])) * usum[q];
+                hv[q] = __float2half(__bfloat162float(__float2bfloat16(h)));
+            }
+            *reinterpret_cast<uint4*>(out + (size_t)r * ldo + cc) = *reinterpret_cast<const uint4*>(hv);
+        }
+    }
 }
 
 // post-expert RMSNorm x routing weight, summed per token: grid = tokens, 8 warps (one per route). Phase 1: each
-// warp loads its route's row (all H/256 16B pieces per lane at once) and reduces the sum of squares; phase 2:
-// every thread re-reads 8 elements of all 8 rows (L2-hot) and writes the weighted sum. No shared-memory tile,
-// so the SM keeps its carveout.
-template <int H>
+// warp loads its route's row (all H/256 16B pieces per lane at once) and reduces the sum of squares; KSPLIT > 1:
+// the row is the sum of GEMM2's fp32 partial slices, rounded to bf16 and written back to y. Phase 2: every
+// thread re-reads 8 elements of all 8 rows (L2-hot) and writes the weighted sum. No smem tile.
+template <int H, int KSPLIT>
 __global__ void __launch_bounds__(256)
-moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const int* __restrict__ row_of_pair,
-                    const float* __restrict__ tw, const float* __restrict__ nw, __nv_bfloat16* __restrict__ out, float eps)
+moe_finalize_kernel(__nv_bfloat16* __restrict__ y, int ldy, const float* __restrict__ part, int ldp, int part_rows,
+                    const int* __restrict__ row_of_pair, const float* __restrict__ tw, const float* __restrict__ nw,
+                    __nv_bfloat16* __restrict__ out, float eps)
 {
     constexpr int NSEG = H / 8 / 32;                     // 16B pieces per lane
+    constexpr int PP = KSPLIT <= 4 ? 4 : 2;              // pieces per pass in the split-K reduction
     __shared__ float sc_sh[8];
     __shared__ int row_sh[8];
+    pdl_wait();                                          // y comes from the previous launch
     const int tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = row_of_pair[tok * 8 + warp];
     float ss = 0.f;
     if (r >= 0) {
-        const uint4* src = reinterpret_cast<const uint4*>(y + (size_t)r * ldy);
         uint4 u[NSEG];
-        #pragma unroll
-        for (int q = 0; q < NSEG; ++q) u[q] = src[lane + 32 * q];
+        if constexpr (KSPLIT == 1) {
+            const uint4* src = reinterpret_cast<const uint4*>(y + (size_t)r * ldy);
+            #pragma unroll
+            for (int q = 0; q < NSEG; ++q) u[q] = src[lane + 32 * q];
+        } else {
+            #pragma unroll
+            for (int p0 = 0; p0 < NSEG; p0 += PP) {
+                float4 a[PP][KSPLIT][2];
+                #pragma unroll
+                for (int q = 0; q < PP; ++q)
+                    #pragma unroll
+                    for (int z = 0; z < KSPLIT; ++z) {
+                        const float* row = part + ((size_t)z * part_rows + r) * ldp + (lane + 32 * (p0 + q)) * 8;
+                        a[q][z][0] = __ldcg(reinterpret_cast<const float4*>(row));
+                        a[q][z][1] = __ldcg(reinterpret_cast<const float4*>(row + 4));
+                    }
+                #pragma unroll
+                for (int q = 0; q < PP; ++q) {
+                    float v[8];
+                    #pragma unroll
+                    for (int k = 0; k < 8; ++k) v[k] = 0.f;
+                    #pragma unroll
+                    for (int z = 0; z < KSPLIT; ++z) {
+                        v[0] += a[q][z][0].x; v[1] += a[q][z][0].y; v[2] += a[q][z][0].z; v[3] += a[q][z][0].w;
+                        v[4] += a[q][z][1].x; v[5] += a[q][z][1].y; v[6] += a[q][z][1].z; v[7] += a[q][z][1].w;
+                    }
+                    __nv_bfloat162 o[4];
+                    o[0] = __floats2bfloat162_rn(v[0], v[1]); o[1] = __floats2bfloat162_rn(v[2], v[3]);
+                    o[2] = __floats2bfloat162_rn(v[4], v[5]); o[3] = __floats2bfloat162_rn(v[6], v[7]);
+                    u[p0 + q] = *reinterpret_cast<const uint4*>(o);
+                    *reinterpret_cast<uint4*>(y + (size_t)r * ldy + (lane + 32 * (p0 + q)) * 8) = u[p0 + q];
+                }
+            }
+        }
         #pragma unroll
         for (int q = 0; q < NSEG; ++q) {
             const int seg = lane + 32 * q;
@@ -676,7 +1114,7 @@ moe_finalize_kernel(const __nv_bfloat16* __restrict__ y, int ldy, const int* __r
         sc_sh[warp] = r >= 0 ? rsqrtf(ss / (float)H + eps) * tw[tok * 8 + warp] : 0.f;
         row_sh[warp] = r;
     }
-    __syncthreads();
+    __syncthreads();                                     // (KSPLIT > 1: the y rows written above are this CTA's own)
     #pragma unroll
     for (int base = threadIdx.x * 8; base < H; base += 256 * 8) {
         uint4 v[8];
@@ -746,8 +1184,8 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
 
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
                   torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
-                  torch::Tensor out, torch::Tensor part, torch::Tensor counters, int64_t ksplit, int64_t K, int64_t ntiles,
-                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul)
+                  torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles,
+                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, bool tma, bool pdl)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const __half* Xp = reinterpret_cast<const __half*>(X.data_ptr());
@@ -760,40 +1198,112 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
     float* pp = ksplit > 1 ? part.data_ptr<float>() : nullptr;
     const int ldp = ksplit > 1 ? (int)part.stride(1) : 0;
     const int prow = ksplit > 1 ? (int)part.size(1) : 0;
-    int* cnt = ksplit > 1 ? counters.data_ptr<int>() : nullptr;
-    if (ksplit > 1) {
-        const int n_x = (gated ? ntiles / 2 : ntiles) / (WT_NWARPS * mw);
-        TORCH_CHECK(counters.numel() >= max_blocks * n_x, "split-K counters too small");
-    }
-#define OKC_W(G, M, T, S, NS, SK) launch_wt<G, M, T, S, NS, SK>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
+#define OKC_W(G, M, T, S, NS, SK, TM) launch_wt<G, M, T, S, NS, SK, TM>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
-        pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, stream)
-    const int key = (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
+        pp, ldp, prow, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
+    const int mode = ks >= 10 ? (int)ks - 10 : 0;          // bench ablations: ks = 10 + MODE on the (1,1,1,8) variant
+#ifdef OKC_ABLATE
+    if (mode > 0) {
+        TORCH_CHECK(mw == 1 && nt == 1 && nstage == 8 && !tma && ksplit == 1, "ablation modes: (1,1,1,8) only");
+#define OKC_WM(G, MD) launch_wt<G, 1, 1, 1, 8, false, false, MD>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(),         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo,         pp, ldp, prow, 1, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
+        if (gated) { switch (mode) { case 1: OKC_WM(true, 1); break; case 2: OKC_WM(true, 2); break; case 3: OKC_WM(true, 3); break; default: OKC_WM(true, 4); break; } }
+        else { switch (mode) { case 1: OKC_WM(false, 1); break; case 2: OKC_WM(false, 2); break; case 3: OKC_WM(false, 3); break; default: OKC_WM(false, 4); break; } }
+#undef OKC_WM
+        return;
+    }
+#else
+    TORCH_CHECK(mode == 0, "ablation modes need -DOKC_ABLATE");
+#endif
+    const int key = (tma ? 10000000 : 0) + (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
     switch (key) {
-        case 111102: OKC_W(true, 1, 1, 1, 2, false); break;   case 111104: OKC_W(true, 1, 1, 1, 4, false); break;
-        case 111108: OKC_W(true, 1, 1, 1, 8, false); break;
-        case 112102: OKC_W(true, 1, 2, 1, 2, false); break;   case 112104: OKC_W(true, 1, 2, 1, 4, false); break;
-        case 114102: OKC_W(true, 1, 4, 1, 2, false); break;   case 114104: OKC_W(true, 1, 4, 1, 4, false); break;
-        case 11102: OKC_W(false, 1, 1, 1, 2, false); break;   case 11104: OKC_W(false, 1, 1, 1, 4, false); break;
-        case 11108: OKC_W(false, 1, 1, 1, 8, false); break;
-        case 21102: OKC_W(false, 2, 1, 1, 2, false); break;   case 21104: OKC_W(false, 2, 1, 1, 4, false); break;
-        case 12104: OKC_W(false, 1, 2, 1, 4, false); break;   case 22102: OKC_W(false, 2, 2, 1, 2, false); break;
-        case 22104: OKC_W(false, 2, 2, 1, 4, false); break;   case 14104: OKC_W(false, 1, 4, 1, 4, false); break;
-        case 24102: OKC_W(false, 2, 4, 1, 2, false); break;   case 24104: OKC_W(false, 2, 4, 1, 4, false); break;
-        // split-K (SPLITK = true) instantiations removed: measured slower than the plain variants on every shape
-        default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage, ksplit)");
+        case 111104: OKC_W(true, 1, 1, 1, 4, false, false); break;   case 111108: OKC_W(true, 1, 1, 1, 8, false, false); break;
+        case 112104: OKC_W(true, 1, 2, 1, 4, false, false); break;   case 114102: OKC_W(true, 1, 4, 1, 2, false, false); break;
+        case 114104: OKC_W(true, 1, 4, 1, 4, false, false); break;
+        case 11104: OKC_W(false, 1, 1, 1, 4, false, false); break;   case 11108: OKC_W(false, 1, 1, 1, 8, false, false); break;
+        case 21104: OKC_W(false, 2, 1, 1, 4, false, false); break;   case 22104: OKC_W(false, 2, 2, 1, 4, false, false); break;
+        case 24102: OKC_W(false, 2, 4, 1, 2, false, false); break;   case 24104: OKC_W(false, 2, 4, 1, 4, false, false); break;
+        // split-K (SPLITK) and TMA bulk-copy variants are kept as code but not instantiated: both measured slower
+        default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage, ksplit, tma)");
     }
 #undef OKC_W
 }
 
-void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, torch::Tensor nw, torch::Tensor out,
-                  int64_t M, double eps)
+void moe_w4a16_rs(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
+                  torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
+                  torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles, int64_t max_blocks,
+                  bool gated, int64_t nt, int64_t u, int64_t mode, double gs_mul, bool pdl)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const __half* Xp = reinterpret_cast<const __half*>(X.data_ptr());
+    const uint8_t* Wp = reinterpret_cast<const uint8_t*>(Wr.data_ptr());
+    const uint8_t* Sp = reinterpret_cast<const uint8_t*>(Sr.data_ptr());
+    __half* o16 = gated ? reinterpret_cast<__half*>(out.data_ptr()) : nullptr;
+    __nv_bfloat16* obf = gated ? nullptr : reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int ldo = (int)out.stride(0);
+    float* pp = ksplit > 1 ? part.data_ptr<float>() : nullptr;
+    const int ldp = ksplit > 1 ? (int)part.stride(1) : 0;
+    const int prow = ksplit > 1 ? (int)part.size(1) : 0;
+#define OKC_R(G, T, UU, SK, MD) launch_rs<G, T, UU, SK, MD>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
+        blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
+        pp, ldp, prow, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
+    const int key = (gated ? 1000 : 0) + (ksplit > 1 ? 100 : 0) + (int)nt * 10 + (int)u / 4 + (int)mode * 10000;
+    switch (key) {
+        case 1011: OKC_R(true, 1, 4, false, 0); break;   case 1012: OKC_R(true, 1, 8, false, 0); break;
+        case 1111: OKC_R(true, 1, 4, true, 0); break;    case 1112: OKC_R(true, 1, 8, true, 0); break;
+        case 1021: OKC_R(true, 2, 4, false, 0); break;   case 1022: OKC_R(true, 2, 8, false, 0); break;
+        case 11: OKC_R(false, 1, 4, false, 0); break;    case 12: OKC_R(false, 1, 8, false, 0); break;
+        case 111: OKC_R(false, 1, 4, true, 0); break;    case 112: OKC_R(false, 1, 8, true, 0); break;
+        case 21: OKC_R(false, 2, 4, false, 0); break;    case 22: OKC_R(false, 2, 8, false, 0); break;
+        // loads-only ablation (U = 8)
+        case 11012: OKC_R(true, 1, 8, false, 1); break;  case 10012: OKC_R(false, 1, 8, false, 1); break;
+        case 11112: OKC_R(true, 1, 8, true, 1); break;   case 10112: OKC_R(false, 1, 8, true, 1); break;
+        default: TORCH_CHECK(false, "unsupported rs variant (gated, ksplit, nt, u, mode)");
+    }
+#undef OKC_R
+}
+
+void moe_wt_silu_reduce(torch::Tensor part, int64_t ksplit, torch::Tensor out, torch::Tensor blk_row0, torch::Tensor blk_end,
+                        torch::Tensor nblk, int64_t rows_per_block, int64_t max_blocks, int64_t I)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    dim3 grid((unsigned)rows_per_block, (unsigned)max_blocks);
+#define OKC_R(KS) wt_silu_reduce_kernel<KS><<<grid, 256, 0, stream>>>(part.data_ptr<float>(), (int)part.stride(1), (int)part.size(1), \
+        reinterpret_cast<__half*>(out.data_ptr()), (int)out.stride(0), blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), \
+        nblk.data_ptr<int>(), (int)I)
+    switch (ksplit) {
+        case 2: OKC_R(2); break;  case 4: OKC_R(4); break;  case 8: OKC_R(8); break;
+        default: TORCH_CHECK(false, "unsupported ksplit for the SiLU reduce");
+    }
+#undef OKC_R
+}
+
+void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Tensor row_of_pair, torch::Tensor tw,
+                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps, bool pdl)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(out.size(1) == 4096, "finalize: H must be 4096");
-    moe_finalize_kernel<4096><<<(unsigned)M, 256, 0, stream>>>(
-        reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), (int)y.stride(0), row_of_pair.data_ptr<int>(),
-        tw.data_ptr<float>(), nw.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (float)eps);
+    const float* pp = ksplit > 1 ? part.data_ptr<float>() : nullptr;
+    const int ldp = ksplit > 1 ? (int)part.stride(1) : 0, prow = ksplit > 1 ? (int)part.size(1) : 0;
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((unsigned)M);
+    cfg.blockDim = dim3(256);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaError_t err = cudaSuccess;
+#define OKC_F(KS) err = cudaLaunchKernelEx(&cfg, moe_finalize_kernel<4096, KS>, reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), \
+        (int)y.stride(0), pp, ldp, prow, row_of_pair.data_ptr<int>(), tw.data_ptr<float>(), nw.data_ptr<float>(), \
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (float)eps)
+    switch (ksplit) {
+        case 1: OKC_F(1); break;  case 2: OKC_F(2); break;  case 4: OKC_F(4); break;  case 8: OKC_F(8); break;
+        default: TORCH_CHECK(false, "unsupported ksplit for the finalize");
+    }
+#undef OKC_F
+    TORCH_CHECK(err == cudaSuccess, "finalize launch failed: ", cudaGetErrorString(err));
 }
 """
 
@@ -806,10 +1316,16 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
                     int64_t mt, int64_t nper, int64_t ks, int64_t ksplit);
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
                   torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
-                  torch::Tensor out, torch::Tensor part, torch::Tensor counters, int64_t ksplit, int64_t K, int64_t ntiles,
-                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul);
-void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, torch::Tensor nw, torch::Tensor out,
-                  int64_t M, double eps);
+                  torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles,
+                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, bool tma, bool pdl);
+void moe_w4a16_rs(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
+                  torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
+                  torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles, int64_t max_blocks,
+                  bool gated, int64_t nt, int64_t u, int64_t mode, double gs_mul, bool pdl);
+void moe_wt_silu_reduce(torch::Tensor part, int64_t ksplit, torch::Tensor out, torch::Tensor blk_row0, torch::Tensor blk_end,
+                        torch::Tensor nblk, int64_t rows_per_block, int64_t max_blocks, int64_t I);
+void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Tensor row_of_pair, torch::Tensor tw,
+                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps, bool pdl);
 """
 
 _EXT = None
@@ -822,7 +1338,7 @@ def build():
         _EXT = load_inline(
             name="okc_moe_w4a16", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_finalize"], extra_cuda_cflags=["-O3", "-arch=sm_90a", "--use_fast_math"], verbose=False)
+            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_w4a16_rs", "moe_wt_silu_reduce", "moe_finalize"], extra_cuda_cflags=["-O3", "-arch=sm_90a", "--use_fast_math"], verbose=False)
     return _EXT
 
 
@@ -860,7 +1376,8 @@ def repack_weights(w: torch.Tensor, sf: torch.Tensor):
 
 def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
     """w uint8 [E, N, K/2] packed E2M1 (low nibble = even k), sf fp8 [E, N, K/16] ->
-    Wr uint8 [E, N/16, K/128, 2, 32, 16]: per (expert, m16 tile, chunk, half, lane) 4 words = the lane's
+    Wr uint8 [E, N/64, K/128, 4, 1024] (per expert, 4-tile group, chunk, tile slot: 2 halves x 32 lanes x 16 B): per
+    (tile, chunk, half, lane) 4 words = the lane's
     A-fragment nibbles for k16 steps 4*half .. 4*half+3 (byte b: nibble A_b at bits {7,4,3,2} = E4M3
     position, nibble B_b at (e1:6, s:5, e0:1, m:0); A_0,A_1 = row g k 2t,2t+1; A_2,A_3 = row g+8 k 2t,2t+1;
     B_0,B_1 = row g k 2t+8,2t+9; B_2,B_3 = row g+8 k 2t+8,2t+9);
@@ -895,4 +1412,7 @@ def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
         del nib, n6, sel, word
     sfu = sf.view(torch.uint8).view(E, NTL, 2, 8, NC, 8)                            # e, tile, rh, g, chunk, step
     Sr = sfu.permute(0, 1, 4, 3, 5, 2).contiguous().view(E, NTL, NC, 8, 16)         # e, tile, chunk, g, (step, rh)
-    return Wr.contiguous(), Sr
+    # 4-tile groups: a group's chunk is 4 KB (weights) / 512 B (scales) contiguous
+    Wr = Wr.view(E, NTL // 4, 4, NC, 1024).permute(0, 1, 3, 2, 4).contiguous()      # e, group, chunk, slot, 1 KB
+    Sr = Sr.view(E, NTL // 4, 4, NC, 128).permute(0, 1, 3, 2, 4).contiguous()       # e, group, chunk, slot, 128 B
+    return Wr, Sr
