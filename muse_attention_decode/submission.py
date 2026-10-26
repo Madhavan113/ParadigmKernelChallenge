@@ -504,7 +504,8 @@ def _plan(cfg):
         # sliding verify: 64-key tiles, 8 warps (shorter per-tile latency), 1-8 tiles per CTA
         return dict(base, splits=_pow2(min(32, 256 // ctas)), block_t=64, warps=8)
     if ctas <= 4:
-        return dict(base, splits=_pow2(min(128, 1024 // ctas)))
+        # tiny-batch verify over the whole context: 64 splits x 8 warps judged faster than 128 x 4
+        return dict(base, splits=_pow2(min(64, 1024 // ctas)), warps=8)
     return dict(base, splits=_pow2(min(8, 256 // ctas)))
 
 
@@ -571,20 +572,21 @@ def _attn_bench(data):
     n64 = dict(nw, block_t=64)
     w8 = dict(n64, warps=8)
     plans = {
-        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, warps=8), dict(nw, splits=8), dict(nw, splits=16, ex2h=False)],
-        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=64), dict(n64, splits=128), dict(nw, splits=128, stages=3)],
-        "B16 L1 sliding": [dict(n64, splits=8), dict(n64, splits=8, warps=8), dict(n64, splits=16), dict(nw, splits=8)],
-        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16, warps=8), dict(bd, splits=16, ex2h=False)],
-        "B32 L1 sliding": [dict(n64, splits=8), dict(n64, splits=8, warps=8), dict(n64, splits=16), dict(n64, splits=4)],
-        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=8, warps=8)],
-        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, warps=16), dict(w8, splits=32, warps=4), dict(w8, splits=16, warps=16),
-                          dict(w8, splits=64), dict(nw, splits=16, warps=16)],
-        "B1 L8 full": [dict(nw, splits=128), dict(nw, splits=64), dict(n64, splits=128), dict(n64, splits=64), dict(nw, splits=128, stages=3),
-                       dict(n64, splits=128, warps=16)],
-        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, warps=16), dict(w8, splits=16), dict(w8, splits=4), dict(nw, splits=4, warps=16)],
-        "B16 L8 full": [dict(nw, splits=8), dict(n64, splits=8), dict(n64, splits=16)],
-        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, warps=16), dict(w8, splits=8), dict(w8, splits=2), dict(nw, splits=2, warps=16)],
-        "B32 L8 full": [dict(nw, splits=4), dict(n64, splits=4), dict(n64, splits=8)],
+        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16)],
+        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=128, g1=8), dict(nw, splits=128, pf=False), dict(nw, splits=64, warps=8)],
+        "B16 L1 sliding": [dict(n64, splits=8)],
+        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16)],
+        "B32 L1 sliding": [dict(n64, splits=8)],
+        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=8)],
+        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, g1=32), dict(w8, splits=32, g1=4), dict(w8, splits=32, stages=3),
+                          dict(w8, splits=64, stages=3), dict(w8, splits=16, stages=3), dict(w8, splits=32, pf=False)],
+        "B1 L8 full": [dict(nw, splits=64, warps=8), dict(nw, splits=128), dict(nw, splits=64), dict(nw, splits=32, warps=8),
+                       dict(nw, splits=64, warps=8, g1=64), dict(nw, splits=64, warps=8, pf=False), dict(nw, splits=64, warps=8, stages=3),
+                       dict(n64, splits=64, warps=8)],
+        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, g1=4)],
+        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8)],
+        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, g1=2)],
+        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4)],
     }
     for name, (B, L, window) in cases.items():
         d = make(B, L, window)
