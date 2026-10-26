@@ -19,6 +19,23 @@ __device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
     asm("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
     return v;
 }
+// volatile variants: ptxas keeps volatile asm statements in program order, so loads written before
+// the (volatile) mma asms are issued before them instead of being sunk to the end of the loop body
+__device__ __forceinline__ uint4 ldg_stream_v(const uint4* p) {
+    uint4 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ uint2 ldg_v2_v(const uint2* p) {
+    uint2 v;
+    asm volatile("ld.global.nc.L1::no_allocate.v2.u32 {%0,%1}, [%2];" : "=r"(v.x), "=r"(v.y) : "l"(p));
+    return v;
+}
+__device__ __forceinline__ uint4 ldg_l1_v(const uint4* p) {   // L1-cached (x, re-read by many warps)
+    uint4 v;
+    asm volatile("ld.global.nc.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(v.x), "=r"(v.y), "=r"(v.z), "=r"(v.w) : "l"(p));
+    return v;
+}
 __device__ __forceinline__ float bf_lo(uint32_t u) { return __uint_as_float(u << 16); }
 __device__ __forceinline__ float bf_hi(uint32_t u) { return __uint_as_float(u & 0xffff0000u); }
 __device__ __forceinline__ void dot8(float& acc, const uint4& w, const uint4& x) {
@@ -607,7 +624,7 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
             #pragma unroll
             for (int h = 0; h < 2; ++h) {
                 const uint4* xq = xp[i][h] + (size_t)(cc >> 2) * 32 + (cc & 3) * 8;   // k-tile = 32 uint4, 64-k chunk = 8 uint4
-                if (xok[i][h]) { xa[i][h][0] = xq[0]; xa[i][h][1] = xq[1]; }
+                if (xok[i][h]) { xa[i][h][0] = ldg_l1_v(xq); xa[i][h][1] = ldg_l1_v(xq + 1); }
                 else { xa[i][h][0] = make_uint4(0u, 0u, 0u, 0u); xa[i][h][1] = make_uint4(0u, 0u, 0u, 0u); }
             }
     };
@@ -615,7 +632,7 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
     #pragma unroll
     for (int u = 0; u < UNROLL; ++u)
         #pragma unroll
-        for (int r = 0; r < RPW; ++r) { cn[u][r] = *nb_at(r, u); cl[u][r] = ldg_stream(lo_at(r, u)); }
+        for (int r = 0; r < RPW; ++r) { cn[u][r] = ldg_v2_v(nb_at(r, u)); cl[u][r] = ldg_stream_v(lo_at(r, u)); }
     uint4 xcur[MT][2][2];
     load_x(0, xcur);
     for (int c = 0; c < nchunk; c += UNROLL) {
@@ -624,7 +641,7 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u)
             #pragma unroll
-            for (int r = 0; r < RPW; ++r) { nn[u][r] = *nb_at(r, cnx + u); nl[u][r] = ldg_stream(lo_at(r, cnx + u)); }
+            for (int r = 0; r < RPW; ++r) { nn[u][r] = ldg_v2_v(nb_at(r, cnx + u)); nl[u][r] = ldg_stream_v(lo_at(r, cnx + u)); }
         #pragma unroll
         for (int u = 0; u < UNROLL; ++u) {
             const int cc = c + u;
@@ -728,6 +745,208 @@ void launch_mma12(const __nv_bfloat16* X, int ldx, int m, const uint8_t* LO, con
                   __nv_bfloat16* out, int ldo, float* part, int* cnt, int N, int K, cudaStream_t stream)
 {
     mma12_kernel<MT, RPW, UNROLL, SK><<<dim3(N / 32, SK), 256, 0, stream>>>(X, ldx, m, LO, NB, eb, eo, en, ek, ed, out, ldo, part, cnt, N, K);
+}
+
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, int src_bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" :: "r"(dst), "l"(src), "r"(src_bytes));
+}
+__device__ __forceinline__ void cp_async8(uint32_t dst, const void* src) {
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 8;\n" :: "r"(dst), "l"(src));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;\n" ::); }
+template <int N> __device__ __forceinline__ void cp_async_wait() { asm volatile("cp.async.wait_group %0;\n" :: "n"(N)); }
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return static_cast<uint32_t>(__cvta_generic_to_shared(p)); }
+
+// ---- 12-bit mma GEMM with cp.async staging: same math / mapping as mma12_kernel, but every lane's
+// chunk data (RPW x 16 B low bytes, RPW x 8 B nibbles, MT x 2 x 32 B of x) is copied asynchronously
+// into its own shared-memory slot NSTAGE chunks ahead (commit / wait groups), so the loads are in
+// flight regardless of how ptxas schedules the compute.
+template <int MT, int RPW, int NSTAGE, int SK>
+__global__ void __launch_bounds__(256) mma12cp_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m,
+        const uint8_t* __restrict__ LO, const uint8_t* __restrict__ NB, int eb,
+        const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+        __nv_bfloat16* __restrict__ out, int ldo, float* __restrict__ part, int* __restrict__ cnt, int N, int K)
+{
+    constexpr int GROUPS = 4 / RPW, KS = 8 / GROUPS, MR = 16 * MT;
+    constexpr int LOB = RPW * 16, NBB = RPW * 8, XB = MT * 2 * 32, LANEB = LOB + NBB + XB, WSTAGE = 32 * LANEB;
+    extern __shared__ __align__(16) uint8_t dsmem[];
+    __shared__ float red[32][MR + 1];
+    __shared__ int s_en[64];
+    __shared__ float s_ev[64][MR];
+    __shared__ int s_last;
+    const int pn = blockIdx.x, sk = blockIdx.y;
+    const int KT = K / 256, ktc = KT / SK / KS;
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+    const int grp = warp / KS, kp = warp % KS;
+    const int kt0 = sk * (KT / SK) + kp * ktc;
+    const int nchunk = ktc * 4;
+    const uint32_t hb = (uint32_t)(eb >> 1);
+    const uint32_t lut0 = hb | (hb + 1) << 8 | (hb + 2) << 16 | (hb + 3) << 24;
+    const uint32_t lut1 = (hb + 4) | (hb + 5) << 8 | (hb + 6) << 16 | (hb + 7) << 24;
+    uint8_t* my = dsmem + warp * (NSTAGE * WSTAGE) + lane * LANEB;
+
+    const uint8_t* lo_base[RPW]; const uint8_t* nb_base[RPW];
+    #pragma unroll
+    for (int r = 0; r < RPW; ++r) {
+        const int row = grp * RPW * 8 + 8 * r + g;
+        lo_base[r] = LO + ((size_t)(pn * KT + kt0) * 32 + row) * 256 + 16 * t;
+        nb_base[r] = NB + ((size_t)(pn * KT + kt0) * 32 + row) * 128 + 8 * t;
+    }
+    const __nv_bfloat16* xp[MT][2]; bool xok[MT][2];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int row = 16 * i + g + 8 * h;
+            xok[i][h] = row < m;
+            xp[i][h] = X + (size_t)(row < m ? row : 0) * ldx + kt0 * 256 + 16 * t;
+        }
+    auto issue = [&](int c, int st) {
+        uint8_t* slot = my + st * WSTAGE;
+        const size_t lo_off = (size_t)(c >> 2) * 32 * 256 + (c & 3) * 64, nb_off = (size_t)(c >> 2) * 32 * 128 + (c & 3) * 32;
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            cp_async16(smem_u32(slot + 16 * r), lo_base[r] + lo_off, 16);
+            cp_async8(smem_u32(slot + LOB + 8 * r), nb_base[r] + nb_off);
+        }
+        const size_t x_off = (size_t)(c >> 2) * 256 + (c & 3) * 64;   // elements
+        #pragma unroll
+        for (int i = 0; i < MT; ++i)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                const __nv_bfloat16* src = xp[i][h] + x_off;
+                const int ok = xok[i][h] ? 16 : 0;
+                cp_async16(smem_u32(slot + LOB + NBB + (2 * i + h) * 32), src, ok);
+                cp_async16(smem_u32(slot + LOB + NBB + (2 * i + h) * 32 + 16), src + 8, ok);
+            }
+    };
+
+    float acc[MT][RPW][4];
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][r][q] = 0.f;
+
+    #pragma unroll
+    for (int st = 0; st < NSTAGE - 1; ++st) {
+        if (st < nchunk) issue(st, st);
+        cp_async_commit();
+    }
+    int st = 0;
+    for (int c = 0; c < nchunk; ++c, st = (st + 1 == NSTAGE ? 0 : st + 1)) {
+        const int cn = c + NSTAGE - 1;
+        if (cn < nchunk) issue(cn, (st + NSTAGE - 1) % NSTAGE);
+        cp_async_commit();
+        cp_async_wait<NSTAGE - 1>();
+        __syncwarp();
+        const uint8_t* slot = my + st * WSTAGE;
+        uint4 cl[RPW]; uint2 cnb[RPW];
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            cl[r] = *reinterpret_cast<const uint4*>(slot + 16 * r);
+            cnb[r] = *reinterpret_cast<const uint2*>(slot + LOB + 8 * r);
+        }
+        uint4 xa[MT][2][2];
+        #pragma unroll
+        for (int i = 0; i < MT; ++i)
+            #pragma unroll
+            for (int h = 0; h < 2; ++h) {
+                xa[i][h][0] = *reinterpret_cast<const uint4*>(slot + LOB + NBB + (2 * i + h) * 32);
+                xa[i][h][1] = *reinterpret_cast<const uint4*>(slot + LOB + NBB + (2 * i + h) * 32 + 16);
+            }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            #pragma unroll
+            for (int r = 0; r < RPW; ++r) {
+                const uint32_t Lw = j == 0 ? cl[r].x : j == 1 ? cl[r].y : j == 2 ? cl[r].z : cl[r].w;
+                const uint32_t n16 = j == 0 ? (cnb[r].x & 0xFFFFu) : j == 1 ? (cnb[r].x >> 16) : j == 2 ? (cnb[r].y & 0xFFFFu) : (cnb[r].y >> 16);
+                uint32_t b0, b1;
+                decode4(Lw, n16, lut0, lut1, b0, b1);
+                #pragma unroll
+                for (int i = 0; i < MT; ++i) {
+                    const uint4 ga = xa[i][0][j >> 1], gb = xa[i][1][j >> 1];
+                    const uint32_t a0 = (j & 1) ? ga.z : ga.x, a2 = (j & 1) ? ga.w : ga.y;
+                    const uint32_t a1 = (j & 1) ? gb.z : gb.x, a3 = (j & 1) ? gb.w : gb.y;
+                    mma16816(acc[i][r], a0, a1, a2, a3, b0, b1);
+                }
+            }
+        }
+        __syncwarp();
+    }
+    cp_async_wait<0>();
+
+    for (int idx = threadIdx.x; idx < 32 * (MR + 1); idx += 256) (&red[0][0])[idx] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int i = 0; i < MT; ++i)
+        #pragma unroll
+        for (int r = 0; r < RPW; ++r) {
+            const int n0 = grp * RPW * 8 + 8 * r + 2 * t;
+            atomicAdd(&red[n0][16 * i + g], acc[i][r][0]);
+            atomicAdd(&red[n0 + 1][16 * i + g], acc[i][r][1]);
+            atomicAdd(&red[n0][16 * i + g + 8], acc[i][r][2]);
+            atomicAdd(&red[n0 + 1][16 * i + g + 8], acc[i][r][3]);
+        }
+    __syncthreads();
+    if (SK > 1) {
+        for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+            const int n = idx & 31, i = idx >> 5;
+            part[((size_t)sk * MR + i) * N + pn * 32 + n] = red[n][i];
+        }
+        __threadfence();
+        __syncthreads();
+        if (threadIdx.x == 0) s_last = (atomicAdd(cnt + pn, 1) == SK - 1);
+        __syncthreads();
+        if (!s_last) return;
+        __threadfence();
+        for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+            const int n = idx & 31, i = idx >> 5;
+            float v = 0.f;
+            #pragma unroll
+            for (int s2 = 0; s2 < SK; ++s2) v += __ldcg(part + ((size_t)s2 * MR + i) * N + pn * 32 + n);
+            red[n][i] = v;
+        }
+        __syncthreads();
+    }
+    const int e0 = esc_off[pn], e1 = esc_off[pn + 1];
+    for (int base = e0; base < e1; base += 64) {
+        const int e = base + (int)threadIdx.x;
+        if (threadIdx.x < 64) {
+            if (e < e1) {
+                s_en[threadIdx.x] = esc_n[e];
+                const float d = esc_d[e]; const int kk = esc_k[e];
+                for (int i = 0; i < MR; ++i) s_ev[threadIdx.x][i] = i < m ? d * __bfloat162float(X[(size_t)i * ldx + kk]) : 0.f;
+            } else {
+                s_en[threadIdx.x] = -1;
+            }
+        }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int cnt_ = min(e1 - base, 64);
+            for (int j = 0; j < cnt_; ++j)
+                if (s_en[j] == (int)threadIdx.x)
+                    for (int i = 0; i < MR; ++i) red[threadIdx.x][i] += s_ev[j][i];
+        }
+        __syncthreads();
+    }
+    for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+        const int n = idx & 31, i = idx >> 5;
+        if (i < m) out[(size_t)i * ldo + pn * 32 + n] = __float2bfloat16(red[n][i]);
+    }
+    if (SK > 1 && threadIdx.x == 0) cnt[pn] = 0;
+}
+
+template <int MT, int RPW, int NSTAGE, int SK>
+void launch_mma12cp(const __nv_bfloat16* X, int ldx, int m, const uint8_t* LO, const uint8_t* NB, int eb, const int* eo, const int* en, const int* ek, const float* ed,
+                    __nv_bfloat16* out, int ldo, float* part, int* cnt, int N, int K, cudaStream_t stream)
+{
+    constexpr int LANEB = RPW * 16 + RPW * 8 + MT * 2 * 32;
+    constexpr int smem = NSTAGE * 8 * 32 * LANEB;
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(mma12cp_kernel<MT, RPW, NSTAGE, SK>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    mma12cp_kernel<MT, RPW, NSTAGE, SK><<<dim3(N / 32, SK), 256, smem, stream>>>(X, ldx, m, LO, NB, eb, eo, en, ek, ed, out, ldo, part, cnt, N, K);
 }
 
 } // namespace
@@ -915,6 +1134,38 @@ void mma12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torc
         default: TORCH_CHECK(false, "unsupported mma12 config");
     }
 }
+#define MMA12CP_CASE(T_, R_, U_, S_) \
+    case (T_ * 1000 + R_ * 100 + U_ * 10 + S_): launch_mma12cp<T_, R_, U_, S_>(Xp, ldx, m, LOp, NBp, (int)eb, eo, en, ek, ed, ob, ldo, part.data_ptr<float>(), cnt.data_ptr<int>(), N, K, stream); break;
+
+void mma12cp(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
+             torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t nstage, int64_t sk)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int m = (int)X.size(0), K = (int)X.size(1), N = (int)out.size(1);
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const uint8_t* LOp = LO.data_ptr<uint8_t>(); const uint8_t* NBp = NB.data_ptr<uint8_t>();
+    const int* eo = esc_off.data_ptr<int>(); const int* en = esc_n.data_ptr<int>(); const int* ek = esc_k.data_ptr<int>(); const float* ed = esc_d.data_ptr<float>();
+    __nv_bfloat16* ob = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
+    const int key = (int)mt * 1000 + (int)rpw * 100 + (int)nstage * 10 + (int)sk;
+    switch (key) {
+        MMA12CP_CASE(1, 4, 4, 1)
+        MMA12CP_CASE(1, 4, 3, 1)
+        MMA12CP_CASE(1, 4, 3, 2)
+        MMA12CP_CASE(1, 2, 4, 1)
+        MMA12CP_CASE(1, 2, 3, 1)
+        MMA12CP_CASE(1, 2, 3, 2)
+        MMA12CP_CASE(1, 2, 4, 2)
+        MMA12CP_CASE(1, 1, 4, 1)
+        MMA12CP_CASE(1, 1, 4, 2)
+        MMA12CP_CASE(2, 4, 2, 1)
+        MMA12CP_CASE(2, 2, 3, 1)
+        MMA12CP_CASE(2, 2, 2, 2)
+        MMA12CP_CASE(2, 1, 3, 1)
+        MMA12CP_CASE(2, 1, 3, 2)
+        default: TORCH_CHECK(false, "unsupported mma12cp config");
+    }
+}
 """
 
 CPP_SRC = """
@@ -926,6 +1177,7 @@ void skinny_mma(torch::Tensor X, torch::Tensor W, torch::Tensor out, int64_t mt,
 void tgemv(torch::Tensor X, torch::Tensor Wt, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t bn, int64_t warps, int64_t unroll, int64_t sk);
 void gemv12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t warps, int64_t unroll, int64_t sk);
 void mma12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t unroll, int64_t sk);
+void mma12cp(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t nstage, int64_t sk);
 """
 
 _EXT = None
@@ -936,9 +1188,9 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda8", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda10", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12", "mma12"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
+            functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12", "mma12", "mma12cp"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
 
 
@@ -982,3 +1234,11 @@ def mma12_usable(m: int, n: int, k: int, mt: int, rpw: int, unroll: int, sk: int
     if kt % (sk * ks):
         return False
     return (kt // sk // ks * 4) % unroll == 0
+
+
+def mma12cp_usable(m: int, n: int, k: int, mt: int, rpw: int, nstage: int, sk: int) -> bool:
+    if m > 16 * mt or n % 32 or k % 256:
+        return False
+    ks = 8 // (4 // rpw)
+    kt = k // 256
+    return kt % (sk * ks) == 0
