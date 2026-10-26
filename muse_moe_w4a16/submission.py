@@ -826,7 +826,7 @@ __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
     return tpw * WT_NWARPS * 1024 + tpw * WT_NWARPS * 128 + 8 * nt * A_STRIDE * 2;
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, bool TMA>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, bool TMA, int MODE = 0>
 __global__ void __launch_bounds__(128 * KS)
 moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     const int* __restrict__ sorted_tok,
@@ -912,7 +912,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             const bool valid = (sidx < NT * 128) && (r < nrows);
             const int tok = valid ? (GATED ? sorted_tok[row0 + r] : row0 + r) : 0;
             xsrc[i] = X + (size_t)tok * ldx + c0 * KC + (sidx & 15) * 8;
-            xbytes[i] = valid ? 16 : 0;
+            xbytes[i] = (valid && MODE != 4) ? 16 : 0;
         }
     }
     auto issue_w = [&](int c, int stage) {
@@ -1028,6 +1028,10 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         const uint8_t* ws = wt_smem + stage * STAGE_BYTES;
         const uint8_t* ss = ws + W_STAGE;
         const __half* xs = reinterpret_cast<const __half*>(ss + S_STAGE);
+        if constexpr (MODE == 1) {                                   // loads only: touch one word per warp
+            if (lane == 0) acc[0][0][0] += __uint_as_float(*reinterpret_cast<const uint32_t*>(ws + warp * 16)) * 1e-30f;
+            continue;
+        }
         #pragma unroll
         for (int hh = 0; hh < 2 / KS; ++hh) {
             const int h = KS == 1 ? hh : gidx;                       // half chunk: k16 steps 4h..4h+3
@@ -1043,7 +1047,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                 uint32_t b[NT][4];
                 #pragma unroll
                 for (int nb = 0; nb < NT; ++nb) {
-                    if (nb < ntb)
+                    if (MODE == 4) { b[nb][0] = b[nb][1] = b[nb][2] = b[nb][3] = 0u; }
+                    else if (nb < ntb)
                         ldmatrix_x4(b[nb][0], b[nb][1], b[nb][2], b[nb][3],
                                     smem_u32(xs + (nb * 8 + (lane & 7)) * A_STRIDE + h * 64 + ps * 32 + (lane >> 3) * 8));
                 }
@@ -1061,13 +1066,21 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                         const uint32_t elo = w & 0x9C9C9C9Cu;
                         const uint32_t ehi = ((w << 2) & 0x8C8C8C8Cu) | ((w >> 2) & 0x10101010u);
                         uint32_t a[4];
-                        a[0] = f16x2_mul(e4m3x2_lo16_to_f16x2(elo), S0);
-                        a[1] = f16x2_mul(e4m3x2_hi16_to_f16x2(elo), S1);
-                        a[2] = f16x2_mul(e4m3x2_lo16_to_f16x2(ehi), S0);
-                        a[3] = f16x2_mul(e4m3x2_hi16_to_f16x2(ehi), S1);
-                        #pragma unroll
-                        for (int nb = 0; nb < NT; ++nb) {
-                            if (nb < ntb) mma16816(acc[i][nb * CH + (CH == 2 ? q : 0)], a, b[nb][2 * q], b[nb][2 * q + 1]);
+                        if constexpr (MODE == 2) {                   // no dequant: raw words as fragments
+                            a[0] = w; a[1] = sw; a[2] = elo; a[3] = ehi;
+                        } else {
+                            a[0] = f16x2_mul(e4m3x2_lo16_to_f16x2(elo), S0);
+                            a[1] = f16x2_mul(e4m3x2_hi16_to_f16x2(elo), S1);
+                            a[2] = f16x2_mul(e4m3x2_lo16_to_f16x2(ehi), S0);
+                            a[3] = f16x2_mul(e4m3x2_hi16_to_f16x2(ehi), S1);
+                        }
+                        if constexpr (MODE == 3) {                   // no MMA: keep the fragments live
+                            acc[i][0][0] += __uint_as_float((a[0] ^ a[1] ^ a[2] ^ a[3]) & 0x007FFFFFu);
+                        } else {
+                            #pragma unroll
+                            for (int nb = 0; nb < NT; ++nb) {
+                                if (nb < ntb) mma16816(acc[i][nb * CH + (CH == 2 ? q : 0)], a, b[nb][2 * q], b[nb][2 * q + 1]);
+                            }
                         }
                     }
                 }
@@ -1153,7 +1166,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, bool TMA>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, bool TMA, int MODE = 0>
 void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
                float* part, int ldp, int part_rows, int ksplit,
@@ -1163,7 +1176,7 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
     constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT) + (TMA ? NSTAGE * 8 : 0);
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         attr_set = true;
     }
     const int n_x = (GATED ? ntiles / 2 : ntiles) / (WT_NWARPS * MW);
@@ -1177,7 +1190,7 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
-    cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA>,
+    cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA, MODE>,
         X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, K, ntiles, gs_mul);
     TORCH_CHECK(err == cudaSuccess, "wt launch failed: ", cudaGetErrorString(err));
 }
@@ -1386,6 +1399,15 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
 #define OKC_W(G, M, T, S, NS, SK, TM) launch_wt<G, M, T, S, NS, SK, TM>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
         pp, ldp, prow, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
+    const int mode = ks >= 10 ? (int)ks - 10 : 0;          // bench ablations: ks = 10 + MODE on the (1,1,1,8) variant
+    if (mode > 0) {
+        TORCH_CHECK(mw == 1 && nt == 1 && nstage == 8 && !tma && ksplit == 1, "ablation modes: (1,1,1,8) only");
+#define OKC_WM(G, MD) launch_wt<G, 1, 1, 1, 8, false, false, MD>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(),         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo,         pp, ldp, prow, 1, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
+        if (gated) { switch (mode) { case 1: OKC_WM(true, 1); break; case 2: OKC_WM(true, 2); break; case 3: OKC_WM(true, 3); break; default: OKC_WM(true, 4); break; } }
+        else { switch (mode) { case 1: OKC_WM(false, 1); break; case 2: OKC_WM(false, 2); break; case 3: OKC_WM(false, 3); break; default: OKC_WM(false, 4); break; } }
+#undef OKC_WM
+        return;
+    }
     const int key = (tma ? 10000000 : 0) + (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
     switch (key) {
         case 111104: OKC_W(true, 1, 1, 1, 4, false, false); break;   case 111108: OKC_W(true, 1, 1, 1, 8, false, false); break;
@@ -2186,6 +2208,13 @@ def _bench_wt(state, autotune=False):
         try:
             print(f"  wt parts bs{bs} {(nt, mw2, ks, ns, ksp, tma)}: " + "  ".join(f"{k} {_timeit_cold(f, dev):6.1f}" for k, f in parts.items())
                   + f"  | local routes {int(((ids >= 0) & (ids < 32)).sum())} distinct {int(torch.unique(ids[(ids < 32)]).numel())}")
+            # ablations of the (1,1,1,8) kernels: 1 loads only, 2 no dequant, 3 no MMA, 4 no token tile
+            for mode in (1, 2, 3, 4):
+                t1 = _timeit_cold(lambda: ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
+                                  state["Wt13"], state["St13"], state["gs13"], state["inter"], part, 1, 4096, 512, maxb, True, 1, 1, 10 + mode, 8, 64.0, False, False), dev)
+                t2 = _timeit_cold(lambda: ext.moe_w4a16_wt(state["inter"], state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
+                                  state["Wt2"], state["St2"], state["gs2"], state["y"], part, 1, 4096, 256, maxb, False, 1, 1, 10 + mode, 8, 64.0, False, False), dev)
+                print(f"    ablation mode {mode} ({'loads only' if mode == 1 else 'no dequant' if mode == 2 else 'no mma' if mode == 3 else 'no x tile'}): gemm1 {t1:6.1f}  gemm2 {t2:6.1f}")
         except Exception as e:
             print(f"  wt parts bs{bs} failed: {str(e)[:100]}")
     global _PDL_OVERRIDE
