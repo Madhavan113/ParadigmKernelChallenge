@@ -1536,13 +1536,17 @@ __host__ __device__ constexpr int w12_stage_bytes(int nt) { return 4 * W12_TILE_
 // SPLITK: the CTA stores its fp32 partial slice (plain stores), takes a ticket on cnt[tile group]; the last arrival
 // sums the slices from L2 (ld.global.cg), adds the group's escapes (two 32-row pack tiles) in parallel over
 // (escape, token) with shared-memory atomics, writes bf16 and resets the ticket. KSPLIT == 1: the CTA's own sums.
+__device__ __forceinline__ void fence_acq_rel_gpu() { asm volatile("fence.acq_rel.gpu;\n" ::: "memory"); }
+
 template <int NT, bool SPLITK>
 __device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m, int N, int tid, int warp, int g, int t,
         float* __restrict__ part, int* __restrict__ cnt,
         const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
         const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
 {
-    __shared__ float red[64][33];
+    // Latency-aware: every loop below issues all of its global loads before using any (the previous version chained
+    // one L2 round trip per loop iteration and cost 12-26 us).
+    __shared__ __align__(16) float red[64][33];
     __shared__ int s_last;
     const int col0 = (blockIdx.x * 4 + warp) * 16 + g;                  // output column (row of W) of fragment row g
     if constexpr (SPLITK) {
@@ -1557,21 +1561,43 @@ __device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m,
                     const int tok = nbk * 8 + 2 * t + cc;
                     if (tok < m) pz[(size_t)tok * N + col0 + 8 * hr] = accv[nbk * 4 + 2 * hr + cc];
                 }
-        __threadfence();
         __syncthreads();
         if (tid == 0) {
+            fence_acq_rel_gpu();                                        // release this CTA's slice (cumulative over the barrier)
             const int old = atomicAdd(cnt + blockIdx.x, 1);
             s_last = (old == KSPLIT - 1);
             if (old == KSPLIT - 1) cnt[blockIdx.x] = 0;
+            fence_acq_rel_gpu();                                        // acquire the other slices
         }
         __syncthreads();
         if (!s_last) return;
-        __threadfence();
-        for (int idx = tid; idx < 64 * m; idx += 128) {
-            const int n = idx & 63, i = idx >> 6;
-            float v = 0.f;
-            for (int z = 0; z < KSPLIT; ++z) v += __ldcg(part + ((size_t)z * m + i) * N + blockIdx.x * 64 + n);
-            red[n][i] = v;
+        // slice sum, 16 tokens per pass: thread -> token il = tid >> 3, columns 8*oct .. 8*oct+7 (two float4)
+        const int il = tid >> 3, oct = tid & 7;
+        for (int p0 = 0; p0 < m; p0 += 16) {
+            const int i = p0 + il;
+            float4 acc0 = make_float4(0.f, 0.f, 0.f, 0.f), acc1 = acc0;
+            if (i < m) {
+                for (int zb = 0; zb < KSPLIT; zb += 8) {
+                    float4 v0[8], v1[8];
+                    #pragma unroll
+                    for (int z = 0; z < 8; ++z) {
+                        if (zb + z < KSPLIT) {
+                            const float* src = part + ((size_t)(zb + z) * m + i) * N + blockIdx.x * 64 + oct * 8;
+                            v0[z] = __ldcg(reinterpret_cast<const float4*>(src));
+                            v1[z] = __ldcg(reinterpret_cast<const float4*>(src + 4));
+                        } else {
+                            v0[z] = make_float4(0.f, 0.f, 0.f, 0.f); v1[z] = v0[z];
+                        }
+                    }
+                    #pragma unroll
+                    for (int z = 0; z < 8; ++z) {
+                        acc0.x += v0[z].x; acc0.y += v0[z].y; acc0.z += v0[z].z; acc0.w += v0[z].w;
+                        acc1.x += v1[z].x; acc1.y += v1[z].y; acc1.z += v1[z].z; acc1.w += v1[z].w;
+                    }
+                }
+                red[oct * 8 + 0][i] = acc0.x; red[oct * 8 + 1][i] = acc0.y; red[oct * 8 + 2][i] = acc0.z; red[oct * 8 + 3][i] = acc0.w;
+                red[oct * 8 + 4][i] = acc1.x; red[oct * 8 + 5][i] = acc1.y; red[oct * 8 + 6][i] = acc1.z; red[oct * 8 + 7][i] = acc1.w;
+            }
         }
     } else {
         #pragma unroll
@@ -1585,18 +1611,27 @@ __device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m,
                 }
     }
     __syncthreads();
-    #pragma unroll
-    for (int pt = 0; pt < 2; ++pt) {
-        const int e0 = esc_off[2 * blockIdx.x + pt], ecnt = esc_off[2 * blockIdx.x + pt + 1] - e0;
-        for (int idx = tid; idx < ecnt * m; idx += 128) {
-            const int e = e0 + idx / m, i = idx - (idx / m) * m;
-            atomicAdd(&red[pt * 32 + esc_n[e]][i], esc_d[e] * __bfloat162float(X[(size_t)i * ldx + esc_k[e]]));
+    // escapes of pack tiles 2*bx, 2*bx + 1: one escape per thread per batch, its m token values loaded together
+    const int e0 = esc_off[2 * blockIdx.x], e1 = esc_off[2 * blockIdx.x + 2];       // the two lists are contiguous
+    for (int base = e0; base < e1; base += 128) {
+        const int e = base + tid;
+        if (e < e1) {
+            const int nl = esc_n[e] + (e >= esc_off[2 * blockIdx.x + 1] ? 32 : 0);
+            const int kk = esc_k[e];
+            const float d = esc_d[e];
+            float xv[8 * NT];
+            #pragma unroll
+            for (int i = 0; i < 8 * NT; ++i) xv[i] = i < m ? __bfloat162float(X[(size_t)i * ldx + kk]) : 0.f;
+            #pragma unroll
+            for (int i = 0; i < 8 * NT; ++i)
+                if (i < m) atomicAdd(&red[nl][i], d * xv[i]);
         }
     }
     __syncthreads();
-    for (int idx = tid; idx < 64 * m; idx += 128) {
-        const int n = idx & 63, i = idx >> 6;
-        out[(size_t)i * ldo + blockIdx.x * 64 + n] = __float2bfloat16(red[n][i]);
+    // bf16x2 stores: thread -> columns 2*(tid & 31), tokens (tid >> 5) + 4r
+    for (int i = tid >> 5; i < m; i += 4) {
+        const int n = 2 * (tid & 31);
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)i * ldo + blockIdx.x * 64 + n) = __floats2bfloat162_rn(red[n][i], red[n + 1][i]);
     }
 }
 
