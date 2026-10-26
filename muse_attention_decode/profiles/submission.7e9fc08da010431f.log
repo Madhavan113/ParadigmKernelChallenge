@@ -1,0 +1,33 @@
+BENCH attention: us per graph replay after an L2 flush (median), plan overrides
+  B1 L1 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 16}      15.3 us
+  B1 L1 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 16, 'pfx': True}      16.2 us
+  B1 L1 full      {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 128}      23.7 us
+  B1 L1 full      {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 128, 'pfx': True}      24.6 us
+  B16 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'splits': 8}      16.9 us
+  B16 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'splits': 8, 'pfx': True}      17.5 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16}                 115.5 us
+  B32 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'splits': 8}      20.3 us
+  B32 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'splits': 8, 'pfx': True}      22.7 us
+  B32 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8}                  205.3 us
+  B1 L8 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 32}      22.4 us
+  B1 L8 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 32, 'pfx': True}      23.1 us
+  B1 L8 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 32, 'g1': 8, 'pfx': True}      23.5 us
+  B1 L8 full      {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 64, 'warps': 8}      32.0 us
+  B1 L8 full      {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 64, 'warps': 8, 'pfx': True}      32.7 us
+  B1 L8 full      {'hp': 1, 'bd': False, 'stages': 8, 'ex2h': True, 'block_t': 128, 'splits': 64, 'warps': 8, 'pfx': True}      33.1 us
+  B16 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 8}      25.4 us
+  B16 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 8, 'pfx': True}      26.2 us
+  B16 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 4, 'pfx': True}      26.0 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 8}     136.6 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 8, 'pfx': True}     149.1 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 8, 'ex2h': True, 'block_t': 128, 'splits': 8, 'pfx': True}     149.9 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 16, 'pfx': True}     160.6 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 4, 'pfx': True}     198.5 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 8, 'pfx': True, 'pf': False}     147.0 us
+  B32 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 4}      28.8 us
+  B32 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 4, 'pfx': True}      32.1 us
+  B32 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 4}     264.1 us
+  B32 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 4, 'pfx': True}     364.7 us
+  B32 L8 full     {'hp': 1, 'bd': False, 'stages': 6, 'ex2h': True, 'block_t': 128, 'splits': 4, 'pfx': True}     366.0 us
+  B32 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 8, 'pfx': True}     367.2 us
+BENCH attention done in 33s

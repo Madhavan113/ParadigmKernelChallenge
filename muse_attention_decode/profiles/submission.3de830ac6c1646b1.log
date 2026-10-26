@@ -1,0 +1,40 @@
+BENCH attention: us per graph replay after an L2 flush (median), plan overrides
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16}                 115.4 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16, 'abl': 1}       201.2 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16, 'abl': 2}       185.2 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16, 'qk8': True, 'abl': 1}     175.8 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16, 'rb': 64}       125.0 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 7, 'block_t': 64, 'splits': 16, 'rb': 64}       122.0 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 128, 'splits': 16, 'rb': 64}      153.4 us
+  B16 L1 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 16, 'rb': 64}     138.7 us
+  B16 L1 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'splits': 16, 'rb': 64}     164.8 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 32, 'rb': 64}       148.6 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 8, 'block_t': 64, 'splits': 16}                 113.9 us
+  B16 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16, 'rb': 64, 'abl': 1}     171.5 us
+  B32 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8}                  205.0 us
+  B32 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8, 'abl': 1}        336.5 us
+  B32 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8, 'rb': 64}        218.4 us
+  B32 L1 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16, 'rb': 64}       231.6 us
+  B32 L1 full     {'hp': 2, 'bd': True, 'stages': 7, 'block_t': 64, 'splits': 8, 'rb': 64}        215.9 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 8}     136.1 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 8, 'abl': 1}     212.3 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 8, 'abl': 2}     793.5 us
+  B16 L8 full     {'hp': 1, 'bd': False, 'stages': 8, 'ex2h': True, 'block_t': 128, 'splits': 8}     133.8 us
+  B16 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8, 'warps': 8}      235.5 us
+  B16 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 16, 'warps': 8}     276.3 us
+  B16 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 4, 'warps': 8}      411.7 us
+  B16 L8 full     {'hp': 2, 'bd': True, 'stages': 7, 'block_t': 64, 'splits': 8, 'warps': 8}      234.6 us
+  B16 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 128, 'splits': 8, 'warps': 8}     211.9 us
+  B16 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8, 'warps': 8, 'abl': 1}     380.8 us
+  B16 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8, 'warps': 16}     311.8 us
+  B16 L8 full     {'hp': 2, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 8}     279.0 us
+  B16 L8 full     {'hp': 2, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'warps': 8, 'splits': 8}     243.0 us
+  B16 L8 full     {'hp': 2, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 16}     294.5 us
+  B32 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 4}     262.9 us
+  B32 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 4, 'abl': 1}     407.7 us
+  B32 L8 full     {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'splits': 4, 'abl': 2}    1568.0 us
+  B32 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 4, 'warps': 8}      413.1 us
+  B32 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 8, 'warps': 8}      439.3 us
+  B32 L8 full     {'hp': 2, 'bd': True, 'stages': 5, 'block_t': 64, 'splits': 4, 'warps': 16}     571.4 us
+  B32 L8 full     {'hp': 2, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'warps': 8, 'splits': 4}     533.9 us
+BENCH attention done in 77s
