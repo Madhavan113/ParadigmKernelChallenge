@@ -1,0 +1,33 @@
+  cuda built 53s
+BENCH proj (us per call, cold L2 by a read flush; '!' = rel err above tol)
+  router m=128: cat+mm   9.6 | dup+mm   9.4
+  router m=256: cat+mm  13.5 | dup+mm  13.0
+  pooler m=128: cuBLAS  28.3 | bmm2  26.7 | bmm4  28.5
+BENCH pooler/unpooler m=16/32 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)
+  pooler    (64, 256, 2, 4, 4, True)       cur m16   21.3 m32   23.2 | m16  22.4 | m32  23.5
+  pooler    (64, 256, 2, 4, 4, False)      cur m16   21.3 m32   23.2 | m16  22.5 | m32  23.7
+  pooler    (64, 128, 2, 4, 6, True)       cur m16   21.3 m32   23.2 | m16  23.0 | m32  24.1
+  pooler    (64, 128, 2, 4, 8, True)       cur m16   21.3 m32   23.2 | m16  23.5 | m32  25.0
+  pooler    (64, 256, 2, 2, 4, True)       cur m16   21.3 m32   23.2 | m16  22.9 | m32  23.6
+  pooler    (64, 128, 2, 2, 8, True)       cur m16   21.3 m32   23.2 | m16  24.0 | m32  25.2
+  pooler    (32, 256, 1, 4, 5, True)       cur m16   21.3 m32   23.2 | m16  21.2 | m32  23.2
+  pooler    (32, 128, 1, 4, 8, False)      cur m16   21.3 m32   23.2 | m16  21.1 | m32  24.9
+  pooler    (64, 256, 4, 4, 4, True)       cur m16   21.3 m32   23.2 | m16  24.8 | m32  26.4
+  pooler    (128, 64, 2, 4, 8, True)       cur m16   21.3 m32   23.2 | m16  27.7 | m32  27.4
+  unpooler  (64, 256, 2, 4, 4, True)       cur m16   21.4 m32   21.6 | m16  24.8 | m32  26.5
+  unpooler  (64, 256, 2, 4, 4, False)      cur m16   21.4 m32   21.6 | m16  24.9 | m32  27.3
+  unpooler  (64, 128, 2, 4, 6, True)       cur m16   21.4 m32   21.6 | m16  22.9 | m32  28.2
+  unpooler  (64, 128, 2, 4, 8, True)       cur m16   21.4 m32   21.6 | m16  25.9 | m32  29.0
+  unpooler  (64, 256, 2, 2, 4, True)       cur m16   21.4 m32   21.6 | m16  25.8 | m32  27.4
+  unpooler  (64, 128, 2, 2, 8, True)       cur m16   21.4 m32   21.6 | m16  26.5 | m32  28.1
+  unpooler  (32, 256, 1, 4, 5, True)       cur m16   21.4 m32   21.6 | m16  21.4 | m32  25.3
+  unpooler  (32, 128, 1, 4, 8, False)      cur m16   21.4 m32   21.6 | m16  21.8 | m32  23.3
+  unpooler  (64, 256, 4, 4, 4, True)       cur m16   21.4 m32   21.6 | m16  29.3 | m32  30.9
+  unpooler  (128, 64, 2, 4, 8, True)       cur m16   21.4 m32   21.6 | m16  23.5 | m32  24.3
+BENCH qkv/o (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)
+  qkv m=8: table  13.9 | cuBLAS  14.0 | (64, 128, 8, 4, 4, True)  13.8 | (32, 256, 4, 4, 3, True)  13.8 | (64, 128, 8, 4, 4, False)  14.4 | (64, 256, 4, 4, 4, True)  17.4 | (64, 128, 4, 4, 6, True)  14.6
+  qkv m=16: table  13.8 | cuBLAS  13.8 | (64, 128, 8, 4, 4, True)  14.1 | (32, 256, 4, 4, 3, True)  13.6 | (64, 128, 8, 4, 4, False)  15.0 | (64, 256, 4, 4, 4, True)  17.9 | (64, 128, 4, 4, 6, True)  14.8
+  qkv m=32: table  19.8 | cuBLAS  14.0 | (64, 128, 8, 4, 4, True)  16.9 | (32, 256, 4, 4, 3, True)  16.2 | (64, 128, 8, 4, 4, False)  18.8 | (64, 256, 4, 4, 4, True)  20.0 | (64, 128, 4, 4, 6, True)  25.3
+   fail o 32 (64, 128, 1, 4, 6, True) 'o_tiled_64x128'
+  o m=32: table   5.4 | cuBLAS   5.1 | (64, 256, 1, 4, 4, True)   5.4 | (64, 128, 1, 4, 6, True) fail | (32, 128, 1, 4, 8, True)   6.2 | (64, 256, 1, 4, 4, False)   6.1
+BENCH proj done in 63s

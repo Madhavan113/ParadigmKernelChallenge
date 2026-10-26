@@ -1,0 +1,46 @@
+  cuda built 53s
+BENCH proj (us per call, cold L2 by a read flush; '!' = rel err above tol)
+  qkv_gate  m8: triton  14.6 cuBLAS  14.2 | m16: triton  14.5 cuBLAS  13.8 | m32: triton  19.6 cuBLAS  14.2
+  o         m8: triton   4.9 cuBLAS   4.4 | m16: triton   4.1 cuBLAS   4.8 | m32: triton   5.3 cuBLAS   5.1
+  pooler    m8: triton  21.1 cuBLAS  23.7 | m16: triton  20.9 cuBLAS  24.2 | m32: triton  23.4 cuBLAS  24.5
+  unpooler  m8: triton   5.1 cuBLAS   5.4 | m16: triton  20.9 cuBLAS  21.0 | m32: triton  21.5 cuBLAS  21.4
+  router    m8: triton   4.7 cuBLAS   7.2 | m16: triton   5.1 cuBLAS   7.4 | m32: triton   6.3 cuBLAS   8.6
+  m=1 qkv_gate : triton  15.1 | g1/4/2  11.4 | g2/2/2  12.1 | g2/4/2  11.6 | g4/2/2  12.2 | g2/2/4  10.6 | g1/2/4  12.9 | g1/2/8  13.1
+  m=1 pooler   : triton  21.1 | g1/4/2  19.0 | g2/2/2  18.0 | g2/4/2  18.2 | g4/2/2  18.1 | g2/2/4  19.4 | g1/2/4  19.6 | g1/2/8  22.4
+  m=1 unpooler : triton   5.5 | g1/4/2   4.3 | g2/2/2   5.2 | g2/4/2   4.7 | g4/2/2   5.7 | g2/2/4   4.8 | g1/2/4   4.2 | g1/2/8   5.6
+  m=1 router   : triton   5.0 | g1/4/8   4.5 | g1/2/8   4.5 | g2/2/8   5.0
+BENCH qkv m=8/16 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)
+  qkv (32, 128, 8, 4, 4, True)       cur m8   14.6 m16   14.6 | m8  14.3 | m16  14.5
+  qkv (32, 128, 8, 4, 6, True)       cur m8   14.6 m16   14.6 | m8  17.1 | m16  17.1
+  qkv (32, 128, 4, 4, 4, True)       cur m8   14.6 m16   14.6 | m8  15.0 | m16  14.5
+  qkv (32, 128, 4, 4, 6, True)       cur m8   14.6 m16   14.6 | m8  14.5 | m16  14.7
+  qkv (32, 128, 8, 4, 4, False)      cur m8   14.6 m16   14.6 | m8  14.9 | m16  15.1
+  qkv (32, 128, 4, 4, 6, False)      cur m8   14.6 m16   14.6 | m8  15.5 | m16  15.7
+  qkv (64, 128, 8, 4, 4, True)       cur m8   14.6 m16   14.6 | m8  13.7 | m16  13.8
+  qkv (64, 128, 4, 4, 6, True)       cur m8   14.6 m16   14.6 | m8  15.2 | m16  15.0
+  qkv (32, 256, 8, 4, 4, True)       cur m8   14.6 m16   14.6 | m8  16.4 | m16  15.7
+  qkv (32, 256, 8, 4, 3, True)       cur m8   14.6 m16   14.6 | m8  16.0 | m16  16.0
+  qkv (32, 256, 4, 4, 3, True)       cur m8   14.6 m16   14.6 | m8  13.9 | m16  13.5
+  qkv (32, 256, 8, 4, 4, False)      cur m8   14.6 m16   14.6 | m8  15.8 | m16  16.3
+  qkv (64, 64, 8, 4, 8, True)        cur m8   14.6 m16   14.6 | m8  15.0 | m16  14.9
+  qkv (32, 128, 16, 4, 4, True)      cur m8   14.6 m16   14.6 | m8  17.2 | m16  17.1
+  qkv (32, 256, 4, 2, 4, True)       cur m8   14.6 m16   14.6 | m8  14.5 | m16  13.4
+  qkv (32, 128, 8, 2, 6, True)       cur m8   14.6 m16   14.6 | m8  16.2 | m16  16.2
+BENCH pooler/unpooler m=8/16 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)
+  pooler    (32, 128, 1, 4, 4, True)       cur m8   21.4 m16   21.2 | m8  26.7 | m16  26.8
+  pooler    (32, 128, 2, 4, 4, True)       cur m8   21.4 m16   21.2 | m8  23.3 | m16  22.8
+  pooler    (32, 128, 1, 2, 6, True)       cur m8   21.4 m16   21.2 | m8  21.8 | m16  22.3
+  pooler    (32, 128, 2, 2, 6, True)       cur m8   21.4 m16   21.2 | m8  22.6 | m16  22.4
+  pooler    (32, 128, 1, 4, 6, True)       cur m8   21.4 m16   21.2 | m8  24.2 | m16  24.2
+  pooler    (32, 256, 1, 2, 4, True)       cur m8   21.4 m16   21.2 | m8  21.4 | m16  21.6
+  pooler    (32, 128, 1, 4, 4, False)      cur m8   21.4 m16   21.2 | m8  25.7 | m16  25.9
+  pooler    (64, 64, 1, 4, 8, True)        cur m8   21.4 m16   21.2 | m8  34.6 | m16  34.4
+  unpooler  (32, 128, 1, 4, 4, True)       cur m8   21.3 m16   20.9 | m8  21.2 | m16  21.1
+  unpooler  (32, 128, 2, 4, 4, True)       cur m8   21.3 m16   20.9 | m8  23.3 | m16  23.0
+  unpooler  (32, 128, 1, 2, 6, True)       cur m8   21.3 m16   20.9 | m8  20.9 | m16  20.9
+  unpooler  (32, 128, 2, 2, 6, True)       cur m8   21.3 m16   20.9 | m8  25.3 | m16  25.3
+  unpooler  (32, 128, 1, 4, 6, True)       cur m8   21.3 m16   20.9 | m8  21.4 | m16  21.1
+  unpooler  (32, 256, 1, 2, 4, True)       cur m8   21.3 m16   20.9 | m8  20.9 | m16  20.5
+  unpooler  (32, 128, 1, 4, 4, False)      cur m8   21.3 m16   20.9 | m8  21.2 | m16  20.9
+  unpooler  (64, 64, 1, 4, 8, True)        cur m8   21.3 m16   20.9 | m8  21.2 | m16  21.5
+BENCH proj done in 66s
