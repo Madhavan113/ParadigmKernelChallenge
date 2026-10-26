@@ -260,7 +260,7 @@ def _attn_decode_kernel(
     PS: tl.constexpr, WINDOW: tl.constexpr, ROPE: tl.constexpr, SPLITS: tl.constexpr,
     RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr, ACT: tl.constexpr, FP8_ASM: tl.constexpr,
     CH: tl.constexpr, QK_FP8: tl.constexpr, HP: tl.constexpr, BD: tl.constexpr, EX2H: tl.constexpr, PV8: tl.constexpr,
-    G1: tl.constexpr, PF: tl.constexpr, ABL: tl.constexpr,
+    G1: tl.constexpr, PF: tl.constexpr, ABL: tl.constexpr, PFX: tl.constexpr,
 ):
     GROUP: tl.constexpr = HQ // HKV
     HPS: tl.constexpr = HP if BD else 1        # heads sharing one row set
@@ -387,6 +387,13 @@ def _attn_decode_kernel(
         page = tl.load(pt_ptr + b * max_pages + t // PS)
         row = page.to(tl.int64) * PS + (t % PS).to(tl.int64)
         cp = row[:, None] * ROW_W + h0 * D + c[None, :]
+        if PFX:
+            # the other KV head's two 32-byte sectors of the same 128-byte line: fetched with ours, so
+            # its CTA (launched next to this one) hits L2 and the DRAM sees one 128-byte access per row
+            sec = tl.arange(0, 2) * 32
+            cpx = row[:, None] * ROW_W + (h0 ^ 1) * D + sec[None, :]
+            _prefetch_l2(kc_ptr + cpx)
+            _prefetch_l2(vc_ptr + cpx)
         k8 = tl.load(kc_ptr + cp)
         v8 = tl.load(vc_ptr + cp)
         m0, l0, acc0 = _tile(q0, k8, v8, rmask, m0, l0, acc0, qk_mult, False, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
@@ -585,23 +592,21 @@ def _attn_bench(data):
     bd = dict(hp=2, bd=True, stages=5, block_t=64)                   # both heads per CTA, whole 128B rows
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128)      # one head per CTA
     w8 = dict(nw, block_t=64, warps=8)
-    sq = dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=4)
     plans = {
-        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, ch=16), dict(nw, splits=16, ch=4), dict(nw, splits=8, ch=8)],
-        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=128, ch=16), dict(nw, splits=64, ch=16), dict(nw, splits=128, g1=8, ch=16)],
-        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16, stages=8), dict(bd, splits=16, stages=6), dict(bd, splits=16, stages=8, pf=False)],
-        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=8, stages=8), dict(bd, splits=8, stages=6)],
-        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, ch=8), dict(w8, splits=32, g1=4), dict(w8, splits=32, g1=4, ch=8),
-                          dict(w8, splits=32, ch=2), dict(w8, splits=16, ch=8), dict(w8, splits=32, g1=8, ch=8)],
-        "B1 L8 full": [dict(nw, splits=64, warps=8), dict(nw, splits=64, warps=8, ch=8), dict(nw, splits=64, warps=8, g1=16, ch=8),
-                       dict(nw, splits=128, warps=8, ch=8), dict(nw, splits=64, warps=8, g1=8, ch=8)],
-        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, ch=8)],
-        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, stages=8), dict(nw, splits=8, stages=6), dict(sq, splits=8), dict(sq, splits=16),
-                        dict(nw, splits=8, stages=8, pf=False)],
-        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, ch=8)],
-        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, stages=8), dict(nw, splits=4, stages=6), dict(sq, splits=4)],
+        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, pfx=True)],
+        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=128, pfx=True)],
+        "B16 L1 sliding": [dict(nw, splits=8, block_t=64), dict(nw, splits=8, block_t=64, pfx=True)],
+        "B16 L1 full": [dict(bd, splits=16)],
+        "B32 L1 sliding": [dict(nw, splits=8, block_t=64), dict(nw, splits=8, block_t=64, pfx=True)],
+        "B32 L1 full": [dict(bd, splits=8)],
+        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, pfx=True), dict(w8, splits=32, g1=8, pfx=True)],
+        "B1 L8 full": [dict(nw, splits=64, warps=8), dict(nw, splits=64, warps=8, pfx=True), dict(nw, splits=64, warps=8, pfx=True, stages=8)],
+        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, pfx=True), dict(w8, splits=4, pfx=True)],
+        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, pfx=True), dict(nw, splits=8, pfx=True, stages=8), dict(nw, splits=16, pfx=True),
+                        dict(nw, splits=4, pfx=True), dict(nw, splits=8, pfx=True, pf=False)],
+        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, pfx=True)],
+        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, pfx=True), dict(nw, splits=4, pfx=True, stages=6), dict(nw, splits=8, pfx=True)],
     }
-    cases = {k: v for k, v in cases.items() if k in plans}
     for name, (B, L, window) in cases.items():
         d = make(B, L, window)
         for plan in plans[name]:
@@ -659,7 +664,9 @@ def _attention_forward(data) -> torch.Tensor:
     page_table = data["page_table"]
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
-    ch = min(max(g1, g2), int(plan.get("ch") or (8 if rb <= 16 else (4 if rb <= 64 else 1))))   # partial sets merged per load group
+    # partial sets merged per load group: wide for tiny batches (one CTA per SM, registers are free)
+    ch_default = (16 if rb <= 16 else 8) if ctas <= 2 else (8 if rb <= 16 else (4 if rb <= 64 else 1))
+    ch = min(max(g1, g2), int(plan.get("ch") or ch_default))
     extra = {}
     if plan.get("maxnreg"):
         extra["maxnreg"] = plan["maxnreg"]
@@ -672,7 +679,8 @@ def _attention_forward(data) -> torch.Tensor:
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
         ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=plan["block_t"], ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
         CH=ch, QK_FP8=qk_fp8, HP=hp, BD=bd, EX2H=ex2h, PV8=pv8, G1=g1, PF=FP8_ASM and bool(plan.get("pf", True)),
-        ABL=int(plan.get("abl", 0)), num_warps=plan["warps"], num_stages=plan["stages"],
+        ABL=int(plan.get("abl", 0)), PFX=FP8_ASM and hp == 1 and bool(plan.get("pfx", False)),
+        num_warps=plan["warps"], num_stages=plan["stages"],
         **extra,
     )
     return out
