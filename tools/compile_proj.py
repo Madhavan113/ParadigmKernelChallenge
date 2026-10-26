@@ -7,14 +7,14 @@ from triton.compiler import ASTSource
 from triton.backends.compiler import GPUTarget
 import submission as S
 KERNEL = S._tiled_gemv_kernel if "--gemv" in sys.argv else (S._tiled_gemm_kernel if "--tiled" in sys.argv else S._skinny_gemm_kernel)
-a = [x for x in sys.argv[1:] if x not in ("--tiled", "--gemv")]
+a = [x for x in sys.argv[1:] if x not in ("--tiled", "--gemv", "--swap")]
 
 BM, BN, BK, SK, TW, NW, NS, MSPEC = [int(x) for x in (a + ["16", "32", "256", "1", "0", "4", "4", "0"][len(a):])]
 sig = {"x_ptr": "*bf16", "w_ptr": "*bf16", "w2_ptr": "*bf16", "out_ptr": "*bf16", "part_ptr": "*fp32",
        "cnt_ptr": "*i32", "M": "i32", "N": "i32", "K": "i32", "stride_xm": "i32", "stride_wn": "i32",
        "stride_om": "i32", "BLOCK_M": "constexpr", "BLOCK_N": "constexpr", "BLOCK_K": "constexpr",
-       "SPLIT_K": "constexpr", "TWO_W": "constexpr"}
-consts = {"BLOCK_M": BM, "BLOCK_N": BN, "BLOCK_K": BK, "SPLIT_K": SK, "TWO_W": bool(TW)}
+       "SPLIT_K": "constexpr", "TWO_W": "constexpr", "SWAP_MN": "constexpr"}
+consts = {"BLOCK_M": BM, "BLOCK_N": BN, "BLOCK_K": BK, "SPLIT_K": SK, "TWO_W": bool(TW), "SWAP_MN": "--swap" in sys.argv}
 # the JIT's specialization: every pointer and stride is 16-byte aligned / divisible by 16
 names = list(sig)
 attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names)
