@@ -1,0 +1,42 @@
+
+void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
+                  torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
+                  torch::Tensor out, int64_t K, int64_t ntiles, int64_t max_blocks, bool gated,
+                  int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, double store_mul)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const __half* Xp = reinterpret_cast<const __half*>(X.data_ptr());
+    const uint8_t* Wp = reinterpret_cast<const uint8_t*>(Wr.data_ptr());
+    const uint8_t* Sp = reinterpret_cast<const uint8_t*>(Sr.data_ptr());
+    __half* o16 = gated ? reinterpret_cast<__half*>(out.data_ptr()) : nullptr;
+    __nv_bfloat16* obf = gated ? nullptr : reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int ldo = (int)out.stride(0);
+#define OKC_W(G, M, T, S, NS) launch_wt<G, M, T, S, NS>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
+        blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
+        (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, (float)store_mul, stream)
+    const int key = (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
+    switch (key) {
+        case 111104: OKC_W(true, 1, 1, 1, 4); break;   case 111204: OKC_W(true, 1, 1, 2, 4); break;
+        case 111106: OKC_W(true, 1, 1, 1, 6); break;   case 111206: OKC_W(true, 1, 1, 2, 6); break;
+        case 112104: OKC_W(true, 1, 2, 1, 4); break;   case 112204: OKC_W(true, 1, 2, 2, 4); break;
+        case 114104: OKC_W(true, 1, 4, 1, 4); break;
+        case 11104: OKC_W(false, 1, 1, 1, 4); break;   case 11204: OKC_W(false, 1, 1, 2, 4); break;
+        case 11106: OKC_W(false, 1, 1, 1, 6); break;   case 11206: OKC_W(false, 1, 1, 2, 6); break;
+        case 21104: OKC_W(false, 2, 1, 1, 4); break;   case 21204: OKC_W(false, 2, 1, 2, 4); break;
+        case 12104: OKC_W(false, 1, 2, 1, 4); break;   case 22104: OKC_W(false, 2, 2, 1, 4); break;
+        case 14104: OKC_W(false, 1, 4, 1, 4); break;   case 24104: OKC_W(false, 2, 4, 1, 4); break;
+        default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage)");
+    }
+#undef OKC_W
+}
+
+void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, torch::Tensor nw, torch::Tensor out,
+                  int64_t M, double eps)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int H = (int)out.size(1);
+    TORCH_CHECK(H % 2048 == 0, "finalize: H must be a multiple of 2048");
+    moe_finalize_kernel<<<(unsigned)M, 256, 0, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(y.data_ptr()), (int)y.stride(0), row_of_pair.data_ptr<int>(),
+        tw.data_ptr<float>(), nw.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), H, (float)eps);
+}
