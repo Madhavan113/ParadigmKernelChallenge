@@ -65,6 +65,14 @@ __device__ __forceinline__ float2 f16x2_to_f2(uint32_t v) {
     __half2 h = *reinterpret_cast<__half2*>(&v);
     return __half22float2(h);
 }
+// sin/cos of the RoPE angle x (fp32, as the reference computes it): the range reduction in double,
+// the evaluation with the hardware intrinsic (|r| <= pi: ~2^-21 absolute error; no local memory)
+__device__ __forceinline__ void sincos_fast(float x, float& sn, float& cs) {
+    const double two_pi = 6.283185307179586;
+    const double xd = (double)x;
+    const float r = (float)(xd - rint(xd / two_pi) * two_pi);
+    __sincosf(r, &sn, &cs);
+}
 // byte offset of 16-byte chunk `ch` of row `r` in the fp8 staging tile ([rows][64 B], swizzled)
 __device__ __forceinline__ uint32_t swz8(int r, int ch) { return (uint32_t)r * 64u + (uint32_t)((ch ^ ((r >> 1) & 3)) << 4); }
 // byte offset of 16-byte chunk `ch` (8 fp16) of row `r` in an fp16 tile ([rows][128 B], swizzled)
@@ -205,7 +213,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             const float inv = rsqrtf(ss / D + 1e-5f) * qk_scale * k_scale;
             x0 *= inv; x1 *= inv;
             float sn, cs;
-            sincosf((float)(seq + r / G) * inv_freq, &sn, &cs);
+            sincos_fast((float)(seq + r / G) * inv_freq, sn, cs);
             *reinterpret_cast<__half2*>(Qs + r * QS_STRIDE + 2 * lane) = __floats2half2_rn(x0 * cs - x1 * sn, x0 * sn + x1 * cs);
         }
         if (warp < L) {
@@ -217,7 +225,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             const float inv = rsqrtf(ss / D + 1e-5f);
             x0 *= inv; x1 *= inv;
             float sn, cs;
-            sincosf((float)(seq + j) * inv_freq, &sn, &cs);
+            sincos_fast((float)(seq + j) * inv_freq, sn, cs);
             const float y0 = x0 * cs - x1 * sn, y1 = x0 * sn + x1 * cs;
             __nv_fp8x2_e4m3 k8(make_float2(y0 / k_scale, y1 / k_scale));
             __nv_fp8x2_e4m3 v8(make_float2(vx0 / v_scale, vx1 / v_scale));
@@ -276,7 +284,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
 
     // ---- the window: each warp its 64 keys, per 16-row tile ----
     const int wslot0 = slot0 + wrow0;            // global slot of this warp's first key
-    for (int rt = 0; rt < NRT; rt++) {
+    for (int rt = 0; rt < ((abl & 32) ? 0 : NRT); rt++) {
         float m_run[2] = {NEG, NEG}, l_run[2] = {0.f, 0.f};
         float acc[8][4];
         #pragma unroll
@@ -367,62 +375,70 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             my[32 + (g + 8) * RS + d0 + 1] = acc[nt][3];
         }
         __syncthreads();
-        // ---- merge the warps (+ the block's own tokens, on rank 0) ----
+        // ---- merge the warps (+ the block's own tokens, on rank 0): one pass, one barrier ----
         const bool own_new = (rank == 0);
-        if (tid < 16 * NW && !(abl & 4)) {
-            const int r = tid / NW, w = tid % NW;
-            float M = NEG;
-            for (int ww = 0; ww < NW; ww++) M = fmaxf(M, red[ww * RED_W + r]);
-            if (own_new) for (int jj = 0; jj < L; jj++) M = fmaxf(M, snew[(rt * 16 + r) * L + jj]);
-            wts[r * NW + w] = exp2f(red[w * RED_W + r] - M);
-            if (w == 0) {
-                float Ls = 0.f;
-                for (int ww = 0; ww < NW; ww++) Ls += exp2f(red[ww * RED_W + r] - M) * red[ww * RED_W + 16 + r];
-                if (own_new) for (int jj = 0; jj < L; jj++) Ls += exp2f(snew[(rt * 16 + r) * L + jj] - M);
-                Lrow[r] = Ls; Mrow[r] = M;
-            }
-        }
-        __syncthreads();
         float* F = fin + rt * RED_W;
         if (!(abl & 4)) {
-            for (int idx = tid; idx < 16 * D; idx += NT) {
-                const int r = idx / D, d = idx % D;
-                float O = 0.f;
-                for (int w = 0; w < NW; w++) O += wts[r * NW + w] * red[w * RED_W + 32 + r * RS + d];
+            #pragma unroll
+            for (int k = 0; k < (16 * D) / NT; k++) {
+                const int idx = tid + k * NT, r = idx / D, d = idx % D;
+                float M = NEG;
+                #pragma unroll
+                for (int ww = 0; ww < NW; ww++) M = fmaxf(M, red[ww * RED_W + r]);
+                if (own_new) for (int jj = 0; jj < L; jj++) M = fmaxf(M, snew[(rt * 16 + r) * L + jj]);
+                float O = 0.f, Ls = 0.f;
+                #pragma unroll
+                for (int ww = 0; ww < NW; ww++) {
+                    const float w = exp2f(red[ww * RED_W + r] - M);
+                    Ls += w * red[ww * RED_W + 16 + r];
+                    O += w * red[ww * RED_W + 32 + r * RS + d];
+                }
                 if (own_new) {
-                    const float M = Mrow[r];
-                    for (int jj = 0; jj < L; jj++) O += exp2f(snew[(rt * 16 + r) * L + jj] - M) * vnew[jj * D + d];
+                    for (int jj = 0; jj < L; jj++) {
+                        const float w = exp2f(snew[(rt * 16 + r) * L + jj] - M);
+                        Ls += w;
+                        O += w * vnew[jj * D + d];
+                    }
                 }
                 F[32 + r * RS + d] = O;
-                if (d == 0) { F[r] = Mrow[r]; F[16 + r] = Lrow[r]; }
+                if (d == 0) { F[r] = M; F[16 + r] = Ls; }
             }
         }
         __syncthreads();
     }
 
     // ---- combine the four CTAs' partials over distributed shared memory (rank 0 finishes) ----
-    cluster.sync();
-    if (rank != 0) { cluster.sync(); return; }
-    if (!(abl & 4)) {
+    if (!(abl & 128)) {
+        cluster.sync();
+        if (rank != 0) { cluster.sync(); return; }
+    } else if (rank != 0) return;
+    if (!(abl & 4) && !(abl & 128)) {
         const float* P1 = cluster.map_shared_rank(fin, 1);
         const float* P2 = cluster.map_shared_rank(fin, 2);
         const float* P3 = cluster.map_shared_rank(fin, 3);
-        for (int idx = tid; idx < NRT * 16 * D; idx += NT) {
-            const int rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D, d = rem % D;
-            float* F = fin + rt * RED_W;
-            const int off = rt * RED_W;
-            const float M0 = F[r], M1 = P1[off + r], M2 = P2[off + r], M3 = P3[off + r];
+        float* cw = red;                         // NRT x 16 x 4 weights, then the combined M, L (red is free now)
+        if (tid < NRT * 16) {
+            const int rt = tid / 16, r = tid % 16, off = rt * RED_W;
+            const float M0 = fin[off + r], M1 = P1[off + r], M2 = P2[off + r], M3 = P3[off + r];
+            const float L0 = fin[off + 16 + r], L1 = P1[off + 16 + r], L2 = P2[off + 16 + r], L3 = P3[off + 16 + r];
             const float M = fmaxf(fmaxf(M0, M1), fmaxf(M2, M3));
             const float w0 = exp2f(M0 - M), w1 = exp2f(M1 - M), w2 = exp2f(M2 - M), w3 = exp2f(M3 - M);
-            const float O = F[32 + r * RS + d] * w0 + P1[off + 32 + r * RS + d] * w1 + P2[off + 32 + r * RS + d] * w2 + P3[off + 32 + r * RS + d] * w3;
-            const float Lc = F[16 + r] * w0 + P1[off + 16 + r] * w1 + P2[off + 16 + r] * w2 + P3[off + 16 + r] * w3;
-            __syncthreads();                     // everyone has read F[r], F[16 + r] for this pass
-            F[32 + r * RS + d] = O;
-            if (d == 0) { F[16 + r] = Lc; F[r] = M; }
-            __syncthreads();
+            cw[tid * 4 + 0] = w0; cw[tid * 4 + 1] = w1; cw[tid * 4 + 2] = w2; cw[tid * 4 + 3] = w3;
+            fin[off + r] = M;
+            fin[off + 16 + r] = L0 * w0 + L1 * w1 + L2 * w2 + L3 * w3;
         }
+        __syncthreads();
+        #pragma unroll
+        for (int k = 0; k < (NRT * 16 * D) / NT; k++) {
+            const int idx = tid + k * NT, rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D, d = rem % D;
+            const int off = rt * RED_W, e = off + 32 + r * RS + d, wi = (rt * 16 + r) * 4;
+            fin[e] = fin[e] * cw[wi] + P1[e] * cw[wi + 1] + P2[e] * cw[wi + 2] + P3[e] * cw[wi + 3];
+        }
+        cluster.sync();
+    } else if (!(abl & 128)) {
+        cluster.sync();
     }
-    cluster.sync();
+    if (abl & 64) return;
 
     // ---- epilogue: o = O / L x v_scale; per-head RMSNorm x sigmoid(gate) -> bf16 ----
     #pragma unroll
