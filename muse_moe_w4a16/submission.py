@@ -799,10 +799,6 @@ __device__ __forceinline__ uint32_t e4m3x2_hi16_to_f16x2(uint32_t w) {
 // programmatic dependent launch (no-ops when the kernel was launched without the attribute)
 __device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
 __device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
-__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2::evict_last [%0];\n" :: "l"(p)); }
-__device__ __forceinline__ void cp_async16_pol(uint32_t dst, const void* src, int src_bytes, uint64_t pol) {
-    asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" :: "r"(dst), "l"(src), "r"(src_bytes), "l"(pol));
-}
 
 constexpr int WT_NWARPS = 4;
 __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
@@ -833,7 +829,6 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     extern __shared__ __align__(16) uint8_t wt_smem[];
 
     if (GATED) pdl_wait();                            // the routing lists and x16 come from the previous launch
-    if (GATED && l2pf) pdl_trigger();                 // small batches: let GEMM2's CTAs pre-launch and prefetch W2
     const int j = blockIdx.y;
     if (j >= *nblk) return;
     if (blk_bm[j] != 8 * NT) return;                  // mixed block sizes: this block belongs to the other kernel
@@ -881,16 +876,14 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
     const uint32_t smem_base = smem_u32(wt_smem);
 
-    uint64_t pol;
-    if (l2pf) asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
-    else asm volatile("createpolicy.fractional.L2::evict_normal.b64 %0, 1.0;\n" : "=l"(pol));
+    (void)l2pf;                                       // the L2-prefetch experiment was removed (illegal-instruction fault)
     auto issue_w = [&](int c, int stage) {
         const uint32_t ws = smem_base + stage * STAGE_BYTES;
         const uint32_t ss = ws + W_STAGE;
         #pragma unroll
         for (int i = 0; i < WSEG; ++i)
-            cp_async16_pol(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 1024, 16, pol);
-        if (tid < TPC * 8) cp_async16_pol(ss + tid * 16, ssrc + c * 128, 16, pol);
+            cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 1024, 16);
+        if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * 128, 16);
     };
     auto issue_x = [&](int c, int stage) {
         const uint32_t xs = smem_base + stage * STAGE_BYTES + W_STAGE + S_STAGE;
@@ -925,24 +918,6 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         #pragma unroll
         for (int st = 0; st < NSTAGE - 1; ++st)
             if (st < NC) issue_w(st, st);
-        if (l2pf && (tid & 7) == 0) {
-            // prefetch the rest of this slice and the same tiles of the next two blocks (their experts) into L2
-            for (int k = 0; k < 3; ++k) {
-                const int jb = j + k;
-                if (jb >= *nblk) break;
-                const size_t eb = (size_t)blk_e[jb] * NTILES;
-                #pragma unroll
-                for (int i = 0; i < WSEG; ++i) {
-                    const int sidx = tid + i * NTHR;
-                    const uint8_t* wb = Wr + ((eb + tile_of(sidx >> 6)) * NC_ALL + c0) * 1024 + (sidx & 63) * 16;
-                    for (int c = k == 0 ? NSTAGE - 1 : 0; c < NC; ++c) prefetch_l2(wb + c * 1024);
-                }
-                if (tid < TPC * 8) {
-                    const uint8_t* sb = Sr + ((eb + tile_of(tid >> 3)) * NC_ALL + c0) * 128 + (tid & 7) * 16;
-                    for (int c = k == 0 ? NSTAGE - 1 : 0; c < NC; ++c) prefetch_l2(sb + c * 128);
-                }
-            }
-        }
         pdl_wait();
         #pragma unroll
         for (int st = 0; st < NSTAGE - 1; ++st) {
@@ -1024,7 +999,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             }
         }
     }
-    if (!(GATED && l2pf)) pdl_trigger();              // main loop done: the next kernel may start launching
+    pdl_trigger();                                    // main loop done: the next kernel may start launching
     cp_async_wait<0>();
 
     if (KS == 2) {
@@ -1615,7 +1590,7 @@ _PDL_OVERRIDE = None   # bench: False forces plain launches
 WT_BIG = {128: (4, 2, 1, 2, 1), 100000: (4, 2, 1, 2, 1)}
 MIXED_MIN_TOKENS = 65
 _MIXED_OVERRIDE = None
-L2PF_MAX_TOKENS = 16   # up to this many tokens GEMM2 prefetches its W2 slice into L2 while GEMM1 runs (PDL)
+L2PF_MAX_TOKENS = 0    # W2 L2-prefetch experiment removed from the kernel (illegal-instruction fault on the judge); inert
 _L2PF_OVERRIDE = None
 
 
@@ -2260,7 +2235,7 @@ def _bench_wt(state, autotune=False):
         except Exception as e:
             print(f"  wt parts bs{bs} failed: {str(e)[:100]}")
     global _WT_ABL, _PDL_OVERRIDE, _MIXED_OVERRIDE, _L2PF_OVERRIDE
-    for name, var in (("mixed", "_MIXED_OVERRIDE"), ("l2pf", "_L2PF_OVERRIDE")):
+    for name, var in (("mixed", "_MIXED_OVERRIDE"),):
         for flag in (False, True):
             globals()[var] = flag
             try:
