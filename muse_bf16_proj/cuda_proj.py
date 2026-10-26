@@ -998,12 +998,13 @@ template <int NT, bool SPLITK>
 __device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m, int N, int tid, int warp, int g, int t,
         float* __restrict__ part, int* __restrict__ cnt,
         const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
-        const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
+        const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo, int emode)
 {
-    // Latency-aware: every loop below issues all of its global loads before using any (the previous version chained
-    // one L2 round trip per loop iteration and cost 12-26 us).
+    // Latency-aware: every loop below issues all of its global loads before using any. emode (bench diagnostics):
+    // 4 = return at entry, 5 = partial stores + ticket only, 6 = skip the escapes; 0 = full.
     __shared__ __align__(16) float red[64][33];
     __shared__ int s_last;
+    if (emode == 4) return;
     const int col0 = (blockIdx.x * 4 + warp) * 16 + g;                  // output column (row of W) of fragment row g
     if constexpr (SPLITK) {
         const int KSPLIT = (int)gridDim.y;
@@ -1026,7 +1027,7 @@ __device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m,
             fence_acq_rel_gpu();                                        // acquire the other slices
         }
         __syncthreads();
-        if (!s_last) return;
+        if (!s_last || emode == 5) return;
         // slice sum, 16 tokens per pass: thread -> token il = tid >> 3, columns 8*oct .. 8*oct+7 (two float4)
         const int il = tid >> 3, oct = tid & 7;
         for (int p0 = 0; p0 < m; p0 += 16) {
@@ -1068,7 +1069,7 @@ __device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m,
     }
     __syncthreads();
     // escapes of pack tiles 2*bx, 2*bx + 1: one escape per thread per batch, its m token values loaded together
-    const int e0 = esc_off[2 * blockIdx.x], e1 = esc_off[2 * blockIdx.x + 2];       // the two lists are contiguous
+    const int e0 = esc_off[2 * blockIdx.x], e1 = emode == 6 ? esc_off[2 * blockIdx.x] : esc_off[2 * blockIdx.x + 2];   // contiguous lists
     for (int base = e0; base < e1; base += 128) {
         const int e = base + tid;
         if (e < e1) {
@@ -1092,14 +1093,14 @@ __device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m,
 }
 
 typedef void (*w12_epi_fn)(const float*, int, int, int, int, int, int, float*, int*, const int*, const int*, const int*, const float*,
-                           const __nv_bfloat16*, int, __nv_bfloat16*, int);
+                           const __nv_bfloat16*, int, __nv_bfloat16*, int, int);
 
 template <int NT, int NSTAGE, bool SPLITK, int MODE = 0>
 __global__ void __launch_bounds__(128)
 w12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ W, int eb,
            float* __restrict__ part, int N, int K,
            const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
-           __nv_bfloat16* __restrict__ out, int ldo, int* __restrict__ cnt)
+           __nv_bfloat16* __restrict__ out, int ldo, int* __restrict__ cnt, int emode)
 {
     constexpr int STAGE_BYTES = w12_stage_bytes(NT);
     constexpr int W_STAGE = 4 * W12_TILE_BYTES;
@@ -1207,17 +1208,17 @@ w12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* _
     // the epilogue through an opaque pointer: a real call, so the loop's register allocation does not see it
     w12_epi_fn fp = w12_epilogue<NT, SPLITK>;
     asm volatile("" : "+l"(fp));
-    fp(accv, m, N, tid, warp, g, t, part, cnt, esc_off, esc_n, esc_k, esc_d, X, ldx, out, ldo);
+    fp(accv, m, N, tid, warp, g, t, part, cnt, esc_off, esc_n, esc_k, esc_d, X, ldx, out, ldo, emode);
 }
 
-struct W12Args { const int* eo; const int* en; const int* ek; const float* ed; __nv_bfloat16* out; int ldo; int* cnt; };
+struct W12Args { const int* eo; const int* en; const int* ek; const float* ed; __nv_bfloat16* out; int ldo; int* cnt; int emode; };
 template <int NT, int NSTAGE, bool SPLITK, int MODE = 0>
 void launch_w12(const __nv_bfloat16* X, int ldx, int m, const uint8_t* W, int eb, float* part, int N, int K, int sk, const W12Args& a, cudaStream_t stream)
 {
     constexpr int smem = NSTAGE * w12_stage_bytes(NT);
     static bool attr = false;
     if (!attr) { cudaFuncSetAttribute(w12_kernel<NT, NSTAGE, SPLITK, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
-    w12_kernel<NT, NSTAGE, SPLITK, MODE><<<dim3(N / 64, sk), 128, smem, stream>>>(X, ldx, m, W, eb, part, N, K, a.eo, a.en, a.ek, a.ed, a.out, a.ldo, a.cnt);
+    w12_kernel<NT, NSTAGE, SPLITK, MODE><<<dim3(N / 64, sk), 128, smem, stream>>>(X, ldx, m, W, eb, part, N, K, a.eo, a.en, a.ek, a.ed, a.out, a.ldo, a.cnt, a.emode);
 }
 
 // ---- w12b: single launch. CTA = one 16-row tile of W over the full K; W warps, warp w streams chunks
@@ -1588,7 +1589,7 @@ void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, to
     float* pp = part.data_ptr<float>();
     const int ldx = (int)X.stride(0);
     W12Args a{esc_off.data_ptr<int>(), esc_n.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
-              reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (int)out.stride(0), cnt.data_ptr<int>()};
+              reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (int)out.stride(0), cnt.data_ptr<int>(), (int)(mode >= 4 ? mode : 0)};
     if (mode == 3) {   // loads-only ablation of the GEMM (4 stages, K split)
         if (nt == 1) launch_w12<1, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
         else if (nt == 2) launch_w12<2, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
