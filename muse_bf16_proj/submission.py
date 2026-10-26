@@ -354,6 +354,16 @@ def _sum_partials_kernel(part_ptr, out_ptr, numel, SPLIT_K: tl.constexpr, BLOCK:
     tl.store(out_ptr + offs, acc.to(out_ptr.dtype.element_ty), mask=mask)
 
 
+@triton.jit
+def _dup_cols_kernel(x_ptr, out_ptr, K, BLOCK: tl.constexpr):
+    """out[i, :] = [x[i, :] | x[i, :]] (the router's one-GEMM input over [hi | lo]); K % BLOCK == 0."""
+    pid_m = tl.program_id(0)
+    offs = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    v = tl.load(x_ptr + pid_m * K + offs)
+    tl.store(out_ptr + pid_m * 2 * K + offs, v)
+    tl.store(out_ptr + pid_m * 2 * K + K + offs, v)
+
+
 # == BEGIN CUDA ==
 CUDA_SRC = r"""
 #include <cuda_bf16.h>
@@ -817,8 +827,8 @@ SWEEP = {
     ("o", 8192, 16):  (64, 256, 1, 4, 4, True),           # 4.2
     ("o", 8192, 32):  (64, 256, 1, 4, 4, True),           # 5.3
     ("qkv_gate", 2304, 1):  (32, 256, 4, 4, 4, False),    # 12.2
-    ("qkv_gate", 2304, 8):  (32, 256, 4, 4, 4, True),     # 11.7
-    ("qkv_gate", 2304, 16): (32, 256, 4, 4, 4, True),     # 11.0
+    ("qkv_gate", 2304, 8):  (64, 128, 8, 4, 4, True),     # 13.7 vs 14.6 for (32, 256, 4, 4, 4) (run 662944e4, cold)
+    ("qkv_gate", 2304, 16): (64, 128, 8, 4, 4, True),     # 13.8 vs 14.6
     ("qkv_gate", 2304, 32): (32, 256, 4, 4, 4, True),     # 15.1
     ("router", 256, 1):   (32, 256, 16, 4, 3, True),      # 5.2
     ("router", 256, 8):   (32, 256, 16, 4, 3, True),      # 5.1
@@ -832,10 +842,10 @@ TILE_SHAPE = {"qkv_gate": (32, 256), "o": (64, 256), "pooler": (32, 256), "unpoo
 # Further packings (BLOCK_N, BLOCK_K) kept in state as "<layer>_tiled_<bn>x<bk>" for the other tile
 # shapes a config may ask for (cfg["BLOCK_N"], cfg["BLOCK_K"]); the default packing is one of them.
 EXTRA_PACKS = {
-    "qkv_gate": [(32, 128), (64, 128), (128, 64), (64, 64)],
+    "qkv_gate": [(32, 128), (64, 128), (128, 64), (64, 64), (64, 256)],
     "o":        [(32, 128), (32, 256), (128, 64), (64, 64)],
-    "pooler":   [(32, 128), (64, 128), (128, 64), (64, 64)],
-    "unpooler": [(32, 128), (64, 128), (128, 64), (64, 64)],
+    "pooler":   [(32, 128), (64, 128), (128, 64), (64, 64), (64, 256)],
+    "unpooler": [(32, 128), (64, 128), (128, 64), (64, 64), (64, 256)],
     "router":   [(32, 128), (32, 64)],
 }
 USE_TILED = True
@@ -850,7 +860,7 @@ _OVERRIDE = None   # a config dict, during in-prepare benchmarking
 # router 5.6 vs 7.2; o (K = 1024) stays Triton.
 GEMV_SHAPES = {
     # pooler m=1 GEMV won the bench (18.5 vs 21.3) but lost on the judge (20.3 vs 18.6, run d39344c2): Triton
-    ("qkv_gate", 2304, 1): (1, 1, 4, 2),
+    ("qkv_gate", 2304, 1): (1, 2, 2, 4),   # 10.6 vs 11.4 for (1, 1, 4, 2) (run 662944e4)
     ("unpooler", 1024, 1): (1, 1, 4, 2),
     ("router", 256, 1): (1, 1, 2, 8),
 }
@@ -862,6 +872,7 @@ BMM_SHAPES = {("qkv_gate", 2304, 128): 4, ("qkv_gate", 2304, 256): 4, ("pooler",
 # shapes that go to cuBLAS although m <= MAX_TRITON_M: the judge measured our Triton configs behind
 # SGLang's cuBLAS call there (qkv m=32: 18.2-19.6 vs 14.0-14.5; o m=32: 7.0 vs 6.8)
 CUBLAS_SHAPES = {("qkv_gate", 2304, 32), ("o", 8192, 32)}
+ROUTER_DUP = True   # build [x | x] with a Triton kernel (torch.cat's CatArrayBatchedCopy took 2.6-3.9 us)
 # m -> config for the router above 64 tokens (Triton two-weight GEMM); missing: cuBLAS over [hi | lo]
 ROUTER_BIG = {256: dict(BLOCK_M=128, BLOCK_N=32, BLOCK_K=128, SPLIT_K=8, num_warps=8, num_stages=4, tma=True)}   # 12.8 vs 14.2
 
@@ -898,7 +909,8 @@ def _triton_config(layer: str, m: int, n: int, k: int):
         return cfg
     if USE_TILED:
         cfg["tiled"] = True
-        cfg["BLOCK_N"], cfg["BLOCK_K"] = TILE_SHAPE[layer]
+        if (cfg["BLOCK_N"], cfg["BLOCK_K"]) not in [TILE_SHAPE[layer]] + EXTRA_PACKS[layer]:
+            cfg["BLOCK_N"], cfg["BLOCK_K"] = TILE_SHAPE[layer]
         if cfg.get("tma") is None:
             cfg["tma"] = bool(TMA_BY_M.get(m, USE_TMA))
     elif USE_TMA:
@@ -1030,7 +1042,11 @@ def _proj_forward(x, layer: str, n: int, state) -> torch.Tensor:
             out = torch.empty((m, n), dtype=torch.float32, device=x.device)
             return _launch(x, state["router_hi"], state["router_lo"], out, state, cfg, m, n, k, layer)
         # one GEMM: [x | x] @ [hi | lo]^T == x @ hi^T + x @ lo^T, fp32 accumulation
-        x2 = torch.cat((x, x), dim=1)
+        if ROUTER_DUP and k % 2048 == 0:
+            x2 = torch.empty((m, 2 * k), dtype=x.dtype, device=x.device)
+            _dup_cols_kernel[(m, k // 2048)](x, x2, k, BLOCK=2048, num_warps=4)
+        else:
+            x2 = torch.cat((x, x), dim=1)
         return torch.mm(x2, state["router_hilo_t"], out_dtype=torch.float32)
     w = state[layer]
     if w.shape[0] != n:
@@ -1211,59 +1227,48 @@ def _bench(state):
 
     TAB = {"table": True}
     print("BENCH proj (us per call, cold L2 by a read flush; '!' = rel err above tol)")
-    # ---- A. cuBLAS vs the Triton table at m=8/16/32, every layer
-    for layer in ("qkv_gate", "o", "pooler", "unpooler", "router"):
-        N, K = layers[layer]
-        parts = []
-        for m in (8, 16, 32):
-            if not budget():
-                break
-            n = 1024 if (layer == "unpooler" and m <= 8) else N
-            parts.append(f"m{m}: " + row("triton", layer, m, n, TAB) + " " + row("cuBLAS", layer, m, n, {"none": True}))
-        print(f"  {layer:9s} " + " | ".join(parts))
-    # ---- B. m=1 GEMV re-measure (qkv, pooler, unpooler, router)
-    if ext is not None:
-        gemv1 = [(1, 1, 4, 2), (1, 2, 2, 2), (1, 2, 4, 2), (1, 4, 2, 2), (1, 2, 2, 4), (1, 1, 2, 4), (1, 1, 2, 8)]
-        gemv1_router = [(1, 1, 4, 8), (1, 1, 2, 8), (1, 2, 2, 8)]
-        for layer in ("qkv_gate", "pooler", "unpooler", "router"):
-            if not budget():
-                break
-            N, K = layers[layer]
-            n = 1024 if layer == "unpooler" else N
-            parts = [row("triton", layer, 1, n, TAB)]
-            for mpad, rpw, unroll, ksplit in (gemv1_router if layer == "router" else gemv1):
-                parts.append(row(f"g{rpw}/{unroll}/{ksplit}", layer, 1, n, dict(gemv=True, mpad=mpad, rpw=rpw, unroll=unroll, ksplit=ksplit)))
-            print(f"  m=1 {layer:9s}: " + " | ".join(parts))
-    # ---- C. qkv_gate (N=2304, 37.7 MB at 2.7 TB/s): more CTAs per SM, shallower / narrower pipelines
-    print("BENCH qkv m=8/16 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
-    qkv = [(32, 128, 8, 4, 4, True), (32, 128, 8, 4, 6, True), (32, 128, 4, 4, 4, True), (32, 128, 4, 4, 6, True),
-           (32, 128, 8, 4, 4, False), (32, 128, 4, 4, 6, False), (64, 128, 8, 4, 4, True), (64, 128, 4, 4, 6, True),
-           (32, 256, 8, 4, 4, True), (32, 256, 8, 4, 3, True), (32, 256, 4, 4, 3, True), (32, 256, 8, 4, 4, False),
-           (64, 64, 8, 4, 8, True), (32, 128, 16, 4, 4, True), (32, 256, 4, 2, 4, True), (32, 128, 8, 2, 6, True)]
-    cur = f"cur m8 {row('', 'qkv_gate', 8, 2304, TAB)} m16 {row('', 'qkv_gate', 16, 2304, TAB)}"
-    for bn, bk, sk, nw, ns, tma in qkv:
-        if not budget():
-            break
-        parts = []
-        for m in (8, 16):
-            cfg = dict(BLOCK_M=16, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
-            parts.append(row(f"m{m}", "qkv_gate", m, 2304, cfg))
-        print(f"  qkv {str((bn, bk, sk, nw, ns, tma)):30s} {cur} | " + " | ".join(parts))
-    # ---- D. pooler / unpooler m=8/16: 3-4 CTAs per SM (shallow (32,128) pipelines) and 2 warps
-    print("BENCH pooler/unpooler m=8/16 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
-    pl = [(32, 128, 1, 4, 4, True), (32, 128, 2, 4, 4, True), (32, 128, 1, 2, 6, True), (32, 128, 2, 2, 6, True),
-          (32, 128, 1, 4, 6, True), (32, 256, 1, 2, 4, True), (32, 128, 1, 4, 4, False), (64, 64, 1, 4, 8, True)]
+    global ROUTER_DUP
+    # ---- A. router m=128/256: torch.cat vs the Triton dup kernel for [x | x]
+    for m in (128, 256):
+        ROUTER_DUP = False
+        a_ = row("cat+mm", "router", m, 256, {"none": True})
+        ROUTER_DUP = True
+        b_ = row("dup+mm", "router", m, 256, {"none": True})
+        print(f"  router m={m}: {a_} | {b_}")
+    # ---- B. pooler m=128: cuBLAS vs bmm2/bmm4 (re-measure)
+    parts = [row("cuBLAS", "pooler", 128, 4096, {"none": True})] + [row(f"bmm{sk}", "pooler", 128, 4096, dict(bmm=True, SPLIT_K=sk)) for sk in (2, 4)]
+    print("  pooler m=128: " + " | ".join(parts))
+    # ---- C. pooler / unpooler m=16/32: BN=64 tiles with split-K 2 (half the x traffic, 128 CTAs)
+    print("BENCH pooler/unpooler m=16/32 Triton (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
+    pl = [(64, 256, 2, 4, 4, True), (64, 256, 2, 4, 4, False), (64, 128, 2, 4, 6, True), (64, 128, 2, 4, 8, True),
+          (64, 256, 2, 2, 4, True), (64, 128, 2, 2, 8, True), (32, 256, 1, 4, 5, True), (32, 128, 1, 4, 8, False),
+          (64, 256, 4, 4, 4, True), (128, 64, 2, 4, 8, True)]
     for layer in ("pooler", "unpooler"):
         N, K = layers[layer]
-        cur = f"cur m8 {row('', layer, 8, N, TAB)} m16 {row('', layer, 16, N, TAB)}"
+        cur = f"cur m16 {row('', layer, 16, N, TAB)} m32 {row('', layer, 32, N, TAB)}"
         for bn, bk, sk, nw, ns, tma in pl:
             if not budget():
                 break
             parts = []
-            for m in (8, 16):
-                cfg = dict(BLOCK_M=16, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
+            for m in (16, 32):
+                cfg = dict(BLOCK_M=_block_m(m), BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
                 parts.append(row(f"m{m}", layer, m, N, cfg))
             print(f"  {layer:9s} {str((bn, bk, sk, nw, ns, tma)):30s} {cur} | " + " | ".join(parts))
+    # ---- D. qkv m=8/16/32 and o m=32: the new table vs cuBLAS vs a few neighbours
+    print("BENCH qkv/o (BLOCK_N, BLOCK_K, SPLIT_K, warps, stages, tma)")
+    for m in (8, 16, 32):
+        parts = [row("table", "qkv_gate", m, 2304, TAB), row("cuBLAS", "qkv_gate", m, 2304, {"none": True})]
+        for bn, bk, sk, nw, ns, tma in ((64, 128, 8, 4, 4, True), (32, 256, 4, 4, 3, True), (64, 128, 8, 4, 4, False), (64, 256, 4, 4, 4, True), (64, 128, 4, 4, 6, True)):
+            if not budget():
+                break
+            cfg = dict(BLOCK_M=_block_m(m), BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
+            parts.append(row(f"{(bn, bk, sk, nw, ns, tma)}", "qkv_gate", m, 2304, cfg))
+        print(f"  qkv m={m}: " + " | ".join(parts))
+    parts = [row("table", "o", 32, 8192, TAB), row("cuBLAS", "o", 32, 8192, {"none": True})]
+    for bn, bk, sk, nw, ns, tma in ((64, 256, 1, 4, 4, True), (64, 128, 1, 4, 6, True), (32, 128, 1, 4, 8, True), (64, 256, 1, 4, 4, False)):
+        cfg = dict(BLOCK_M=32, BLOCK_N=bn, BLOCK_K=bk, SPLIT_K=sk, num_warps=nw, num_stages=ns, tiled=True, tma=tma)
+        parts.append(row(f"{(bn, bk, sk, nw, ns, tma)}", "o", 32, 8192, cfg))
+    print("  o m=32: " + " | ".join(parts))
     _OVERRIDE = None
     print(f"BENCH proj done in {time.time() - t0:.0f}s")
 

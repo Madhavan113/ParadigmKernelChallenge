@@ -62,3 +62,12 @@ S._sum_partials(part, out)
 err = float((out.float() - part.sum(0)).norm() / part.sum(0).norm())
 print(f"sum_partials rel L2 {err:.2e}"); assert err < 1e-3
 print("done")
+# check-4 paths: BN=64 split-K 2 tiles at m=32 / m=16, the new qkv table config, the router [x | x] dup kernel
+run("pooler", 32, dict(BLOCK_M=32, BLOCK_N=64, BLOCK_K=256, SPLIT_K=2, num_warps=4, num_stages=4, **T))
+run("unpooler", 16, dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=128, SPLIT_K=2, num_warps=4, num_stages=6, **T))
+run("qkv_gate", 8, dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=128, SPLIT_K=8, num_warps=4, num_stages=4, **T))
+run("qkv_gate", 16, dict(BLOCK_M=16, BLOCK_N=64, BLOCK_K=128, SPLIT_K=8, num_warps=4, num_stages=4, tiled=True, tma=False))
+xx = torch.randn((9, 8192), dtype=torch.float16); x2 = torch.empty((9, 16384), dtype=torch.float16)
+S._dup_cols_kernel[(9, 4)](xx, x2, 8192, BLOCK=2048, num_warps=4)
+assert torch.equal(x2, torch.cat((xx, xx), dim=1)); print("dup kernel ok")
+print("done2")
