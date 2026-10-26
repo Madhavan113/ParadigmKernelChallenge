@@ -1,0 +1,20 @@
+BENCH attention: us per graph replay after an L2 flush (median), plan overrides
+  B1 L1 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 128, 'cuda': False, 'splits': 16}      14.7 us
+  B1 L1 sliding   {'cuda': True}                                                                   19.5 us
+  B1 L1 sliding   {'cuda': True}                                                                   19.5 us
+  B16 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'splits': 8}      16.8 us
+  B16 L1 sliding  {'cuda': True}                                                                   22.9 us
+  B16 L1 sliding  {'cuda': True}                                                                   22.8 us
+  B32 L1 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'splits': 8}      20.1 us
+  B32 L1 sliding  {'cuda': True}                                                                   31.3 us
+  B32 L1 sliding  {'cuda': True}                                                                   31.2 us
+  B1 L8 sliding   {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'warps': 8, 'splits': 32}      22.2 us
+  B1 L8 sliding   {'cuda': True}                                                                   49.1 us
+  B1 L8 sliding   {'cuda': True}                                                                   49.1 us
+  B16 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'warps': 8, 'splits': 8}      25.2 us
+  B16 L8 sliding  {'cuda': True}                                                                   52.6 us
+  B16 L8 sliding  {'cuda': True}                                                                   52.3 us
+  B32 L8 sliding  {'hp': 1, 'bd': False, 'stages': 5, 'ex2h': True, 'block_t': 64, 'cuda': False, 'warps': 8, 'splits': 4}      28.9 us
+  B32 L8 sliding  {'cuda': True}                                                                   60.6 us
+  B32 L8 sliding  {'cuda': True}                                                                   60.7 us
+BENCH attention done in 50s
