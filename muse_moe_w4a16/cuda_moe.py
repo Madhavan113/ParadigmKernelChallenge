@@ -949,13 +949,7 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         case 22104: OKC_W(false, 2, 2, 1, 4, false, 0); break;   case 14104: OKC_W(false, 1, 4, 1, 4, false, 0); break;
         case 24102: OKC_W(false, 2, 4, 1, 2, false, 0); break;   case 24104: OKC_W(false, 2, 4, 1, 4, false, 0); break;
         // split-K (SPLITK = true) instantiations removed: measured slower than the plain variants on every shape
-        // bench ablations (abl 1 = no mma, 2 = no dequant, 3 = loads only) of the scored variants
-        case 10112104: OKC_W(true, 1, 2, 1, 4, false, 1); break;   case 10022104: OKC_W(false, 2, 2, 1, 4, false, 1); break;
-        case 20112104: OKC_W(true, 1, 2, 1, 4, false, 2); break;   case 20022104: OKC_W(false, 2, 2, 1, 4, false, 2); break;
-        case 30112104: OKC_W(true, 1, 2, 1, 4, false, 3); break;   case 30022104: OKC_W(false, 2, 2, 1, 4, false, 3); break;
-        case 10111104: OKC_W(true, 1, 1, 1, 4, false, 1); break;   case 10011104: OKC_W(false, 1, 1, 1, 4, false, 1); break;
-        case 20111104: OKC_W(true, 1, 1, 1, 4, false, 2); break;   case 20011104: OKC_W(false, 1, 1, 1, 4, false, 2); break;
-        case 30111104: OKC_W(true, 1, 1, 1, 4, false, 3); break;   case 30011104: OKC_W(false, 1, 1, 1, 4, false, 3); break;
+        // bench ablations (abl 1 = no mma, 2 = no dequant, 3 = loads only) are not instantiated in the submitted state
         default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage, ksplit)");
     }
 #undef OKC_W
