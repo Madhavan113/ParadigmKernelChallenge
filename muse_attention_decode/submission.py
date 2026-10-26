@@ -487,27 +487,27 @@ CUDA_SLIDING_SRC = r"""
 #include <cstdint>
 namespace cg = cooperative_groups;
 
-// Sliding-window gated attention for one decode / verify step: a cluster of two CTAs per
-// (request, KV head), each owning 1024 of the 2048 window slots with 8 warps x 128 keys. Each
-// lane fetches the page indices of its 4 slots, then every K and V row of the CTA is issued at
-// once with cp.async into shared memory (a row's four 16-byte chunks XOR-swizzled by
-// (row >> 1) & 3, so ldmatrix is bank-conflict free). A warp runs the online softmax over its
-// 128 keys in two 64-key chunks on mma.sync m16n8k16 (fp16 operands, fp32 accumulate): Q from
-// shared memory, K fragments by ldmatrix + cvt e4m3x2->f16x2, V fragments by ldmatrix.trans on
-// byte pairs + prmt + cvt (no transpose pass). The warps' (m, l, acc) partials merge in shared
-// memory together with the block's own new tokens; the second CTA's partial crosses over
-// distributed shared memory; then the gated RMSNorm epilogue. Every window key enters the
-// softmax; nothing is skipped.
+// Sliding-window gated attention for one decode / verify step: a cluster of four CTAs per
+// (request, KV head), each owning 512 of the 2048 window slots with 8 warps x 64 keys.
+//   trip 1: every load that depends on nothing (the request's length, the scales, the query rows,
+//           the block's new key/value rows, the gate rows) is issued together;
+//   trip 2: each lane fetches the page indices of its rows (4 lanes per row), then every K and V
+//           row of the CTA goes out at once (cp.async, 16 B per lane, into a staging tile);
+//   the warps convert their own 64 K and V rows once to fp16 (swizzled 128-byte rows), run the
+//   softmax over their keys on mma.sync m16n8k16 with ldmatrix / ldmatrix.trans fragments, and
+//   merge their (m, l, acc) partials in shared memory (the staging tile, now free) together with
+//   the block's own new tokens; rank 0 combines the four CTAs over distributed shared memory and
+//   applies the gated RMSNorm. Every window key enters the softmax; nothing is skipped.
 
 #define D 64
 #define G 8                     // query heads per KV head
 #define WINDOW 2048
-#define NCTA 2
+#define NCTA 4
 #define NW 8
 #define NT (NW * 32)
-#define KEYS (WINDOW / NCTA)
+#define KEYS (WINDOW / NCTA)    // 512 slots per CTA, 64 per warp
 #define QS_STRIDE 72            // fp16 elements per Q row (padded: ldmatrix conflict free)
-#define RS 65                   // padded row stride (floats) of a 16 x 64 partial: conflict-free stores
+#define RS 65                   // padded row stride (floats) of a 16 x 64 partial
 #define RED_W (32 + 16 * RS)    // floats per 16-row partial: 16 m, 16 l, 16 x RS acc
 #define NEG (-1.0e30f)
 
@@ -520,11 +520,6 @@ __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wai
 __device__ __forceinline__ uint32_t cvt_e4m3x2_f16x2(uint32_t pair) {
     uint32_t r;
     asm("{ .reg .b16 h; mov.b16 h, %1; cvt.rn.f16x2.e4m3x2 %0, h; }" : "=r"(r) : "h"((unsigned short)pair));
-    return r;
-}
-__device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t sel) {
-    uint32_t r;
-    asm("prmt.b32 %0, %1, %2, %3;" : "=r"(r) : "r"(a), "r"(0u), "r"(sel));
     return r;
 }
 __device__ __forceinline__ void ldmatrix_x4(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
@@ -548,31 +543,29 @@ __device__ __forceinline__ float2 f16x2_to_f2(uint32_t v) {
     __half2 h = *reinterpret_cast<__half2*>(&v);
     return __half22float2(h);
 }
-// byte offset of 16-byte chunk `ch` of row `r` in a swizzled [rows][64 B] tile
-__device__ __forceinline__ uint32_t swz(int r, int ch) { return (uint32_t)r * 64u + (uint32_t)((ch ^ ((r >> 1) & 3)) << 4); }
-// Q column permutation inside each 16-dim block: lane c's A fragment holds dims 4c..4c+3 as
-// (a0: 4c, 4c+1 | a2: 4c+2, 4c+3), matching the K fragments ldmatrix yields (see the K loop).
-__device__ __forceinline__ int qcol(int d) {
-    int blk = d & ~15, e = d & 15, c = e >> 2, k = e & 3;
-    return blk + (k < 2 ? 2 * c + k : 8 + 2 * c + (k - 2));
-}
+// byte offset of 16-byte chunk `ch` of row `r` in the fp8 staging tile ([rows][64 B], swizzled)
+__device__ __forceinline__ uint32_t swz8(int r, int ch) { return (uint32_t)r * 64u + (uint32_t)((ch ^ ((r >> 1) & 3)) << 4); }
+// byte offset of 16-byte chunk `ch` (8 fp16) of row `r` in an fp16 tile ([rows][128 B], swizzled)
+__device__ __forceinline__ uint32_t swz16(int r, int ch) { return (uint32_t)r * 128u + (uint32_t)((ch ^ (r & 7)) << 4); }
 
 template <int L>
 struct SlidingSmem {
     static constexpr int R = L * G, NRT = (R + 15) / 16, ROWS = NRT * 16;
-    static constexpr int KS = 0;                                   // KEYS x 64 B
-    static constexpr int VS = KS + KEYS * 64;                      // KEYS x 64 B
-    static constexpr int QS = VS + KEYS * 64;                      // ROWS x QS_STRIDE fp16
-    static constexpr int RED = QS + ROWS * QS_STRIDE * 2;          // NW x RED_W floats
-    static constexpr int WTS = RED + NW * RED_W * 4;               // 16 x NW floats
+    static constexpr int STG = 0;                                  // fp8 staging: K rows then V rows (KEYS x 64 B each)
+    static constexpr int RED = STG;                                // after the conversion: NW x RED_W floats
+    static constexpr int FIN = RED + NW * RED_W * 4;               // NRT x RED_W floats
+    static constexpr int STG_BYTES = 2 * KEYS * 64;
+    static_assert(FIN + NRT * RED_W * 4 <= STG_BYTES, "merge buffers must fit the staging tile");
+    static constexpr int K16 = STG + STG_BYTES;                    // KEYS x 128 B fp16
+    static constexpr int V16 = K16 + KEYS * 128;                   // KEYS x 128 B fp16
+    static constexpr int QS = V16 + KEYS * 128;                    // ROWS x QS_STRIDE fp16
+    static constexpr int WTS = QS + ROWS * QS_STRIDE * 2;          // 16 x NW floats
     static constexpr int LROW = WTS + 16 * NW * 4;                 // 16 floats
     static constexpr int MROW = LROW + 16 * 4;                     // 16 floats
     static constexpr int SNEW = MROW + 16 * 4;                     // ROWS x L floats
     static constexpr int VNEW = SNEW + ROWS * L * 4;               // L x 64 floats (raw e4m3 values)
     static constexpr int KNEW = VNEW + L * D * 4;                  // L x 64 floats
-    static constexpr int FIN = KNEW + L * D * 4;                   // NRT x RED_W floats
-    static constexpr int NEW8 = FIN + NRT * RED_W * 4;             // L x 64 K bytes, L x 64 V bytes
-    static constexpr int BYTES = NEW8 + 2 * L * D;
+    static constexpr int BYTES = KNEW + L * D * 4;
 };
 
 template <int L>
@@ -585,22 +578,26 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
                     float qk_scale, float sm_scale_log2, float log2_theta, int abl) {
     using S = SlidingSmem<L>;
     constexpr int R = S::R, NRT = S::NRT, ROWS = S::ROWS;
+    constexpr int QPW = ROWS / NW;               // query rows per warp (2 or 8)
+    constexpr int GPW = (R + NW - 1) / NW;       // live rows per warp in the epilogue (1 or 8)
     const int QKV_W = (2 * HQ + 2 * HKV) * D;
     const int ROW_W = HKV * D;                   // one cache row (all KV heads) in bytes
 
     extern __shared__ __align__(128) uint8_t smem[];
-    uint8_t* Ks = smem + S::KS;
-    uint8_t* Vs = smem + S::VS;
-    __half* Qs = reinterpret_cast<__half*>(smem + S::QS);
+    uint8_t* K8 = smem + S::STG;
+    uint8_t* V8 = K8 + KEYS * 64;
     float* red = reinterpret_cast<float*>(smem + S::RED);
+    float* fin = reinterpret_cast<float*>(smem + S::FIN);
+    __half* Qs = reinterpret_cast<__half*>(smem + S::QS);
     float* wts = reinterpret_cast<float*>(smem + S::WTS);
     float* Lrow = reinterpret_cast<float*>(smem + S::LROW);
     float* Mrow = reinterpret_cast<float*>(smem + S::MROW);
     float* snew = reinterpret_cast<float*>(smem + S::SNEW);
     float* vnew = reinterpret_cast<float*>(smem + S::VNEW);
     float* knew = reinterpret_cast<float*>(smem + S::KNEW);
-    float* fin = reinterpret_cast<float*>(smem + S::FIN);
-    uint8_t* new8 = smem + S::NEW8;
+    const uint32_t k8_base = smem_u32(K8), v8_base = smem_u32(V8);
+    const uint32_t k16_base = smem_u32(smem + S::K16), v16_base = smem_u32(smem + S::V16);
+    const uint32_t qs_base = smem_u32(Qs);
     __shared__ int s_seq;
 
     cg::cluster_group cluster = cg::this_cluster();
@@ -610,30 +607,26 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int g = lane >> 2, c = lane & 3;
 
-    // ---- trip 1: every load that depends on nothing, issued together: the request's length, the
-    // scales, this warp's query rows, the block's new keys/values, the gate rows for the epilogue ----
-    constexpr int QPW = ROWS / NW;               // query rows per warp (2 or 8)
-    constexpr int GPW = (R + NW - 1) / NW;       // live rows per warp for the epilogue (1 or 8)
+    // ---- trip 1: every load that depends on nothing, issued together ----
     if (tid == 0) s_seq = seq_lens[b];
     const float k_scale = *k_scale_p, v_scale = *v_scale_p;
-    float qx[QPW][2];
+    float qx[QPW][2], gx[GPW][2];
     #pragma unroll
     for (int i = 0; i < QPW; i++) {
         const int r = warp + i * NW;
         qx[i][0] = qx[i][1] = 0.f;
-        if (r < R) {
+        if (r < R && !(abl & 16)) {
             const int j = r / G, qh = h * G + (r % G);
             const __nv_bfloat16* qp = qkv + ((int64_t)(b * L + j)) * QKV_W + qh * D + 2 * lane;
             qx[i][0] = __bfloat162float(qp[0]);
             qx[i][1] = __bfloat162float(qp[1]);
         }
     }
-    float gx[GPW][2];
     #pragma unroll
     for (int i = 0; i < GPW; i++) {
         const int r = warp + i * NW;
         gx[i][0] = gx[i][1] = 0.f;
-        if (r < R) {
+        if (r < R && !(abl & 16)) {
             const int j = r / G, qh = h * G + (r % G);
             const __nv_bfloat16* gp = qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + 2 * HKV + qh) * D;
             gx[i][0] = __bfloat162float(gp[lane]);
@@ -642,7 +635,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     }
     float kx0 = 0.f, kx1 = 0.f, vx0 = 0.f, vx1 = 0.f;   // the new key/value row this warp prepares (warp < L)
     int64_t loc = 0;
-    if (warp < L) {
+    if (warp < L && !(abl & 16)) {
         const __nv_bfloat16* kp = qkv + ((int64_t)(b * L + warp)) * QKV_W + (HQ + h) * D + 2 * lane;
         const __nv_bfloat16* vp = qkv + ((int64_t)(b * L + warp)) * QKV_W + (HQ + HKV + h) * D + 2 * lane;
         kx0 = __bfloat162float(kp[0]); kx1 = __bfloat162float(kp[1]);
@@ -654,27 +647,25 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     const int lo = max(seq - (WINDOW - 1), 0);
     const int n = seq - lo;                      // window keys (<= 2047): slots 0..n-1 <-> positions lo..seq-1
     const int slot0 = rank * KEYS;               // this CTA's first slot
+    const int wrow0 = warp * 64;                 // this warp's first row (slot within the CTA)
 
-    // ---- trip 2: the page indices of this warp's 128 rows (4 lanes per row), then every K and V
-    // row of the CTA at once: lane 4r'+ch copies 16-byte chunk ch of row r' ----
-    const uint32_t ks_base = smem_u32(Ks), vs_base = smem_u32(Vs);
+    // ---- trip 2: page indices of this warp's 64 rows (4 lanes per row), then every K and V row ----
     const int ch = lane & 3;
-    int pg[16];
+    int pg[8];
     #pragma unroll
-    for (int i = 0; i < 16; i++) {
-        const int r = warp * 128 + i * 8 + (lane >> 2);
-        const int slot = slot0 + r;
+    for (int i = 0; i < 8; i++) {
+        const int slot = slot0 + wrow0 + i * 8 + (lane >> 2);
         pg[i] = (slot < n) ? page_table[(int64_t)b * max_pages + (lo + slot) / PS] : 0;
     }
     if (!(abl & 1)) {
         #pragma unroll
-        for (int i = 0; i < 16; i++) {
-            const int r = warp * 128 + i * 8 + (lane >> 2);
+        for (int i = 0; i < 8; i++) {
+            const int r = wrow0 + i * 8 + (lane >> 2);
             const int slot = slot0 + r;
             const bool ok = slot < n;
             const int64_t row = (int64_t)pg[i] * PS + ((lo + slot) % PS);
-            cp_async16(ks_base + swz(r, ch), k_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
-            cp_async16(vs_base + swz(r, ch), v_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
+            cp_async16(k8_base + swz8(r, ch), k_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
+            cp_async16(v8_base + swz8(r, ch), v_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
         }
     }
     cp_async_commit();
@@ -693,8 +684,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             x0 *= inv; x1 *= inv;
             float sn, cs;
             sincosf((float)(seq + r / G) * inv_freq, &sn, &cs);
-            Qs[r * QS_STRIDE + qcol(2 * lane)] = __float2half_rn(x0 * cs - x1 * sn);
-            Qs[r * QS_STRIDE + qcol(2 * lane + 1)] = __float2half_rn(x0 * sn + x1 * cs);
+            *reinterpret_cast<__half2*>(Qs + r * QS_STRIDE + 2 * lane) = __floats2half2_rn(x0 * cs - x1 * sn, x0 * sn + x1 * cs);
         }
         if (warp < L) {
             const int j = warp;
@@ -726,29 +716,53 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
         const int r = idx / L, jj = idx % L;
         float sc = NEG;
         if (r < R && jj <= r / G && !(abl & 8)) {
-            float acc = 0.f;
+            float a = 0.f;
             #pragma unroll 8
-            for (int d = 0; d < D; d++) acc += __half2float(Qs[r * QS_STRIDE + qcol(d)]) * knew[jj * D + d];
-            sc = acc * sm_scale_log2;
+            for (int d = 0; d < D; d++) a += __half2float(Qs[r * QS_STRIDE + d]) * knew[jj * D + d];
+            sc = a * sm_scale_log2;
         }
         snew[idx] = sc;
     }
 
-    // ---- the window: each warp its 128 keys, per 16-row tile ----
-    const uint32_t qs_base = smem_u32(Qs);
+    // ---- K and V rows -> fp16 tiles (each warp its own 64 rows, each lane 2 rows) ----
     if (!(abl & 1)) cp_async_wait_all();
-    __syncthreads();
-    const int wslot0 = slot0 + warp * 128;       // global slot of this warp's first key
+    __syncthreads();                             // every lane's copies have landed
+    if (!(abl & 2)) {
+        #pragma unroll
+        for (int i = 0; i < 2; i++) {
+            const int r = wrow0 + lane + i * 32;
+            #pragma unroll
+            for (int kv = 0; kv < 2; kv++) {
+                const uint32_t src = (kv == 0 ? k8_base : v8_base);
+                const uint32_t dst = (kv == 0 ? k16_base : v16_base);
+                #pragma unroll
+                for (int c8 = 0; c8 < 4; c8++) {         // 16 B of fp8 -> 32 B of fp16 (two 16 B chunks)
+                    uint4 w;
+                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(w.x), "=r"(w.y), "=r"(w.z), "=r"(w.w) : "r"(src + swz8(r, c8)));
+                    uint4 o0, o1;
+                    o0.x = cvt_e4m3x2_f16x2(w.x & 0xffffu); o0.y = cvt_e4m3x2_f16x2(w.x >> 16);
+                    o0.z = cvt_e4m3x2_f16x2(w.y & 0xffffu); o0.w = cvt_e4m3x2_f16x2(w.y >> 16);
+                    o1.x = cvt_e4m3x2_f16x2(w.z & 0xffffu); o1.y = cvt_e4m3x2_f16x2(w.z >> 16);
+                    o1.z = cvt_e4m3x2_f16x2(w.w & 0xffffu); o1.w = cvt_e4m3x2_f16x2(w.w >> 16);
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8)), "r"(o0.x), "r"(o0.y), "r"(o0.z), "r"(o0.w));
+                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8 + 1)), "r"(o1.x), "r"(o1.y), "r"(o1.z), "r"(o1.w));
+                }
+            }
+        }
+    }
+    __syncthreads();                             // fp16 tiles complete; the staging tile is free for the merge buffers
+
+    // ---- the window: each warp its 64 keys, per 16-row tile ----
+    const int wslot0 = slot0 + wrow0;            // global slot of this warp's first key
     for (int rt = 0; rt < NRT; rt++) {
         float m_run[2] = {NEG, NEG}, l_run[2] = {0.f, 0.f};
         float acc[8][4];
         #pragma unroll
         for (int i = 0; i < 8; i++) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f; }
-        // each row's first valid slot (the window's edge): rows rt*16 + g and + g + 8
-        const int first0 = n - (WINDOW - 1) + (rt * 16 + g) / G, first8 = n - (WINDOW - 1) + (rt * 16 + g + 8) / G;
-        #pragma unroll 1
-        for (int kc = 0; kc < ((abl & 2) ? 0 : 2); kc++) {
-            // ---- S = Q K^T over 64 keys (8 n-tiles) ----
+        if (!(abl & 2)) {
+            // each row's first valid slot (the window's edge): rows rt*16 + g and + g + 8
+            const int first0 = n - (WINDOW - 1) + (rt * 16 + g) / G, first8 = n - (WINDOW - 1) + (rt * 16 + g + 8) / G;
+            // ---- S = Q K^T over the warp's 64 keys (8 n-tiles) ----
             float s[8][4];
             #pragma unroll
             for (int i = 0; i < 8; i++) { s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.f; }
@@ -761,23 +775,21 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
                     ldmatrix_x4(qs_base + (uint32_t)(arow * QS_STRIDE + acol) * 2u, a[0], a[1], a[2], a[3]);
                 }
                 #pragma unroll
-                for (int q4 = 0; q4 < 2; q4++) {          // 4 n-tiles (32 keys) per ldmatrix.x4
-                    const int key = warp * 128 + kc * 64 + q4 * 32 + (lane >> 3) * 8 + (lane & 7);
-                    uint32_t rr[4];
-                    ldmatrix_x4(ks_base + swz(key, ks), rr[0], rr[1], rr[2], rr[3]);
-                    #pragma unroll
-                    for (int m = 0; m < 4; m++) {
-                        // rr[m]: dims ks*16 + 4c .. 4c+3 of key (n-tile m, row g)
-                        const uint32_t b0 = cvt_e4m3x2_f16x2(rr[m] & 0xffffu), b1 = cvt_e4m3x2_f16x2(rr[m] >> 16);
-                        mma16816(s[q4 * 4 + m], a, b0, b1);
-                    }
+                for (int p2 = 0; p2 < 4; p2++) {          // 2 n-tiles (16 keys) per ldmatrix.x4
+                    // matrices: (n-tile 2p2 | 2p2+1) x (k half 0 | 1): lane -> matrix m = lane>>3
+                    const int m = lane >> 3;
+                    const int key = wrow0 + p2 * 16 + (m >> 1) * 8 + (lane & 7);
+                    uint32_t b00, b01, b10, b11;
+                    ldmatrix_x4(k16_base + swz16(key, ks * 2 + (m & 1)), b00, b01, b10, b11);
+                    mma16816(s[p2 * 2 + 0], a, b00, b01);
+                    mma16816(s[p2 * 2 + 1], a, b10, b11);
                 }
             }
-            // ---- mask (slice end, window edge), online softmax in the log2 domain ----
+            // ---- mask (slice end, window edge), softmax in the log2 domain ----
             float mx0 = NEG, mx8 = NEG;
             #pragma unroll
             for (int nt = 0; nt < 8; nt++) {
-                const int slot = wslot0 + kc * 64 + nt * 8 + 2 * c;
+                const int slot = wslot0 + nt * 8 + 2 * c;
                 #pragma unroll
                 for (int e = 0; e < 2; e++) {
                     const int sl = slot + e;
@@ -792,40 +804,28 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
             mx8 = fmaxf(mx8, __shfl_xor_sync(0xffffffffu, mx8, 1));
             mx8 = fmaxf(mx8, __shfl_xor_sync(0xffffffffu, mx8, 2));
-            const float mn0 = fmaxf(m_run[0], mx0), mn8 = fmaxf(m_run[1], mx8);
-            const float al0 = exp2f(m_run[0] - mn0), al8 = exp2f(m_run[1] - mn8);
-            m_run[0] = mn0; m_run[1] = mn8;
-            l_run[0] *= al0; l_run[1] *= al8;
-            #pragma unroll
-            for (int i = 0; i < 8; i++) { acc[i][0] *= al0; acc[i][1] *= al0; acc[i][2] *= al8; acc[i][3] *= al8; }
+            m_run[0] = mx0; m_run[1] = mx8;
             uint32_t pa[4][4];                           // P as A fragments: 4 k16 steps over the 64 keys
             #pragma unroll
             for (int nt = 0; nt < 8; nt++) {
-                const float p0 = exp2f(s[nt][0] - mn0), p1 = exp2f(s[nt][1] - mn0);
-                const float p2 = exp2f(s[nt][2] - mn8), p3 = exp2f(s[nt][3] - mn8);
+                const float p0 = exp2f(s[nt][0] - mx0), p1 = exp2f(s[nt][1] - mx0);
+                const float p2 = exp2f(s[nt][2] - mx8), p3 = exp2f(s[nt][3] - mx8);
                 l_run[0] += p0 + p1; l_run[1] += p2 + p3;
                 pa[nt >> 1][(nt & 1) * 2 + 0] = pack_f16x2(p0, p1);
                 pa[nt >> 1][(nt & 1) * 2 + 1] = pack_f16x2(p2, p3);
             }
-            // ---- acc += P V: V fragments by ldmatrix.trans on byte pairs ----
+            // ---- acc = P V: V fragments by ldmatrix.trans on the fp16 tile ----
             #pragma unroll
             for (int ks = 0; ks < 4; ks++) {
-                const int key0 = warp * 128 + kc * 64 + ks * 16;
-                uint32_t vr[8];
                 #pragma unroll
-                for (int dg2 = 0; dg2 < 2; dg2++) {      // dims 0-31, 32-63: matrices (keys lo | hi) x (2 chunks)
-                    const int mrow = key0 + ((lane >> 3) & 1) * 8 + (lane & 7);
-                    const int mch = dg2 * 2 + (lane >> 4);
-                    ldmatrix_x4_trans(vs_base + swz(mrow, mch), vr[dg2 * 4 + 0], vr[dg2 * 4 + 1], vr[dg2 * 4 + 2], vr[dg2 * 4 + 3]);
-                }
-                #pragma unroll
-                for (int dg = 0; dg < 4; dg++) {
-                    // vr: lo16 = (key 2c, dims 16dg+2g, +1), hi16 = (key 2c+1, same dims); second reg = keys +8
-                    const uint32_t lo = vr[dg * 2 + 0], hi = vr[dg * 2 + 1];
-                    const uint32_t be0 = cvt_e4m3x2_f16x2(prmt(lo, 0x7720u)), be1 = cvt_e4m3x2_f16x2(prmt(hi, 0x7720u));   // even dims
-                    const uint32_t bo0 = cvt_e4m3x2_f16x2(prmt(lo, 0x7731u)), bo1 = cvt_e4m3x2_f16x2(prmt(hi, 0x7731u));   // odd dims
-                    mma16816(acc[dg * 2 + 0], pa[ks], be0, be1);
-                    mma16816(acc[dg * 2 + 1], pa[ks], bo0, bo1);
+                for (int p2 = 0; p2 < 4; p2++) {          // 2 n-tiles (16 dims) per ldmatrix.x4.trans
+                    // matrices: (keys lo | hi) x (n-tile 2p2 | 2p2+1): lane -> matrix m = lane>>3
+                    const int m = lane >> 3;
+                    const int key = wrow0 + ks * 16 + (m & 1) * 8 + (lane & 7);
+                    uint32_t b00, b01, b10, b11;
+                    ldmatrix_x4_trans(v16_base + swz16(key, p2 * 2 + (m >> 1)), b00, b01, b10, b11);
+                    mma16816(acc[p2 * 2 + 0], pa[ks], b00, b01);
+                    mma16816(acc[p2 * 2 + 1], pa[ks], b10, b11);
                 }
             }
         }
@@ -837,15 +837,12 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
         float* my = red + warp * RED_W;
         if (c == 0) { my[g] = m_run[0]; my[8 + g] = m_run[1]; my[16 + g] = l_run[0]; my[24 + g] = l_run[1]; }
         #pragma unroll
-        for (int dg = 0; dg < 4; dg++) {
-            #pragma unroll
-            for (int par = 0; par < 2; par++) {
-                const int d0 = 16 * dg + 4 * c + par, d1 = d0 + 2;   // acc tile (dg, par) col n <-> dim 16dg + 2n + par
-                my[32 + g * RS + d0] = acc[dg * 2 + par][0];
-                my[32 + g * RS + d1] = acc[dg * 2 + par][1];
-                my[32 + (g + 8) * RS + d0] = acc[dg * 2 + par][2];
-                my[32 + (g + 8) * RS + d1] = acc[dg * 2 + par][3];
-            }
+        for (int nt = 0; nt < 8; nt++) {
+            const int d0 = nt * 8 + 2 * c;           // acc tile nt: dims nt*8 + n
+            my[32 + g * RS + d0] = acc[nt][0];
+            my[32 + g * RS + d0 + 1] = acc[nt][1];
+            my[32 + (g + 8) * RS + d0] = acc[nt][2];
+            my[32 + (g + 8) * RS + d0 + 1] = acc[nt][3];
         }
         __syncthreads();
         // ---- merge the warps (+ the block's own tokens, on rank 0) ----
@@ -881,19 +878,22 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
         __syncthreads();
     }
 
-    // ---- combine the two CTAs' partials over distributed shared memory (rank 0 finishes) ----
+    // ---- combine the four CTAs' partials over distributed shared memory (rank 0 finishes) ----
     cluster.sync();
-    if (rank == 1) { cluster.sync(); return; }
+    if (rank != 0) { cluster.sync(); return; }
     if (!(abl & 4)) {
-        const float* peer = cluster.map_shared_rank(fin, 1);
+        const float* P1 = cluster.map_shared_rank(fin, 1);
+        const float* P2 = cluster.map_shared_rank(fin, 2);
+        const float* P3 = cluster.map_shared_rank(fin, 3);
         for (int idx = tid; idx < NRT * 16 * D; idx += NT) {
             const int rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D, d = rem % D;
             float* F = fin + rt * RED_W;
-            const float* P = peer + rt * RED_W;
-            const float M0 = F[r], M1 = P[r], M = fmaxf(M0, M1);
-            const float w0 = exp2f(M0 - M), w1 = exp2f(M1 - M);
-            const float O = F[32 + r * RS + d] * w0 + P[32 + r * RS + d] * w1;
-            const float Lc = F[16 + r] * w0 + P[16 + r] * w1;
+            const int off = rt * RED_W;
+            const float M0 = F[r], M1 = P1[off + r], M2 = P2[off + r], M3 = P3[off + r];
+            const float M = fmaxf(fmaxf(M0, M1), fmaxf(M2, M3));
+            const float w0 = exp2f(M0 - M), w1 = exp2f(M1 - M), w2 = exp2f(M2 - M), w3 = exp2f(M3 - M);
+            const float O = F[32 + r * RS + d] * w0 + P1[off + 32 + r * RS + d] * w1 + P2[off + 32 + r * RS + d] * w2 + P3[off + 32 + r * RS + d] * w3;
+            const float Lc = F[16 + r] * w0 + P1[off + 16 + r] * w1 + P2[off + 16 + r] * w2 + P3[off + 16 + r] * w3;
             __syncthreads();                     // everyone has read F[r], F[16 + r] for this pass
             F[32 + r * RS + d] = O;
             if (d == 0) { F[16 + r] = Lc; F[r] = M; }
@@ -1129,7 +1129,7 @@ def _attn_bench(data):
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128, cuda=False)   # the Triton kernel, current plans
     w8 = dict(nw, block_t=64, warps=8)
     cu = dict(cuda=True)
-    abl = [dict(cuda=True, cabl=k) for k in (1, 2, 4, 8, 15)]   # no loads / no QK+PV / no merge / no q,k prep / skeleton
+    abl = [dict(cuda=True, cabl=k) for k in (1, 2, 4, 8, 16, 31)]   # no K/V loads / no convert+QK+PV / no merge / no q,k prep / no trip-1 loads / skeleton
     plans = {
         "B1 L1 sliding": [dict(nw, splits=16), cu, cu] + abl,
         "B16 L1 sliding": [dict(nw, splits=8, block_t=64), cu, cu],
