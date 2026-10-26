@@ -23,7 +23,7 @@ old = '''    plan = _plan(cfg)
 new = '''    plan = _plan(cfg)
     if _PLAN_OVERRIDE is not None:
         plan.update(_PLAN_OVERRIDE)
-    if cfg["window"] and plan.get("cuda", SLIDING_CUDA) and _sliding_forward(data, out):
+    if cfg["window"] and plan.get("cuda", SLIDING_CUDA) and _sliding_forward(data, out, plan.get("cabl", 0)):
         return out
 '''
 if 'plan.get("cuda", SLIDING_CUDA)' not in sub:

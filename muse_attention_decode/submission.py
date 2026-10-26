@@ -507,7 +507,8 @@ namespace cg = cooperative_groups;
 #define NT (NW * 32)
 #define KEYS (WINDOW / NCTA)
 #define QS_STRIDE 72            // fp16 elements per Q row (padded: ldmatrix conflict free)
-#define RED_W (32 + 16 * D)     // floats per 16-row partial: 16 m, 16 l, 16 x 64 acc
+#define RS 65                   // padded row stride (floats) of a 16 x 64 partial: conflict-free stores
+#define RED_W (32 + 16 * RS)    // floats per 16-row partial: 16 m, 16 l, 16 x RS acc
 #define NEG (-1.0e30f)
 
 __device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
@@ -575,13 +576,13 @@ struct SlidingSmem {
 };
 
 template <int L>
-__global__ void __launch_bounds__(NT)
+__global__ void __launch_bounds__(NT, 1)
 sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __restrict__ cache_loc,
                     const int* __restrict__ seq_lens, const int* __restrict__ page_table,
                     uint8_t* __restrict__ k_cache, uint8_t* __restrict__ v_cache,
                     const float* __restrict__ k_scale_p, const float* __restrict__ v_scale_p,
                     __nv_bfloat16* __restrict__ out, int HQ, int HKV, int max_pages, int PS,
-                    float qk_scale, float sm_scale_log2, float log2_theta) {
+                    float qk_scale, float sm_scale_log2, float log2_theta, int abl) {
     using S = SlidingSmem<L>;
     constexpr int R = S::R, NRT = S::NRT, ROWS = S::ROWS;
     const int QKV_W = (2 * HQ + 2 * HKV) * D;
@@ -609,99 +610,133 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int g = lane >> 2, c = lane & 3;
 
-    // ---- trip 1: the request's length (everything else here needs nothing) ----
+    // ---- trip 1: every load that depends on nothing, issued together: the request's length, the
+    // scales, this warp's query rows, the block's new keys/values, the gate rows for the epilogue ----
+    constexpr int QPW = ROWS / NW;               // query rows per warp (2 or 8)
+    constexpr int GPW = (R + NW - 1) / NW;       // live rows per warp for the epilogue (1 or 8)
     if (tid == 0) s_seq = seq_lens[b];
     const float k_scale = *k_scale_p, v_scale = *v_scale_p;
+    float qx[QPW][2];
+    #pragma unroll
+    for (int i = 0; i < QPW; i++) {
+        const int r = warp + i * NW;
+        qx[i][0] = qx[i][1] = 0.f;
+        if (r < R) {
+            const int j = r / G, qh = h * G + (r % G);
+            const __nv_bfloat16* qp = qkv + ((int64_t)(b * L + j)) * QKV_W + qh * D + 2 * lane;
+            qx[i][0] = __bfloat162float(qp[0]);
+            qx[i][1] = __bfloat162float(qp[1]);
+        }
+    }
+    float gx[GPW][2];
+    #pragma unroll
+    for (int i = 0; i < GPW; i++) {
+        const int r = warp + i * NW;
+        gx[i][0] = gx[i][1] = 0.f;
+        if (r < R) {
+            const int j = r / G, qh = h * G + (r % G);
+            const __nv_bfloat16* gp = qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + 2 * HKV + qh) * D;
+            gx[i][0] = __bfloat162float(gp[lane]);
+            gx[i][1] = __bfloat162float(gp[lane + 32]);
+        }
+    }
+    float kx0 = 0.f, kx1 = 0.f, vx0 = 0.f, vx1 = 0.f;   // the new key/value row this warp prepares (warp < L)
+    int64_t loc = 0;
+    if (warp < L) {
+        const __nv_bfloat16* kp = qkv + ((int64_t)(b * L + warp)) * QKV_W + (HQ + h) * D + 2 * lane;
+        const __nv_bfloat16* vp = qkv + ((int64_t)(b * L + warp)) * QKV_W + (HQ + HKV + h) * D + 2 * lane;
+        kx0 = __bfloat162float(kp[0]); kx1 = __bfloat162float(kp[1]);
+        vx0 = __bfloat162float(vp[0]); vx1 = __bfloat162float(vp[1]);
+        loc = cache_loc[b * L + warp];
+    }
     __syncthreads();
     const int seq = s_seq;
     const int lo = max(seq - (WINDOW - 1), 0);
     const int n = seq - lo;                      // window keys (<= 2047): slots 0..n-1 <-> positions lo..seq-1
     const int slot0 = rank * KEYS;               // this CTA's first slot
 
-    // ---- trip 2: page indices of this lane's 4 slots, then every K and V row of the CTA ----
+    // ---- trip 2: the page indices of this warp's 128 rows (4 lanes per row), then every K and V
+    // row of the CTA at once: lane 4r'+ch copies 16-byte chunk ch of row r' ----
     const uint32_t ks_base = smem_u32(Ks), vs_base = smem_u32(Vs);
+    const int ch = lane & 3;
+    int pg[16];
     #pragma unroll
-    for (int i = 0; i < 4; i++) {
-        const int r = tid * 4 + i;               // slot within the CTA
+    for (int i = 0; i < 16; i++) {
+        const int r = warp * 128 + i * 8 + (lane >> 2);
         const int slot = slot0 + r;
-        const bool ok = slot < n;
-        const int t = lo + slot;
-        const int page = ok ? page_table[(int64_t)b * max_pages + t / PS] : 0;
-        const int64_t row = (int64_t)page * PS + (t % PS);
-        const uint8_t* ksrc = k_cache + row * ROW_W + h * D;
-        const uint8_t* vsrc = v_cache + row * ROW_W + h * D;
+        pg[i] = (slot < n) ? page_table[(int64_t)b * max_pages + (lo + slot) / PS] : 0;
+    }
+    if (!(abl & 1)) {
         #pragma unroll
-        for (int ch = 0; ch < 4; ch++) {
-            cp_async16(ks_base + swz(r, ch), ksrc + 16 * ch, ok ? 16 : 0);
-            cp_async16(vs_base + swz(r, ch), vsrc + 16 * ch, ok ? 16 : 0);
+        for (int i = 0; i < 16; i++) {
+            const int r = warp * 128 + i * 8 + (lane >> 2);
+            const int slot = slot0 + r;
+            const bool ok = slot < n;
+            const int64_t row = (int64_t)pg[i] * PS + ((lo + slot) % PS);
+            cp_async16(ks_base + swz(r, ch), k_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
+            cp_async16(vs_base + swz(r, ch), v_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
         }
     }
     cp_async_commit();
 
     // ---- meanwhile: queries (RMSNorm x qk_scale x k_scale, RoPE) -> fp16 Qs; new keys/values ----
     const float inv_freq = exp2f(-(2.0f * lane / D) * log2_theta);   // this lane's RoPE pair (dims 2*lane, 2*lane+1)
-    for (int r = warp; r < ROWS; r += NW) {
-        float x0 = 0.f, x1 = 0.f;
-        const int j = r / G, qh = h * G + (r % G);
-        if (r < R) {
-            const __nv_bfloat16* qp = qkv + ((int64_t)(b * L + j)) * QKV_W + qh * D + 2 * lane;
-            x0 = __bfloat162float(qp[0]);
-            x1 = __bfloat162float(qp[1]);
+    if (!(abl & 8)) {
+        #pragma unroll
+        for (int i = 0; i < QPW; i++) {
+            const int r = warp + i * NW;
+            float x0 = qx[i][0], x1 = qx[i][1];
+            float ss = x0 * x0 + x1 * x1;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+            const float inv = rsqrtf(ss / D + 1e-5f) * qk_scale * k_scale;
+            x0 *= inv; x1 *= inv;
+            float sn, cs;
+            sincosf((float)(seq + r / G) * inv_freq, &sn, &cs);
+            Qs[r * QS_STRIDE + qcol(2 * lane)] = __float2half_rn(x0 * cs - x1 * sn);
+            Qs[r * QS_STRIDE + qcol(2 * lane + 1)] = __float2half_rn(x0 * sn + x1 * cs);
         }
-        float ss = x0 * x0 + x1 * x1;
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-        const float inv = rsqrtf(ss / D + 1e-5f) * qk_scale * k_scale;
-        x0 *= inv; x1 *= inv;
-        float sn, cs;
-        sincosf((float)(seq + j) * inv_freq, &sn, &cs);
-        Qs[r * QS_STRIDE + qcol(2 * lane)] = __float2half_rn(x0 * cs - x1 * sn);
-        Qs[r * QS_STRIDE + qcol(2 * lane + 1)] = __float2half_rn(x0 * sn + x1 * cs);
-    }
-    for (int j = warp; j < L; j += NW) {
-        const __nv_bfloat16* kp = qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + h) * D + 2 * lane;
-        const __nv_bfloat16* vp = qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + HKV + h) * D + 2 * lane;
-        float x0 = __bfloat162float(kp[0]), x1 = __bfloat162float(kp[1]);
-        float ss = x0 * x0 + x1 * x1;
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-        const float inv = rsqrtf(ss / D + 1e-5f);
-        x0 *= inv; x1 *= inv;
-        float sn, cs;
-        sincosf((float)(seq + j) * inv_freq, &sn, &cs);
-        const float y0 = x0 * cs - x1 * sn, y1 = x0 * sn + x1 * cs;
-        __nv_fp8x2_e4m3 k8(make_float2(y0 / k_scale, y1 / k_scale));
-        __nv_fp8x2_e4m3 v8(make_float2(__bfloat162float(vp[0]) / v_scale, __bfloat162float(vp[1]) / v_scale));
-        const uint16_t kb = k8.__x, vb = v8.__x;
-        *reinterpret_cast<uint16_t*>(new8 + j * D + 2 * lane) = kb;
-        *reinterpret_cast<uint16_t*>(new8 + L * D + j * D + 2 * lane) = vb;
-        // the raw E4M3 values the cache will hold (what the reference attends to)
-        const float2 kk = f16x2_to_f2(cvt_e4m3x2_f16x2(kb)), vv = f16x2_to_f2(cvt_e4m3x2_f16x2(vb));
-        knew[j * D + 2 * lane] = kk.x; knew[j * D + 2 * lane + 1] = kk.y;
-        vnew[j * D + 2 * lane] = vv.x; vnew[j * D + 2 * lane + 1] = vv.y;
-        if (rank == 0) {
-            const int64_t loc = cache_loc[b * L + j];
-            *reinterpret_cast<uint16_t*>(k_cache + loc * ROW_W + h * D + 2 * lane) = kb;
-            *reinterpret_cast<uint16_t*>(v_cache + loc * ROW_W + h * D + 2 * lane) = vb;
+        if (warp < L) {
+            const int j = warp;
+            float x0 = kx0, x1 = kx1;
+            float ss = x0 * x0 + x1 * x1;
+            #pragma unroll
+            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+            const float inv = rsqrtf(ss / D + 1e-5f);
+            x0 *= inv; x1 *= inv;
+            float sn, cs;
+            sincosf((float)(seq + j) * inv_freq, &sn, &cs);
+            const float y0 = x0 * cs - x1 * sn, y1 = x0 * sn + x1 * cs;
+            __nv_fp8x2_e4m3 k8(make_float2(y0 / k_scale, y1 / k_scale));
+            __nv_fp8x2_e4m3 v8(make_float2(vx0 / v_scale, vx1 / v_scale));
+            const uint16_t kb = k8.__x, vb = v8.__x;
+            // the raw E4M3 values the cache will hold (what the reference attends to)
+            const float2 kk = f16x2_to_f2(cvt_e4m3x2_f16x2(kb)), vv = f16x2_to_f2(cvt_e4m3x2_f16x2(vb));
+            knew[j * D + 2 * lane] = kk.x; knew[j * D + 2 * lane + 1] = kk.y;
+            vnew[j * D + 2 * lane] = vv.x; vnew[j * D + 2 * lane + 1] = vv.y;
+            if (rank == 0) {
+                *reinterpret_cast<uint16_t*>(k_cache + loc * ROW_W + h * D + 2 * lane) = kb;
+                *reinterpret_cast<uint16_t*>(v_cache + loc * ROW_W + h * D + 2 * lane) = vb;
+            }
         }
     }
     __syncthreads();
     // scores of the block's own tokens: snew[r][jj] = q_r . knew[jj] (causal: jj <= token(r)), log2 domain
     for (int idx = tid; idx < ROWS * L; idx += NT) {
         const int r = idx / L, jj = idx % L;
-        float s = NEG;
-        if (r < R && jj <= r / G) {
-            float a = 0.f;
+        float sc = NEG;
+        if (r < R && jj <= r / G && !(abl & 8)) {
+            float acc = 0.f;
             #pragma unroll 8
-            for (int d = 0; d < D; d++) a += __half2float(Qs[r * QS_STRIDE + qcol(d)]) * knew[jj * D + d];
-            s = a * sm_scale_log2;
+            for (int d = 0; d < D; d++) acc += __half2float(Qs[r * QS_STRIDE + qcol(d)]) * knew[jj * D + d];
+            sc = acc * sm_scale_log2;
         }
-        snew[idx] = s;
+        snew[idx] = sc;
     }
 
     // ---- the window: each warp its 128 keys, per 16-row tile ----
     const uint32_t qs_base = smem_u32(Qs);
-    cp_async_wait_all();
+    if (!(abl & 1)) cp_async_wait_all();
     __syncthreads();
     const int wslot0 = slot0 + warp * 128;       // global slot of this warp's first key
     for (int rt = 0; rt < NRT; rt++) {
@@ -712,7 +747,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
         // each row's first valid slot (the window's edge): rows rt*16 + g and + g + 8
         const int first0 = n - (WINDOW - 1) + (rt * 16 + g) / G, first8 = n - (WINDOW - 1) + (rt * 16 + g + 8) / G;
         #pragma unroll 1
-        for (int kc = 0; kc < 2; kc++) {
+        for (int kc = 0; kc < ((abl & 2) ? 0 : 2); kc++) {
             // ---- S = Q K^T over 64 keys (8 n-tiles) ----
             float s[8][4];
             #pragma unroll
@@ -806,16 +841,16 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             #pragma unroll
             for (int par = 0; par < 2; par++) {
                 const int d0 = 16 * dg + 4 * c + par, d1 = d0 + 2;   // acc tile (dg, par) col n <-> dim 16dg + 2n + par
-                my[32 + g * D + d0] = acc[dg * 2 + par][0];
-                my[32 + g * D + d1] = acc[dg * 2 + par][1];
-                my[32 + (g + 8) * D + d0] = acc[dg * 2 + par][2];
-                my[32 + (g + 8) * D + d1] = acc[dg * 2 + par][3];
+                my[32 + g * RS + d0] = acc[dg * 2 + par][0];
+                my[32 + g * RS + d1] = acc[dg * 2 + par][1];
+                my[32 + (g + 8) * RS + d0] = acc[dg * 2 + par][2];
+                my[32 + (g + 8) * RS + d1] = acc[dg * 2 + par][3];
             }
         }
         __syncthreads();
         // ---- merge the warps (+ the block's own tokens, on rank 0) ----
         const bool own_new = (rank == 0);
-        if (tid < 16 * NW) {
+        if (tid < 16 * NW && !(abl & 4)) {
             const int r = tid / NW, w = tid % NW;
             float M = NEG;
             for (int ww = 0; ww < NW; ww++) M = fmaxf(M, red[ww * RED_W + r]);
@@ -830,16 +865,18 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
         }
         __syncthreads();
         float* F = fin + rt * RED_W;
-        for (int idx = tid; idx < 16 * D; idx += NT) {
-            const int r = idx / D, d = idx % D;
-            float O = 0.f;
-            for (int w = 0; w < NW; w++) O += wts[r * NW + w] * red[w * RED_W + 32 + idx];
-            if (own_new) {
-                const float M = Mrow[r];
-                for (int jj = 0; jj < L; jj++) O += exp2f(snew[(rt * 16 + r) * L + jj] - M) * vnew[jj * D + d];
+        if (!(abl & 4)) {
+            for (int idx = tid; idx < 16 * D; idx += NT) {
+                const int r = idx / D, d = idx % D;
+                float O = 0.f;
+                for (int w = 0; w < NW; w++) O += wts[r * NW + w] * red[w * RED_W + 32 + r * RS + d];
+                if (own_new) {
+                    const float M = Mrow[r];
+                    for (int jj = 0; jj < L; jj++) O += exp2f(snew[(rt * 16 + r) * L + jj] - M) * vnew[jj * D + d];
+                }
+                F[32 + r * RS + d] = O;
+                if (d == 0) { F[r] = Mrow[r]; F[16 + r] = Lrow[r]; }
             }
-            F[32 + idx] = O;
-            if (d == 0) { F[r] = Mrow[r]; F[16 + r] = Lrow[r]; }
         }
         __syncthreads();
     }
@@ -847,40 +884,41 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     // ---- combine the two CTAs' partials over distributed shared memory (rank 0 finishes) ----
     cluster.sync();
     if (rank == 1) { cluster.sync(); return; }
-    {
+    if (!(abl & 4)) {
         const float* peer = cluster.map_shared_rank(fin, 1);
         for (int idx = tid; idx < NRT * 16 * D; idx += NT) {
-            const int rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D;
+            const int rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D, d = rem % D;
             float* F = fin + rt * RED_W;
             const float* P = peer + rt * RED_W;
             const float M0 = F[r], M1 = P[r], M = fmaxf(M0, M1);
             const float w0 = exp2f(M0 - M), w1 = exp2f(M1 - M);
-            const float O = F[32 + rem] * w0 + P[32 + rem] * w1;
+            const float O = F[32 + r * RS + d] * w0 + P[32 + r * RS + d] * w1;
             const float Lc = F[16 + r] * w0 + P[16 + r] * w1;
             __syncthreads();                     // everyone has read F[r], F[16 + r] for this pass
-            F[32 + rem] = O;
-            if (rem % D == 0) { F[16 + r] = Lc; F[r] = M; }
+            F[32 + r * RS + d] = O;
+            if (d == 0) { F[16 + r] = Lc; F[r] = M; }
             __syncthreads();
         }
-        cluster.sync();
     }
+    cluster.sync();
 
     // ---- epilogue: o = O / L x v_scale; per-head RMSNorm x sigmoid(gate) -> bf16 ----
-    for (int r = warp; r < R; r += NW) {
+    #pragma unroll
+    for (int i = 0; i < GPW; i++) {
+        const int r = warp + i * NW;
+        if (r >= R) break;
         const float* F = fin + (r / 16) * RED_W;
         const int rr = r % 16;
         const float inv = v_scale / F[16 + rr];
-        const float o0 = F[32 + rr * D + lane] * inv, o1 = F[32 + rr * D + lane + 32] * inv;
+        const float o0 = F[32 + rr * RS + lane] * inv, o1 = F[32 + rr * RS + lane + 32] * inv;
         float ss = o0 * o0 + o1 * o1;
         #pragma unroll
         for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
         const float sc = rsqrtf(ss / D + 1e-5f);
         const int j = r / G, qh = h * G + (r % G);
-        const __nv_bfloat16* gp = qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + 2 * HKV + qh) * D;
-        const float g0 = __bfloat162float(gp[lane]), g1 = __bfloat162float(gp[lane + 32]);
         __nv_bfloat16* op = out + ((int64_t)(b * L + j)) * HQ * D + qh * D;
-        op[lane] = __float2bfloat16(o0 * sc / (1.f + expf(-g0)));
-        op[lane + 32] = __float2bfloat16(o1 * sc / (1.f + expf(-g1)));
+        op[lane] = __float2bfloat16(o0 * sc / (1.f + expf(-gx[i][0])));
+        op[lane + 32] = __float2bfloat16(o1 * sc / (1.f + expf(-gx[i][1])));
     }
 }
 
@@ -888,7 +926,7 @@ template <int L>
 static void launch_sliding(const torch::Tensor& qkv, const torch::Tensor& cache_loc, const torch::Tensor& seq_lens,
                            const torch::Tensor& page_table, torch::Tensor& k_cache, torch::Tensor& v_cache,
                            const torch::Tensor& k_scale, const torch::Tensor& v_scale, torch::Tensor& out,
-                           int HQ, int HKV, int PS, float qk_scale, float sm_scale_log2, float log2_theta) {
+                           int HQ, int HKV, int PS, float qk_scale, float sm_scale_log2, float log2_theta, int abl) {
     const int B = seq_lens.size(0);
     const int smem = SlidingSmem<L>::BYTES;
     static bool configured = false;
@@ -909,19 +947,19 @@ static void launch_sliding(const torch::Tensor& qkv, const torch::Tensor& cache_
         reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()), cache_loc.data_ptr<int64_t>(), seq_lens.data_ptr<int>(),
         page_table.data_ptr<int>(), reinterpret_cast<uint8_t*>(k_cache.data_ptr()), reinterpret_cast<uint8_t*>(v_cache.data_ptr()),
         k_scale.data_ptr<float>(), v_scale.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
-        HQ, HKV, (int)page_table.size(1), PS, qk_scale, sm_scale_log2, log2_theta);
+        HQ, HKV, (int)page_table.size(1), PS, qk_scale, sm_scale_log2, log2_theta, abl);
     TORCH_CHECK(err == cudaSuccess, "sliding_attn launch failed: ", cudaGetErrorString(err));
 }
 
 void sliding_attn(torch::Tensor qkv, torch::Tensor cache_loc, torch::Tensor seq_lens, torch::Tensor page_table,
                   torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale,
                   torch::Tensor out, int64_t L, int64_t HQ, int64_t HKV, int64_t PS,
-                  double qk_scale, double sm_scale_log2, double log2_theta) {
+                  double qk_scale, double sm_scale_log2, double log2_theta, int64_t abl) {
     TORCH_CHECK(HQ == 8 * HKV, "sliding_attn: 8 query heads per KV head");
     if (L == 1) launch_sliding<1>(qkv, cache_loc, seq_lens, page_table, k_cache, v_cache, k_scale, v_scale, out,
-                                  (int)HQ, (int)HKV, (int)PS, (float)qk_scale, (float)sm_scale_log2, (float)log2_theta);
+                                  (int)HQ, (int)HKV, (int)PS, (float)qk_scale, (float)sm_scale_log2, (float)log2_theta, (int)abl);
     else if (L == 8) launch_sliding<8>(qkv, cache_loc, seq_lens, page_table, k_cache, v_cache, k_scale, v_scale, out,
-                                       (int)HQ, (int)HKV, (int)PS, (float)qk_scale, (float)sm_scale_log2, (float)log2_theta);
+                                       (int)HQ, (int)HKV, (int)PS, (float)qk_scale, (float)sm_scale_log2, (float)log2_theta, (int)abl);
     else TORCH_CHECK(false, "sliding_attn: q_len must be 1 or 8");
 }
 """
@@ -931,7 +969,7 @@ CPP_SLIDING_SRC = """
 void sliding_attn(torch::Tensor qkv, torch::Tensor cache_loc, torch::Tensor seq_lens, torch::Tensor page_table,
                   torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale,
                   torch::Tensor out, int64_t L, int64_t HQ, int64_t HKV, int64_t PS,
-                  double qk_scale, double sm_scale_log2, double log2_theta);
+                  double qk_scale, double sm_scale_log2, double log2_theta, int64_t abl);
 """
 
 SLIDING_CUDA = True     # sliding-window layers: the dedicated CUDA kernel (False: the Triton kernel)
@@ -956,8 +994,9 @@ def _sliding_ext():
     return _SLIDING_EXT
 
 
-def _sliding_forward(data, out):
-    """The dedicated sliding-window kernel; returns False (nothing done) when it does not apply."""
+def _sliding_forward(data, out, abl=0):
+    """The dedicated sliding-window kernel; returns False (nothing done) when it does not apply.
+    abl (benchmark ablations, wrong results): 1 no K/V loads, 2 no QK/PV, 4 no merge, 8 no q/k prep."""
     cfg = data["config"]
     L, HQ, HKV, D = cfg["q_len"], cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
     if cfg["window"] != 2048 or L not in (1, 8) or HQ != 8 * HKV or D != 64 or not cfg["rope_theta"]:
@@ -970,7 +1009,7 @@ def _sliding_forward(data, out):
         qkv = qkv.contiguous()
     ext.sliding_attn(qkv, data["cache_loc"], data["seq_lens"], data["page_table"], data["k_cache"], data["v_cache"],
                      data["k_scale"], data["v_scale"], out, L, HQ, HKV, cfg["page_size"],
-                     cfg["qk_scale_factor"], cfg["sm_scale"] * LOG2E, math.log2(cfg["rope_theta"]))
+                     cfg["qk_scale_factor"], cfg["sm_scale"] * LOG2E, math.log2(cfg["rope_theta"]), int(abl))
     return True
 
 # == END CUDA SLIDING ==
@@ -1090,11 +1129,12 @@ def _attn_bench(data):
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128, cuda=False)   # the Triton kernel, current plans
     w8 = dict(nw, block_t=64, warps=8)
     cu = dict(cuda=True)
+    abl = [dict(cuda=True, cabl=k) for k in (1, 2, 4, 8, 15)]   # no loads / no QK+PV / no merge / no q,k prep / skeleton
     plans = {
-        "B1 L1 sliding": [dict(nw, splits=16), cu, cu],
+        "B1 L1 sliding": [dict(nw, splits=16), cu, cu] + abl,
         "B16 L1 sliding": [dict(nw, splits=8, block_t=64), cu, cu],
         "B32 L1 sliding": [dict(nw, splits=8, block_t=64), cu, cu],
-        "B1 L8 sliding": [dict(w8, splits=32), cu, cu],
+        "B1 L8 sliding": [dict(w8, splits=32), cu, cu] + abl,
         "B16 L8 sliding": [dict(w8, splits=8), cu, cu],
         "B32 L8 sliding": [dict(w8, splits=4), cu, cu],
     }
@@ -1137,7 +1177,7 @@ def _attention_forward(data) -> torch.Tensor:
     plan = _plan(cfg)
     if _PLAN_OVERRIDE is not None:
         plan.update(_PLAN_OVERRIDE)
-    if cfg["window"] and plan.get("cuda", SLIDING_CUDA) and _sliding_forward(data, out):
+    if cfg["window"] and plan.get("cuda", SLIDING_CUDA) and _sliding_forward(data, out, plan.get("cabl", 0)):
         return out
     hp = plan["hp"] if HKV % plan["hp"] == 0 else 1
     bd = plan["bd"] and hp == 2
