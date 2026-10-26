@@ -23,6 +23,10 @@ from typing import TypedDict
 import torch
 import triton
 import triton.language as tl
+try:
+    from triton.language.extra.cuda import gdc_launch_dependents as _gdc_launch_dependents
+except Exception:   # older Triton: no programmatic dependent launch intrinsics
+    _gdc_launch_dependents = None
 
 
 class Weights(TypedDict):
@@ -79,13 +83,15 @@ def _route_kernel(
     sorted_pair_ptr, lids_ptr, npad_ptr,
     M, local_start, n_elems, n_route_ctas, xscale,
     PB: tl.constexpr, CH: tl.constexpr, BM: tl.constexpr, MAXB: tl.constexpr, E: tl.constexpr,
-    TOPK: tl.constexpr, XBLOCK: tl.constexpr, MARLIN: tl.constexpr, MULTI: tl.constexpr,
+    TOPK: tl.constexpr, XBLOCK: tl.constexpr, MARLIN: tl.constexpr, MULTI: tl.constexpr, PDL: tl.constexpr,
 ):
     """Sort-free routing. CTA c < n_route_ctas owns pairs [c*PB, (c+1)*PB): each pair's rank among
     the pairs of its expert (how many earlier pairs route there) gives its padded row; every CTA
     recounts the per-expert totals (cheap), CTA 0 also writes the block list. The remaining
     CTAs convert x to fp16 (exact for BF16 values)."""
     pid = tl.program_id(0)
+    if PDL:
+        _gdc_launch_dependents()      # the GEMM may start launching (it waits for our writes before reading them)
     if pid >= n_route_ctas:
         offs = (pid - n_route_ctas) * XBLOCK + tl.arange(0, XBLOCK)
         m = offs < n_elems
@@ -811,6 +817,10 @@ __device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t
 __device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
 __device__ __forceinline__ void fence_mbar_init() { asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory"); }
 
+// programmatic dependent launch (no-ops when the kernel was launched without the attribute)
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
+
 constexpr int WT_NWARPS = 4;
 __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
     return tpw * WT_NWARPS * 1024 + tpw * WT_NWARPS * 128 + 8 * nt * A_STRIDE * 2;
@@ -827,8 +837,10 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     float* __restrict__ part, int ldp, int part_rows,
                     int K, int NTILES, float gs_mul)
 {
-    // Weights: Wr[e][tile/4][chunk][tile%4][1 KB], scales Sr[e][tile/4][chunk][tile%4][128 B]: a 4-tile group's
-    // chunk is 4 KB contiguous. TMA: thread 0 issues cp.async.bulk copies (per chunk: TPC/4 weight groups, TPC/4
+    // Weights: Wr[e][chunk][tile/4][tile%4][1 KB], scales Sr[e][chunk][tile/4][tile%4][128 B]: an expert's chunk is
+    // one contiguous 512 KB (+64 KB) region that all of its CTAs sweep together.
+    // PDL: GATED (GEMM1) waits for the routing lists first; else (GEMM2) the weights only need the lists (already
+    // complete) so their prologue is issued before waiting for GEMM1's inter. TMA: thread 0 issues cp.async.bulk copies (per chunk: TPC/4 weight groups, TPC/4
     // scale groups, the valid token rows) tracked by one mbarrier per stage; else 16 B cp.async by all threads.
     // SPLITK: gridDim.z CTAs split K; CTA z owns chunks [z*NC/KSPLIT, (z+1)*NC/KSPLIT) and stores its fp32
     // partial sums (times gs) to part[z][row][col] (GATED: gate at col, up at col + N/2) for the reduce kernels.
@@ -843,6 +855,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     constexpr int CH = NT == 1 ? 2 : 1;               // accumulator chains per tile (latency)
     extern __shared__ __align__(128) uint8_t wt_smem[];
 
+    if (GATED) pdl_wait();                            // the routing lists come from the previous launch
     const int j = blockIdx.y;
     if (j >= *nblk) return;
     const int e = blk_e[j];
@@ -872,8 +885,9 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     };
     const size_t ebase = (size_t)e * NG;
     // global address of (tile, chunk c) weights / scales
-    auto waddr = [&](int tile, int c) { return Wr + ((ebase + (tile >> 2)) * NC_ALL + c) * 4096 + (tile & 3) * 1024; };
-    auto saddr = [&](int tile, int c) { return Sr + ((ebase + (tile >> 2)) * NC_ALL + c) * 512 + (tile & 3) * 128; };
+    const size_t WCH = (size_t)NG * 4096, SCH = (size_t)NG * 512;    // bytes per expert chunk
+    auto waddr = [&](int tile, int c) { return Wr + ((size_t)e * NC_ALL + c) * WCH + (tile >> 2) * 4096 + (tile & 3) * 1024; };
+    auto saddr = [&](int tile, int c) { return Sr + ((size_t)e * NC_ALL + c) * SCH + (tile >> 2) * 512 + (tile & 3) * 128; };
 
     const uint32_t smem_base = smem_u32(wt_smem);
     const uint32_t bars = smem_base + NSTAGE * STAGE_BYTES;      // TMA: one mbarrier per stage
@@ -901,14 +915,16 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             xbytes[i] = valid ? 16 : 0;
         }
     }
-    auto issue = [&](int c, int stage) {
+    auto issue_w = [&](int c, int stage) {
         const uint32_t ws = smem_base + stage * STAGE_BYTES;
         const uint32_t ss = ws + W_STAGE;
-        const uint32_t xs = ss + S_STAGE;
         #pragma unroll
         for (int i = 0; i < WSEG; ++i)
-            cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 4096, 16);
-        if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * 512, 16);
+            cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * WCH, 16);
+        if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * SCH, 16);
+    };
+    auto issue_x = [&](int c, int stage) {
+        const uint32_t xs = smem_base + stage * STAGE_BYTES + W_STAGE + S_STAGE;
         #pragma unroll
         for (int i = 0; i < XSEG; ++i) {
             const int sidx = tid + i * NTHR;
@@ -916,6 +932,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                 cp_async16(xs + ((sidx >> 4) * A_STRIDE + (sidx & 15) * 8) * 2, xsrc[i] + c * KC, xbytes[i]);
         }
     };
+    auto issue = [&](int c, int stage) { issue_w(c, stage); issue_x(c, stage); };
 
     // ---- TMA issue, distributed: lane 0 of warps 0..NGRP-1 copies one weight group (+ scales), the lanes of the
     // last warp copy one token row each, thread 0 registers the stage's byte count on the stage's mbarrier ----
@@ -930,8 +947,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         if (warp < NGRP) {
             int grp = blockIdx.x * MW + (warp % MW);
             if (GATED && warp >= MW) grp += NG / 2;
-            wgrp_src = Wr + ((ebase + grp) * NC_ALL + c0) * 4096;
-            sgrp_src = Sr + ((ebase + grp) * NC_ALL + c0) * 512;
+            wgrp_src = Wr + ((size_t)e * NC_ALL + c0) * WCH + grp * 4096;
+            sgrp_src = Sr + ((size_t)e * NC_ALL + c0) * SCH + grp * 512;
         }
         if (tid == 0) {
             #pragma unroll
@@ -948,8 +965,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         if (tid == 0) mbar_expect_tx(bar, (uint32_t)(W_STAGE + S_STAGE + nvalid * KC * 2));
         if (lane == 0 && warp < NGRP) {
             fence_proxy_async();
-            bulk_g2s(ws + warp * 4096, wgrp_src + (size_t)c * 4096, 4096, bar);
-            bulk_g2s(ss + warp * 512, sgrp_src + (size_t)c * 512, 512, bar);
+            bulk_g2s(ws + warp * 4096, wgrp_src + (size_t)c * WCH, 4096, bar);
+            bulk_g2s(ss + warp * 512, sgrp_src + (size_t)c * SCH, 512, bar);
         }
         if (warp == WT_NWARPS - 1 && lane < nvalid) {
             fence_proxy_async();
@@ -968,15 +985,27 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     const float gsf = gs[e] * gs_mul;                                   // gs * 64: applied to the fp32 sums
 
     if constexpr (TMA) {
+        if (!GATED) pdl_wait();
         #pragma unroll
         for (int st = 0; st < NSTAGE - 1; ++st)
             if (st < NC) issue_tma(st, st);
-    } else {
+    } else if (GATED) {
         #pragma unroll
         for (int st = 0; st < NSTAGE - 1; ++st) {
             if (st < NC) issue(st, st);
             cp_async_commit();
         }
+    } else {
+        // weights first (one group), then wait for GEMM1's inter, then the token rows (one group)
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st)
+            if (st < NC) issue_w(st, st);
+        cp_async_commit();
+        pdl_wait();
+        #pragma unroll
+        for (int st = 0; st < NSTAGE - 1; ++st)
+            if (st < NC) issue_x(st, st);
+        cp_async_commit();
     }
 
     for (int c = 0; c < NC; ++c) {
@@ -989,7 +1018,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             }
             mbar_wait(bars + 8 * stage, (uint32_t)((c / NSTAGE) & 1));
         } else {
-            cp_async_wait<NSTAGE - 2>();
+            if (!GATED && c == 0) cp_async_wait<0>();     // the two prologue groups
+            else cp_async_wait<NSTAGE - 2>();
             __syncthreads();
             const int cn = c + NSTAGE - 1;
             if (cn < NC) issue(cn, cn % NSTAGE);
@@ -1044,6 +1074,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             }
         }
     }
+    pdl_trigger();                                    // main loop done: the next kernel may start launching
     if constexpr (!TMA) cp_async_wait<0>();
 
     if (KS == 2) {
@@ -1126,7 +1157,7 @@ template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, bool TMA>
 void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
                float* part, int ldp, int part_rows, int ksplit,
-               int K, int ntiles, int max_blocks, float gs_mul, cudaStream_t stream)
+               int K, int ntiles, int max_blocks, float gs_mul, bool pdl, cudaStream_t stream)
 {
     constexpr int TPW = (GATED ? 2 : 1) * MW;
     constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT) + (TMA ? NSTAGE * 8 : 0);
@@ -1136,9 +1167,19 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
         attr_set = true;
     }
     const int n_x = (GATED ? ntiles / 2 : ntiles) / (WT_NWARPS * MW);
-    dim3 grid(n_x, max_blocks, ksplit);
-    moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA><<<grid, 128 * KS, smem, stream>>>(
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(n_x, max_blocks, ksplit);
+    cfg.blockDim = dim3(128 * KS);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, TMA>,
         X, ldx, st, be, br, bend, nb, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, K, ntiles, gs_mul);
+    TORCH_CHECK(err == cudaSuccess, "wt launch failed: ", cudaGetErrorString(err));
 }
 
 // split-K reduce of GEMM1's fp32 partial slices + SiLU(gate) * up -> inter (bf16 values in an fp16 container).
@@ -1200,6 +1241,7 @@ moe_finalize_kernel(__nv_bfloat16* __restrict__ y, int ldy, const float* __restr
     constexpr int PP = KSPLIT <= 4 ? 4 : 2;              // pieces per pass in the split-K reduction
     __shared__ float sc_sh[8];
     __shared__ int row_sh[8];
+    pdl_wait();                                          // y comes from the previous launch
     const int tok = blockIdx.x, warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
     const int r = row_of_pair[tok * 8 + warp];
     float ss = 0.f;
@@ -1328,7 +1370,7 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
                   torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
                   torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles,
-                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, bool tma)
+                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, bool tma, bool pdl)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const __half* Xp = reinterpret_cast<const __half*>(X.data_ptr());
@@ -1343,25 +1385,16 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
     const int prow = ksplit > 1 ? (int)part.size(1) : 0;
 #define OKC_W(G, M, T, S, NS, SK, TM) launch_wt<G, M, T, S, NS, SK, TM>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
-        pp, ldp, prow, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, stream)
+        pp, ldp, prow, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, stream)
     const int key = (tma ? 10000000 : 0) + (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
     switch (key) {
-        case 111102: OKC_W(true, 1, 1, 1, 2, false, false); break;   case 111104: OKC_W(true, 1, 1, 1, 4, false, false); break;
-        case 111108: OKC_W(true, 1, 1, 1, 8, false, false); break;
-        case 112104: OKC_W(true, 1, 2, 1, 4, false, false); break;   case 114104: OKC_W(true, 1, 4, 1, 4, false, false); break;
-        case 114102: OKC_W(true, 1, 4, 1, 2, false, false); break;
+        case 111104: OKC_W(true, 1, 1, 1, 4, false, false); break;   case 111108: OKC_W(true, 1, 1, 1, 8, false, false); break;
+        case 112104: OKC_W(true, 1, 2, 1, 4, false, false); break;   case 114102: OKC_W(true, 1, 4, 1, 2, false, false); break;
+        case 114104: OKC_W(true, 1, 4, 1, 4, false, false); break;
         case 11104: OKC_W(false, 1, 1, 1, 4, false, false); break;   case 11108: OKC_W(false, 1, 1, 1, 8, false, false); break;
         case 21104: OKC_W(false, 2, 1, 1, 4, false, false); break;   case 22104: OKC_W(false, 2, 2, 1, 4, false, false); break;
-        case 22102: OKC_W(false, 2, 2, 1, 2, false, false); break;   case 24102: OKC_W(false, 2, 4, 1, 2, false, false); break;
-        case 24104: OKC_W(false, 2, 4, 1, 4, false, false); break;   case 14104: OKC_W(false, 1, 4, 1, 4, false, false); break;
-        // split-K (SPLITK = true): partial-slice stores, for the small batches
-        case 1111104: OKC_W(true, 1, 1, 1, 4, true, false); break;   case 1011104: OKC_W(false, 1, 1, 1, 4, true, false); break;
-        // TMA bulk-copy ring
-        case 10111104: OKC_W(true, 1, 1, 1, 4, false, true); break;  case 10111108: OKC_W(true, 1, 1, 1, 8, false, true); break;
-        case 10112104: OKC_W(true, 1, 2, 1, 4, false, true); break;  case 10114104: OKC_W(true, 1, 4, 1, 4, false, true); break;
-        case 10011104: OKC_W(false, 1, 1, 1, 4, false, true); break; case 10011108: OKC_W(false, 1, 1, 1, 8, false, true); break;
-        case 10021104: OKC_W(false, 2, 1, 1, 4, false, true); break; case 10022104: OKC_W(false, 2, 2, 1, 4, false, true); break;
-        case 10024104: OKC_W(false, 2, 4, 1, 4, false, true); break;
+        case 24102: OKC_W(false, 2, 4, 1, 2, false, false); break;   case 24104: OKC_W(false, 2, 4, 1, 4, false, false); break;
+        // split-K (SPLITK) and TMA bulk-copy variants are kept as code but not instantiated: both measured slower
         default: TORCH_CHECK(false, "unsupported wt variant (mw, nt, ks, nstage, ksplit, tma)");
     }
 #undef OKC_W
@@ -1383,13 +1416,24 @@ void moe_wt_silu_reduce(torch::Tensor part, int64_t ksplit, torch::Tensor out, t
 }
 
 void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Tensor row_of_pair, torch::Tensor tw,
-                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps)
+                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps, bool pdl)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(out.size(1) == 4096, "finalize: H must be 4096");
     const float* pp = ksplit > 1 ? part.data_ptr<float>() : nullptr;
     const int ldp = ksplit > 1 ? (int)part.stride(1) : 0, prow = ksplit > 1 ? (int)part.size(1) : 0;
-#define OKC_F(KS) moe_finalize_kernel<4096, KS><<<(unsigned)M, 256, 0, stream>>>(reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), \
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((unsigned)M);
+    cfg.blockDim = dim3(256);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    cudaError_t err = cudaSuccess;
+#define OKC_F(KS) err = cudaLaunchKernelEx(&cfg, moe_finalize_kernel<4096, KS>, reinterpret_cast<__nv_bfloat16*>(y.data_ptr()), \
         (int)y.stride(0), pp, ldp, prow, row_of_pair.data_ptr<int>(), tw.data_ptr<float>(), nw.data_ptr<float>(), \
         reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (float)eps)
     switch (ksplit) {
@@ -1397,6 +1441,7 @@ void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Te
         default: TORCH_CHECK(false, "unsupported ksplit for the finalize");
     }
 #undef OKC_F
+    TORCH_CHECK(err == cudaSuccess, "finalize launch failed: ", cudaGetErrorString(err));
 }
 """
 
@@ -1410,11 +1455,11 @@ void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk
 void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
                   torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
                   torch::Tensor out, torch::Tensor part, int64_t ksplit, int64_t K, int64_t ntiles,
-                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, bool tma);
+                  int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, bool tma, bool pdl);
 void moe_wt_silu_reduce(torch::Tensor part, int64_t ksplit, torch::Tensor out, torch::Tensor blk_row0, torch::Tensor blk_end,
                         torch::Tensor nblk, int64_t rows_per_block, int64_t max_blocks, int64_t I);
 void moe_finalize(torch::Tensor y, torch::Tensor part, int64_t ksplit, torch::Tensor row_of_pair, torch::Tensor tw,
-                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps);
+                  torch::Tensor nw, torch::Tensor out, int64_t M, double eps, bool pdl);
 """
 
 _EXT = None
@@ -1465,7 +1510,7 @@ def repack_weights(w: torch.Tensor, sf: torch.Tensor):
 
 def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
     """w uint8 [E, N, K/2] packed E2M1 (low nibble = even k), sf fp8 [E, N, K/16] ->
-    Wr uint8 [E, N/64, K/128, 4, 1024] (per expert, 4-tile group, chunk, tile slot: 2 halves x 32 lanes x 16 B): per
+    Wr uint8 [E, K/128, N/64, 4, 1024] (per expert, chunk, 4-tile group, tile slot: 2 halves x 32 lanes x 16 B): per
     (tile, chunk, half, lane) 4 words = the lane's
     A-fragment nibbles for k16 steps 4*half .. 4*half+3 (byte b: nibble A_b at bits {7,4,3,2} = E4M3
     position, nibble B_b at (e1:6, s:5, e0:1, m:0); A_0,A_1 = row g k 2t,2t+1; A_2,A_3 = row g+8 k 2t,2t+1;
@@ -1501,9 +1546,10 @@ def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
         del nib, n6, sel, word
     sfu = sf.view(torch.uint8).view(E, NTL, 2, 8, NC, 8)                            # e, tile, rh, g, chunk, step
     Sr = sfu.permute(0, 1, 4, 3, 5, 2).contiguous().view(E, NTL, NC, 8, 16)         # e, tile, chunk, g, (step, rh)
-    # 4-tile groups: a group's chunk is 4 KB (weights) / 512 B (scales) contiguous, for bulk copies
-    Wr = Wr.view(E, NTL // 4, 4, NC, 1024).permute(0, 1, 3, 2, 4).contiguous()      # e, group, chunk, slot, 1 KB
-    Sr = Sr.view(E, NTL // 4, 4, NC, 128).permute(0, 1, 3, 2, 4).contiguous()       # e, group, chunk, slot, 128 B
+    # chunk-major: an expert's chunk c (all N/16 tiles' 1 KB blocks, grouped by 4) is one contiguous region, so the
+    # CTAs of an expert sweep memory together
+    Wr = Wr.view(E, NTL // 4, 4, NC, 1024).permute(0, 3, 1, 2, 4).contiguous()      # e, chunk, group, slot, 1 KB
+    Sr = Sr.view(E, NTL // 4, 4, NC, 128).permute(0, 3, 1, 2, 4).contiguous()       # e, chunk, group, slot, 128 B
     return Wr, Sr
 
 # == END CUDA ==
@@ -1548,11 +1594,12 @@ def _moe_forward_cuda(x, ids, tw, local_start: int, I: int, state) -> torch.Tens
 # (token n8 blocks per expert block, GEMM2 m16 tiles per warp, K-split warp groups, stages, K-split CTAs, TMA bulk copies)
 # Locked from the in-prepare cold-L2 sweeps (checks f2f756d9, a3d79f15): 8 cp.async stages up to 8 tokens, 4 above;
 # 8-token blocks up to 64 tokens, 16-token (GEMM2: 2 tiles per warp) up to 128, 32-token with 2 stages beyond.
-WT_DEFAULT = {8: (1, 1, 1, 8, 1, 1), 64: (1, 1, 1, 4, 1, 1), 128: (2, 2, 1, 4, 1, 1), 100000: (4, 2, 1, 2, 1, 0)}
+WT_DEFAULT = {8: (1, 1, 1, 8, 1, 0), 64: (1, 1, 1, 4, 1, 0), 128: (2, 2, 1, 4, 1, 0), 100000: (4, 2, 1, 2, 1, 0)}
 WT_SAFE = (1, 1, 1, 4, 1, 0)
 PART_SPLIT_MAX = 8      # fp32 partial slices for split-K
 PART_ROWS = 1024        # padded rows the partial buffer holds (split-K is a small-batch tool)
 _WT_OVERRIDE = None
+_PDL_OVERRIDE = None     # bench: False forces plain launches
 
 
 def _wt_variant(M: int, state):
@@ -1584,6 +1631,7 @@ def _moe_forward_wt(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor
     ids = ids.contiguous()
     tw = tw.contiguous()
     nt, mw2, ks, nstage, ksplit, tma = _wt_variant(M, state)
+    pdl = bool(state.get("pdl", False)) and _PDL_OVERRIDE is not False
     BM = 8 * nt
     if M * TOPK + LOCAL * (BM - 1) > PART_ROWS:
         ksplit = 1
@@ -1597,13 +1645,13 @@ def _moe_forward_wt(x, ids, tw, local_start: int, I: int, state) -> torch.Tensor
     part = state["part"]
     ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
                      state["Wt13"], state["St13"], state["gs13"], inter, part, ksplit, H, 2 * I // 16, maxb, True, 1, nt, ks,
-                     nstage, state["gs_mul"], bool(tma))
+                     nstage, state["gs_mul"], bool(tma), pdl)
     if ksplit > 1:
         ext.moe_wt_silu_reduce(part, ksplit, inter, state["blk_row0"], state["blk_end"], state["nblk"], BM, maxb, I)
     ext.moe_w4a16_wt(inter, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
                      state["Wt2"], state["St2"], state["gs2"], y, part, ksplit, I, H // 16, maxb, False, mw2, nt, ks, nstage,
-                     state["gs_mul"], bool(tma))
-    ext.moe_finalize(y, part, ksplit, state["row_of_pair"], tw, state["norm_w"], out, M, POST_NORM_EPS)
+                     state["gs_mul"], bool(tma), pdl)
+    ext.moe_finalize(y, part, ksplit, state["row_of_pair"], tw, state["norm_w"], out, M, POST_NORM_EPS, pdl)
     return out
 
 
@@ -1754,7 +1802,8 @@ def _route(x, ids, local_start: int, BM: int, state, marlin: bool):
         state["sorted_tok"], state["row_of_pair"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
         state["sorted_pair"], state["lids"], state["npad"],
         M, local_start, n_elems, n_route, float(state.get("xscale", 1.0)),
-        PB=PB, CH=CH, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, MARLIN=marlin, MULTI=NP > CH, num_warps=4,
+        PB=PB, CH=CH, BM=BM, MAXB=MAXB, E=LOCAL, TOPK=TOPK, XBLOCK=XBLOCK, MARLIN=marlin, MULTI=NP > CH,
+        PDL=bool(state.get("pdl", False)) and _gdc_launch_dependents is not None, num_warps=4,
     )
     return NP, MAXB
 
@@ -2062,8 +2111,7 @@ def _timeit_cold(fn, dev, reps=8):
     return run(True) - run(False)
 
 
-WT_TEST_VARIANTS = ((1, 1, 1, 4, 1, 0), (1, 1, 1, 8, 1, 0), (2, 2, 1, 4, 1, 0), (4, 2, 1, 2, 1, 0), (1, 1, 1, 4, 4, 0),
-                    (1, 1, 1, 4, 1, 1), (1, 1, 1, 8, 1, 1), (1, 2, 1, 4, 1, 1), (2, 2, 1, 4, 1, 1), (4, 2, 1, 4, 1, 1), (2, 1, 1, 4, 1, 1))
+WT_TEST_VARIANTS = ((1, 1, 1, 4, 1, 0), (1, 1, 1, 8, 1, 0), (1, 2, 1, 4, 1, 0), (2, 2, 1, 4, 1, 0), (4, 2, 1, 2, 1, 0), (4, 2, 1, 4, 1, 0))
 
 
 def _selftest_wt(state):
@@ -2129,19 +2177,29 @@ def _bench_wt(state, autotune=False):
         parts = {
             "route": lambda: _route(x, ids, 0, BM, state, marlin=False),
             "gemm1": lambda: ext.moe_w4a16_wt(x16, state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                              state["Wt13"], state["St13"], state["gs13"], state["inter"], part, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, 64.0, bool(tma)),
+                                              state["Wt13"], state["St13"], state["gs13"], state["inter"], part, ksp, 4096, 512, maxb, True, 1, nt, ks, ns, 64.0, bool(tma), False),
             "silu_red": lambda: ext.moe_wt_silu_reduce(part, max(ksp, 2), state["inter"], state["blk_row0"], state["blk_end"], state["nblk"], BM, maxb, 4096),
             "gemm2": lambda: ext.moe_w4a16_wt(state["inter"], state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"],
-                                              state["Wt2"], state["St2"], state["gs2"], state["y"], part, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, 64.0, bool(tma)),
-            "finalize": lambda: ext.moe_finalize(state["y"], part, ksp, state["row_of_pair"], tw, state["norm_w"], out, bs, POST_NORM_EPS),
+                                              state["Wt2"], state["St2"], state["gs2"], state["y"], part, ksp, 4096, 256, maxb, False, mw2, nt, ks, ns, 64.0, bool(tma), False),
+            "finalize": lambda: ext.moe_finalize(state["y"], part, ksp, state["row_of_pair"], tw, state["norm_w"], out, bs, POST_NORM_EPS, False),
         }
         try:
             print(f"  wt parts bs{bs} {(nt, mw2, ks, ns, ksp, tma)}: " + "  ".join(f"{k} {_timeit_cold(f, dev):6.1f}" for k, f in parts.items())
                   + f"  | local routes {int(((ids >= 0) & (ids < 32)).sum())} distinct {int(torch.unique(ids[(ids < 32)]).numel())}")
         except Exception as e:
             print(f"  wt parts bs{bs} failed: {str(e)[:100]}")
-    small = [(1, 1, 1, 8, 1, 0), (1, 1, 1, 4, 1, 0), (1, 1, 1, 8, 1, 1), (1, 1, 1, 4, 1, 1), (1, 2, 1, 4, 1, 1), (1, 1, 1, 4, 4, 0)]
-    big = [(2, 2, 1, 4, 1, 0), (4, 2, 1, 2, 1, 0), (2, 2, 1, 4, 1, 1), (4, 2, 1, 4, 1, 1), (1, 2, 1, 4, 1, 1), (2, 1, 1, 4, 1, 1)]
+    global _PDL_OVERRIDE
+    if state.get("pdl", False):
+        for flag in (False, True):
+            _PDL_OVERRIDE = flag
+            try:
+                r = [_timeit_cold(lambda bs=bs: _moe_forward_wt(*data[bs], 0, 4096, state), dev) for bs in shapes]
+                print(f"  wt pdl={int(flag)}      : " + "  ".join(f"bs{bs} {t:7.1f}" for bs, t in zip(shapes, r)))
+            except Exception as e:
+                print(f"  wt pdl={int(flag)} failed: {str(e)[:80]}")
+        _PDL_OVERRIDE = None
+    small = [(1, 1, 1, 8, 1, 0), (1, 1, 1, 4, 1, 0), (1, 2, 1, 4, 1, 0), (1, 2, 1, 8, 1, 0)]
+    big = [(2, 2, 1, 4, 1, 0), (4, 2, 1, 2, 1, 0), (4, 2, 1, 4, 1, 0), (2, 2, 1, 8, 1, 0)]
     bad = state.get("wt_bad", set())
     best = {}
     for bs in shapes:
@@ -2165,7 +2223,34 @@ def _bench_wt(state, autotune=False):
     print(f"BENCH wt done in {time.time() - t0:.0f}s")
 
 
-AUTOTUNE = True    # pick the wt variant per shape from the in-prepare bench (BENCH) instead of WT_DEFAULT
+PDL_ENABLED = True   # programmatic dependent launch across the 4 launches (verified under graph capture in prepare)
+
+
+def _pdl_selftest(state):
+    """PDL launches must be correct eagerly and capturable into a CUDA graph; otherwise plain launches."""
+    dev = state["w13"].device
+    try:
+        x, ids, tw = _judge_inputs(4, dev, seed=11)
+        state["pdl"] = False
+        ref = _moe_forward_wt(x, ids, tw, 0, 4096, state).float()
+        state["pdl"] = True
+        out = _moe_forward_wt(x, ids, tw, 0, 4096, state).float()
+        torch.cuda.synchronize()
+        err = float((out - ref).norm() / ref.norm().clamp(min=1e-12))
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            out2 = _moe_forward_wt(x, ids, tw, 0, 4096, state)
+        g.replay()
+        torch.cuda.synchronize()
+        err2 = float((out2.float() - ref).norm() / ref.norm().clamp(min=1e-12))
+        state["pdl"] = err < 1e-3 and err2 < 1e-3
+        print(f"pdl selftest: eager {err:.2e} graph {err2:.2e} -> {'enabled' if state['pdl'] else 'DISABLED'}")
+    except Exception as e:
+        state["pdl"] = False
+        print("pdl selftest failed -> plain launches:", str(e)[:160])
+
+
+AUTOTUNE = False   # pick the wt variant per shape from the in-prepare bench (BENCH) instead of WT_DEFAULT
 
 
 def prepare(weights: Weights):
@@ -2176,6 +2261,9 @@ def prepare(weights: Weights):
         except Exception as e:
             print("selftest wt failed:", repr(e)[:200])
             state["wt_ok"] = False
+        torch.cuda.synchronize()
+    if "Wt13" in state and state.get("wt_ok", True) and PDL_ENABLED:
+        _pdl_selftest(state)
         torch.cuda.synchronize()
     if BENCH and "Wt13" in state:
         try:

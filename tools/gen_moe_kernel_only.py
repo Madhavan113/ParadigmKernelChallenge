@@ -14,7 +14,7 @@ sig = ("(const __half*, int, const int*, const int*, const int*, const int*, con
 for g, m, p, s in re.findall(r"OKC_L\((true|false), (\d), (\d), (\d)\)", cu):
     inst.append(f"template void launch<{g}, {m}, {p}, {s}>{sig};")
 wsig = ("(const __half*, int, const int*, const int*, const int*, const int*, const int*, const uint8_t*, const uint8_t*, "
-        "const float*, __half*, __nv_bfloat16*, int, float*, int, int, int, int, int, int, float, cudaStream_t)")
+        "const float*, __half*, __nv_bfloat16*, int, float*, int, int, int, int, int, int, float, bool, cudaStream_t)")
 for g, m, t, s, n, sk, tm in re.findall(r"OKC_W\((true|false), (\d), (\d), (\d), (\d), (true|false), (true|false)\)", cu):
     inst.append(f"template void launch_wt<{g}, {m}, {t}, {s}, {n}, {sk}, {tm}>{wsig};")
 # keep the finalize kernel referenced
@@ -22,6 +22,6 @@ inst.append("void* finalize_ref1 = (void*)&moe_finalize_kernel<4096, 1>;")
 inst.append("void* finalize_ref4 = (void*)&moe_finalize_kernel<4096, 4>;")
 inst.append("void* finalize_ref8 = (void*)&moe_finalize_kernel<4096, 8>;")
 inst.append("void* silu_ref = (void*)&wt_silu_reduce_kernel<4>;")
-out = body + "\n".join(inst) + "\n} // namespace\n"
+out = "#ifndef TORCH_CHECK\n#define TORCH_CHECK(...)\n#endif\n" + body + "\n".join(inst) + "\n} // namespace\n"
 (root / "tools/moe_kernel_only.cu").write_text(out)
 print("wrote", len(out.splitlines()), "lines,", len(inst), "instantiations")
