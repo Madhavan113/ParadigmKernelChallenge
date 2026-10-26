@@ -416,7 +416,10 @@ __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
     uint32_t d; asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel)); return d;
 }
 __device__ __forceinline__ void decode4(uint32_t L, uint32_t n16, uint32_t lut0, uint32_t lut1, uint32_t& w01, uint32_t& w23) {
-    uint32_t H = prmt(lut0, lut1, n16 & 0x7777u) | ((n16 & 0x8888u) << 4);
+    // nibble i of n16 = (sign << 3) | (off >> 1) for element i; E = [b0, b0, b1, b1] puts nibble i in
+    // byte i (low nibble for even i, high for odd), so its sign bit is byte bit 3 (even) / 7 (odd)
+    const uint32_t E = prmt(n16, 0u, 0x1100u);
+    const uint32_t H = prmt(lut0, lut1, n16 & 0x7777u) | ((E & 0x00080008u) << 4) | (E & 0x80008000u);
     w01 = prmt(L, H, 0x5140u);
     w23 = prmt(L, H, 0x7362u);
 }
@@ -505,20 +508,32 @@ __global__ void __launch_bounds__(WARPS * 32) gemv12_kernel(const __nv_bfloat16*
         if (!s_last) return;
         __threadfence();
     }
+    // escapes of this n-tile: staged in parallel (one entry per thread per pass), then row threads scan
+    __shared__ int s_en[WARPS * 32];
+    __shared__ float s_ev[WARPS * 32];
+    const int e0 = esc_off[pn], e1 = esc_off[pn + 1];
+    float v = 0.f;
     if (threadIdx.x < 32) {
-        const int r = threadIdx.x;
-        float v = 0.f;
         if (SK > 1) {
             #pragma unroll
-            for (int s2 = 0; s2 < SK; ++s2) v += __ldcg(part + (size_t)s2 * N + pn * 32 + r);
+            for (int s2 = 0; s2 < SK; ++s2) v += __ldcg(part + (size_t)s2 * N + pn * 32 + threadIdx.x);
         } else {
-            v = red[r];
+            v = red[threadIdx.x];
         }
-        const int e0 = esc_off[pn], e1 = esc_off[pn + 1];
-        for (int e = e0; e < e1; ++e)
-            if (esc_n[e] == r) v = fmaf(esc_d[e], __bfloat162float(X[esc_k[e]]), v);
-        out[pn * 32 + r] = __float2bfloat16(v);
-        if (SK > 1 && r == 0) cnt[pn] = 0;
+    }
+    for (int base = e0; base < e1; base += WARPS * 32) {
+        const int e = base + (int)threadIdx.x;
+        if (e < e1) { s_en[threadIdx.x] = esc_n[e]; s_ev[threadIdx.x] = esc_d[e] * __bfloat162float(X[esc_k[e]]); }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int cnt_ = min(e1 - base, WARPS * 32);
+            for (int j = 0; j < cnt_; ++j) v += (s_en[j] == (int)threadIdx.x) ? s_ev[j] : 0.f;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < 32) {
+        out[pn * 32 + threadIdx.x] = __float2bfloat16(v);
+        if (SK > 1 && threadIdx.x == 0) cnt[pn] = 0;
     }
 }
 
@@ -693,7 +708,7 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda5", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda6", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
             functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT

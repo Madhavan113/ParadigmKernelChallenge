@@ -344,6 +344,126 @@ def _tiled_gemv_kernel(
 
 
 @triton.jit
+def _decode12(L, Nb, lut0, lut1, ASM: tl.constexpr):
+    """L: [R, C] uint32 of 4 raw low bytes, Nb: [R, C] uint32 of 4 nibbles (sign << 3 | off >> 1):
+    returns the 4 bf16 bit patterns as uint16 e0..e3 (elements 4j .. 4j + 3)."""
+    if ASM:
+        w01, w23 = tl.inline_asm_elementwise(
+            "{ .reg .b32 h, t, e, u; and.b32 t, $3, 0x7777; prmt.b32 h, $4, $5, t; prmt.b32 e, $3, 0, 0x1100; "
+            "and.b32 u, e, 0x00080008; shl.b32 u, u, 4; and.b32 e, e, 0x80008000; or.b32 u, u, e; or.b32 h, h, u; "
+            "prmt.b32 $0, $2, h, 0x5140; prmt.b32 $1, $2, h, 0x7362; }",
+            "=r,=r,r,r,r,r", [L, Nb, lut0, lut1], dtype=(tl.uint32, tl.uint32), is_pure=True, pack=1)
+    else:
+        hb = lut0 & 0xFF
+        k0 = Nb & 7
+        k1 = (Nb >> 4) & 7
+        k2 = (Nb >> 8) & 7
+        k3 = (Nb >> 12) & 7
+        s0 = (Nb >> 3) & 1
+        s1 = (Nb >> 7) & 1
+        s2 = (Nb >> 11) & 1
+        s3 = (Nb >> 15) & 1
+        h0 = (hb + k0) | (s0 << 7)
+        h1 = (hb + k1) | (s1 << 7)
+        h2 = (hb + k2) | (s2 << 7)
+        h3 = (hb + k3) | (s3 << 7)
+        w01 = (L & 0xFF) | (h0 << 8) | (((L >> 8) & 0xFF) << 16) | (h1 << 24)
+        w23 = ((L >> 16) & 0xFF) | (h2 << 8) | ((L >> 24) << 16) | (h3 << 24)
+    e0 = (w01 & 0xFFFF).to(tl.uint16)
+    e1 = (w01 >> 16).to(tl.uint16)
+    e2 = (w23 & 0xFFFF).to(tl.uint16)
+    e3 = (w23 >> 16).to(tl.uint16)
+    return e0, e1, e2, e3
+
+
+@triton.jit
+def _tiled12_gemm_kernel(
+    x_ptr, lo_ptr, nb_ptr, out_ptr, part_ptr, cnt_ptr,
+    esc_off_ptr, esc_n_ptr, esc_k_ptr, esc_d_ptr,
+    M, N, K, stride_xm, stride_om, EB,
+    BLOCK_M: tl.constexpr, SPLIT_K: tl.constexpr, ASM: tl.constexpr, INTERP: tl.constexpr,
+):
+    """x @ W.T over the 12-bit packed weight (tiles of 32 rows x 256 k: lo_ptr = uint32 view of the
+    low bytes [tiles * 32, 64], nb_ptr = uint16 view of the nibbles [tiles * 32, 64]); the tile is
+    decoded to bf16 in registers before tl.dot. Split-K as _tiled_gemm_kernel (ticket); the
+    finishing CTA adds the tile's escapes (n_local, k, delta)."""
+    BLOCK_N: tl.constexpr = 32
+    BLOCK_K: tl.constexpr = 256
+    pid_n = tl.program_id(0)
+    pid_k = tl.program_id(1)
+    pid_m = tl.program_id(2)
+    n_tiles = tl.num_programs(0)
+    m_tiles = tl.num_programs(2)
+    KT = K // BLOCK_K
+    kt_chunk = KT // SPLIT_K
+    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
+    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
+    offs_k = tl.arange(0, BLOCK_K)
+    m_mask = offs_m < M
+    k0 = tl.multiple_of(pid_k * kt_chunk * BLOCK_K, BLOCK_K)
+    x_ptrs = x_ptr + offs_m[:, None] * stride_xm + (k0 + offs_k)[None, :]
+    rows = tl.arange(0, BLOCK_N)
+    cols = tl.arange(0, BLOCK_K // 4)
+    tile0 = (pid_n * KT + pid_k * kt_chunk) * (BLOCK_N * BLOCK_K // 4)   # uint32 / uint16 units per tile
+    l_ptrs = lo_ptr + tile0 + rows[:, None] * (BLOCK_K // 4) + cols[None, :]
+    n_ptrs = nb_ptr + tile0 + rows[:, None] * (BLOCK_K // 4) + cols[None, :]
+    hb = (EB >> 1).to(tl.uint32)
+    lut0 = tl.zeros((BLOCK_N, BLOCK_K // 4), dtype=tl.uint32) + (hb | ((hb + 1) << 8) | ((hb + 2) << 16) | ((hb + 3) << 24))
+    lut1 = tl.zeros((BLOCK_N, BLOCK_K // 4), dtype=tl.uint32) + ((hb + 4) | ((hb + 5) << 8) | ((hb + 6) << 16) | ((hb + 7) << 24))
+    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    for _ in range(0, kt_chunk):
+        x = tl.load(x_ptrs, mask=m_mask[:, None], other=0.0)
+        L = tl.load(l_ptrs).to(tl.uint32, bitcast=True)
+        Nb = tl.load(n_ptrs).to(tl.uint16, bitcast=True).to(tl.uint32)
+        e0, e1, e2, e3 = _decode12(L, Nb, lut0, lut1, ASM)
+        # join(a, b) adds a NEW last axis; reshape flattens the outer join fastest: (e0 e1 e2 e3) needs join(join(e0, e2), join(e1, e3))
+        w16 = tl.join(tl.join(e0, e2), tl.join(e1, e3)).reshape(BLOCK_N, BLOCK_K)
+        if INTERP:   # CPU interpreter: no bf16 there, so widen the bit patterns to fp32 and dot in fp32
+            w32 = (w16.to(tl.uint32) << 16).to(tl.float32, bitcast=True)
+            acc = tl.dot(x.to(tl.float32), tl.trans(w32), acc)
+        else:
+            acc = tl.dot(x, tl.trans(w16.to(tl.bfloat16, bitcast=True)), acc)
+        x_ptrs += BLOCK_K
+        l_ptrs += BLOCK_N * BLOCK_K // 4
+        n_ptrs += BLOCK_N * BLOCK_K // 4
+    out_ptrs = out_ptr + offs_m[:, None] * stride_om + offs_n[None, :]
+    if SPLIT_K == 1:
+        total = acc
+        finish = True
+    else:
+        m_pad = m_tiles * BLOCK_M
+        part_ptrs = part_ptr + (pid_k * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+        tl.store(part_ptrs, acc)
+        tl.debug_barrier()
+        tile = pid_m * n_tiles + pid_n
+        ticket = tl.atomic_add(cnt_ptr + tile, 1, sem="acq_rel", scope="gpu")
+        tl.debug_barrier()
+        finish = ticket == SPLIT_K - 1
+        total = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+        if finish:
+            for s_ in tl.static_range(SPLIT_K):
+                p = part_ptr + (s_ * m_pad + offs_m)[:, None] * N + offs_n[None, :]
+                total += tl.load(p, cache_modifier=".cg")
+    if finish:
+        e_beg = tl.load(esc_off_ptr + pid_n)
+        e_end = tl.load(esc_off_ptr + pid_n + 1)
+        ECH: tl.constexpr = 16
+        for e in range(e_beg, e_end, ECH):
+            idx = e + tl.arange(0, ECH)
+            emask = idx < e_end
+            nl = tl.load(esc_n_ptr + idx, mask=emask, other=-1)
+            kk = tl.load(esc_k_ptr + idx, mask=emask, other=0)
+            d = tl.load(esc_d_ptr + idx, mask=emask, other=0.0)
+            xe = tl.load(x_ptr + offs_m[:, None] * stride_xm + kk[None, :], mask=m_mask[:, None] & emask[None, :], other=0.0).to(tl.float32)
+            contrib = xe * d[None, :]                                           # [BM, ECH]
+            onehot = (nl[None, :] == rows[:, None]).to(tl.float32)              # [BN, ECH]
+            total += tl.sum(contrib[:, None, :] * onehot[None, :, :], axis=2)   # [BM, BN]
+        tl.store(out_ptrs, total.to(out_ptr.dtype.element_ty), mask=m_mask[:, None])
+        if SPLIT_K > 1:
+            tl.atomic_xchg(cnt_ptr + pid_m * n_tiles + pid_n, 0)
+
+
+@triton.jit
 def _sum_partials_kernel(part_ptr, out_ptr, numel, SPLIT_K: tl.constexpr, BLOCK: tl.constexpr):
     """out[i] = sum_s part[s, i] (fp32 partials of a batched split-K GEMM), cast to the output dtype."""
     offs = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
@@ -842,7 +962,10 @@ __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
     uint32_t d; asm("prmt.b32 %0, %1, %2, %3;" : "=r"(d) : "r"(a), "r"(b), "r"(sel)); return d;
 }
 __device__ __forceinline__ void decode4(uint32_t L, uint32_t n16, uint32_t lut0, uint32_t lut1, uint32_t& w01, uint32_t& w23) {
-    uint32_t H = prmt(lut0, lut1, n16 & 0x7777u) | ((n16 & 0x8888u) << 4);
+    // nibble i of n16 = (sign << 3) | (off >> 1) for element i; E = [b0, b0, b1, b1] puts nibble i in
+    // byte i (low nibble for even i, high for odd), so its sign bit is byte bit 3 (even) / 7 (odd)
+    const uint32_t E = prmt(n16, 0u, 0x1100u);
+    const uint32_t H = prmt(lut0, lut1, n16 & 0x7777u) | ((E & 0x00080008u) << 4) | (E & 0x80008000u);
     w01 = prmt(L, H, 0x5140u);
     w23 = prmt(L, H, 0x7362u);
 }
@@ -931,20 +1054,32 @@ __global__ void __launch_bounds__(WARPS * 32) gemv12_kernel(const __nv_bfloat16*
         if (!s_last) return;
         __threadfence();
     }
+    // escapes of this n-tile: staged in parallel (one entry per thread per pass), then row threads scan
+    __shared__ int s_en[WARPS * 32];
+    __shared__ float s_ev[WARPS * 32];
+    const int e0 = esc_off[pn], e1 = esc_off[pn + 1];
+    float v = 0.f;
     if (threadIdx.x < 32) {
-        const int r = threadIdx.x;
-        float v = 0.f;
         if (SK > 1) {
             #pragma unroll
-            for (int s2 = 0; s2 < SK; ++s2) v += __ldcg(part + (size_t)s2 * N + pn * 32 + r);
+            for (int s2 = 0; s2 < SK; ++s2) v += __ldcg(part + (size_t)s2 * N + pn * 32 + threadIdx.x);
         } else {
-            v = red[r];
+            v = red[threadIdx.x];
         }
-        const int e0 = esc_off[pn], e1 = esc_off[pn + 1];
-        for (int e = e0; e < e1; ++e)
-            if (esc_n[e] == r) v = fmaf(esc_d[e], __bfloat162float(X[esc_k[e]]), v);
-        out[pn * 32 + r] = __float2bfloat16(v);
-        if (SK > 1 && r == 0) cnt[pn] = 0;
+    }
+    for (int base = e0; base < e1; base += WARPS * 32) {
+        const int e = base + (int)threadIdx.x;
+        if (e < e1) { s_en[threadIdx.x] = esc_n[e]; s_ev[threadIdx.x] = esc_d[e] * __bfloat162float(X[esc_k[e]]); }
+        __syncthreads();
+        if (threadIdx.x < 32) {
+            const int cnt_ = min(e1 - base, WARPS * 32);
+            for (int j = 0; j < cnt_; ++j) v += (s_en[j] == (int)threadIdx.x) ? s_ev[j] : 0.f;
+        }
+        __syncthreads();
+    }
+    if (threadIdx.x < 32) {
+        out[pn * 32 + threadIdx.x] = __float2bfloat16(v);
+        if (SK > 1 && threadIdx.x == 0) cnt[pn] = 0;
     }
 }
 
@@ -1119,7 +1254,7 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda5", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda6", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
             functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
@@ -1241,6 +1376,10 @@ GEMV_SHAPES = {
 }
 # (layer, n, m) -> (warps, unroll, sk): the 12-bit packed GEMV (m = 1)
 G12_SHAPES = {}
+# (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
+T12_SHAPES = {}
+T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
+T12_INTERP = False   # CPU-interpreter mode (fp32 dot over widened bit patterns); never on the GPU
 # (layer, n, m) -> (bn, warps, unroll, sk): the tiled CTA-cooperative GEMV (m = 1) over the packed tiles
 TGEMV_SHAPES = {}
 # (layer, n, m) -> (mt, rows per warp / 8, unroll, ksplit): the CUDA mma.sync register-streaming GEMM (m <= 32)
@@ -1270,6 +1409,9 @@ def _config(layer: str, m: int, n: int, k: int):
     if (layer, n, m) in G12_SHAPES:
         warps, unroll, sk = G12_SHAPES[(layer, n, m)]
         return dict(g12=True, warps=warps, unroll=unroll, sk=sk)
+    if (layer, n, m) in T12_SHAPES:
+        sk, nw, ns = T12_SHAPES[(layer, n, m)]
+        return dict(t12=True, BLOCK_M=_block_m(m), BLOCK_N=32, BLOCK_K=256, SPLIT_K=sk, num_warps=nw, num_stages=ns)
     if (layer, n, m) in TGEMV_SHAPES:
         bn, warps, unroll, sk = TGEMV_SHAPES[(layer, n, m)]
         return dict(tgemv=True, bn=bn, warps=warps, unroll=unroll, sk=sk)
@@ -1369,6 +1511,11 @@ def _usable(cfg, m: int, n: int, k: int) -> bool:
         return tgemv_usable(m, n, k, cfg["bn"], cfg["warps"], cfg["unroll"], cfg["sk"])
     if cfg.get("g12"):
         return gemv12_usable(m, n, k, cfg["warps"], cfg["unroll"], cfg["sk"])
+    if cfg.get("t12"):
+        if m > cfg["BLOCK_M"] or n % 32 or k % 256 or (k // 256) % cfg["SPLIT_K"]:
+            return False
+        m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
+        return cfg["SPLIT_K"] == 1 or cfg["SPLIT_K"] * m_tiles * cfg["BLOCK_M"] * n <= PARTIALS_FLOATS
     if cfg.get("bmm"):
         return k % (cfg["SPLIT_K"] * 64) == 0
     if n % cfg["BLOCK_N"] or k % cfg["SPLIT_K"]:
@@ -1420,7 +1567,11 @@ def _proj_state(weights) -> dict:
     state["partials"] = torch.empty((PARTIALS_FLOATS,), dtype=torch.float32, device=device)
     if USE_PACK12:
         for name in ("qkv_gate", "o", "pooler", "unpooler"):
-            state[name + "_p12"] = _pack12(state[name])
+            pk = _pack12(state[name])
+            if pk is not None:
+                pk["lo32"] = pk["lo"].view(torch.int32)      # [tiles * 32, 64]
+                pk["nib16"] = pk["nib"].view(torch.int16)    # [tiles * 32, 64]
+            state[name + "_p12"] = pk
     return state
 
 
@@ -1465,6 +1616,18 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
         return out
     if cfg.get("mma"):
         build().skinny_mma(x, w, out, cfg["mt"], cfg["rpw"], cfg["unroll"], cfg["ksplit"])
+        return out
+    if cfg.get("t12"):
+        pk = state.get(layer + "_p12")
+        if pk is None:
+            return _launch(x, w, w2, out, state, _triton_config(layer, m, n, k), m, n, k, layer)
+        m_tiles = triton.cdiv(m, cfg["BLOCK_M"])
+        _tiled12_gemm_kernel[(n // 32, cfg["SPLIT_K"], m_tiles)](
+            x, pk["lo32"], pk["nib16"], out, state["partials"], state["counters"],
+            pk["esc_off"], pk["esc_n"], pk["esc_k"], pk["esc_delta"],
+            m, n, k, x.stride(0), out.stride(0), pk["eb"],
+            BLOCK_M=cfg["BLOCK_M"], SPLIT_K=cfg["SPLIT_K"], ASM=T12_ASM, INTERP=T12_INTERP,
+            num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
         return out
     if cfg.get("g12"):
         pk = state.get(layer + "_p12")
@@ -1644,6 +1807,20 @@ def _bench(state):
             for warps, unroll, sk in g12:
                 parts.append(row(f"p12 {warps}/{unroll}/{sk}", layer, 1, n, dict(g12=True, warps=warps, unroll=unroll, sk=sk)))
             print(f"  m=1 {layer:9s} n={n}: " + " | ".join(parts))
+    print("BENCH Triton 12-bit tiled GEMM (SPLIT_K, warps, stages) vs the table at m=8/16/32")
+    t12 = [(1, 4, 4), (1, 4, 6), (1, 2, 6), (1, 8, 4), (2, 4, 4), (1, 4, 3)]
+    t12_qkv = [(4, 4, 4), (4, 4, 3), (8, 4, 4), (2, 4, 6), (4, 2, 4), (4, 8, 4)]
+    for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192), ("unpooler", 1024)):
+        for m in (8, 16, 32):
+            if not budget():
+                break
+            if layer == "unpooler" and ((n == 1024) != (m <= 8)):
+                continue
+            parts = [row("table", layer, m, n, TAB)]
+            for sk, nw, ns in (t12_qkv if layer == "qkv_gate" else t12):
+                cfg = dict(t12=True, BLOCK_M=_block_m(m), BLOCK_N=32, BLOCK_K=256, SPLIT_K=sk, num_warps=nw, num_stages=ns)
+                parts.append(row(f"t12 {sk}/{nw}/{ns}", layer, m, n, cfg))
+            print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
     _OVERRIDE = None
     print(f"BENCH proj done in {time.time() - t0:.0f}s")
 
