@@ -1,0 +1,23 @@
+  EXP qkv_gate   (2304, 8192) nonzero exp 95..123 (29 distinct) zeros 4 denorm 0 nan 0 | escapes B=4 2559 B=5 4 | blk64 range max 122 frac<=15 0.9974
+  EXP o          (8192, 1024) nonzero exp 100..124 (25 distinct) zeros 1 denorm 0 nan 0 | escapes B=4 795 B=5 1 | blk64 range max 123 frac<=15 0.9969
+  EXP pooler     (4096, 8192) nonzero exp 96..122 (27 distinct) zeros 7 denorm 0 nan 0 | escapes B=4 2359 B=5 7 | blk64 range max 122 frac<=15 0.9971
+  EXP unpooler   (8192, 4096) nonzero exp 98..123 (26 distinct) zeros 6 denorm 0 nan 0 | escapes B=4 3272 B=5 6 | blk64 range max 122 frac<=15 0.9971
+  EXP router_hi  (256, 8192) nonzero exp 101..122 (22 distinct) zeros 1 denorm 0 nan 0 | escapes B=4 162 B=5 1 | blk64 range max 121 frac<=15 0.9969
+  EXP router_lo  (256, 8192) nonzero exp 88..114 (27 distinct) zeros 31 denorm 0 nan 0 | escapes B=4 2161 B=5 31 | blk64 range max 113 frac<=15 0.9793
+  cuda built 73s
+  graph replay fixed cost (tiny kernel): 4.6 us, subtracted below
+BENCH proj, judge protocol (us per replay minus fixed cost; '!' = rel err above tol)
+BENCH w12b (single launch: 16-row tile per CTA, W warps over K slices; nt/warps/nst) vs the table
+  m= 8 pooler    n=4096: table  18.3 | w12 old  16.7 | b 1/4/3  25.6 | b 1/8/2  23.6 | b 1/8/3  25.0 | b 1/16/2  29.3 | b 1/16/3  31.8
+  m=16 pooler    n=4096: table  17.5 | w12 old  19.0 | b 2/4/2  39.3 | b 2/8/2  38.0 | b 2/8/3  42.5 | b 2/16/2  44.8
+  m=32 pooler    n=4096: table  19.8 | w12 old  24.4 | b 4/4/2  70.0 | b 4/8/2  74.5
+  m=16 unpooler  n=8192: table  17.9 | w12 old  20.8 | b 2/4/2  37.5 | b 2/8/2  42.8 | b 2/8/3  50.0 | b 2/16/2  56.4
+  m=32 unpooler  n=8192: table  18.7 | w12 old  25.2 | b 4/4/2  86.8 | b 4/8/2  80.5
+  m= 8 qkv_gate  n=2304: table  11.3 | w12 old  12.1 | b 1/4/3  22.2 | b 1/8/2  21.4 | b 1/8/3  21.2 | b 1/16/2  25.2 | b 1/16/3  26.5
+  m=16 qkv_gate  n=2304: table  11.8 | w12 old  14.8 | b 2/4/2  37.2 | b 2/8/2  36.3 | b 2/8/3  38.3 | b 2/16/2  41.3
+  m=32 qkv_gate  n=2304: table  17.3 | w12 old  20.0 | b 4/4/2  68.4 | b 4/8/2  67.1
+  m= 8 o         n=8192: table   3.7 | w12 old   6.0 | b 1/4/3   8.4 | b 1/8/2  11.5 | b 1/8/3  12.2 | b 1/16/2 n/a | b 1/16/3 n/a
+  m=16 o         n=8192: table   3.4 | w12 old   6.8 | b 2/4/2  12.7 | b 2/8/2  16.3 | b 2/8/3  21.0 | b 2/16/2 n/a
+  m=32 o         n=8192: table   4.6 | w12 old   9.9 | b 4/4/2  36.1 | b 4/8/2  29.9
+  m= 8 unpooler  n=1024: table   4.7 | w12 old   5.3 | b 1/4/3   8.5 | b 1/8/2   7.7 | b 1/8/3   7.7 | b 1/16/2   8.0 | b 1/16/3   8.2
+BENCH proj done in 75s
