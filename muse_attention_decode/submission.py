@@ -495,14 +495,16 @@ namespace cg = cooperative_groups;
 // Sliding-window gated attention for one decode / verify step: a cluster of four CTAs per
 // (request, KV head), each owning 512 of the 2048 window slots with 8 warps x 64 keys.
 //   trip 1: every load that depends on nothing (the request's length, the scales, the query rows,
-//           the block's new key/value rows, the gate rows) is issued together;
+//           the block's new key/value rows; the gate rows are prefetched into L2);
 //   trip 2: each lane fetches the page indices of its rows (4 lanes per row), then every K and V
 //           row of the CTA goes out at once (cp.async, 16 B per lane, into a staging tile);
 //   the warps convert their own 64 K and V rows once to fp16 (swizzled 128-byte rows), run the
 //   softmax over their keys on mma.sync m16n8k16 with ldmatrix / ldmatrix.trans fragments, and
 //   merge their (m, l, acc) partials in shared memory (the staging tile, now free) together with
 //   the block's own new tokens; rank 0 combines the four CTAs over distributed shared memory and
-//   applies the gated RMSNorm. Every window key enters the softmax; nothing is skipped.
+//   applies the gated RMSNorm. The phases around the hot loop are __noinline__ functions and the
+//   row-tile loop is rolled, so the loop body stays small in the instruction cache.
+// Every window key enters the softmax; nothing is skipped.
 
 #define D 64
 #define G 8                     // query heads per KV head
@@ -522,6 +524,7 @@ __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, int sr
 }
 __device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
 __device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" :: "l"(p)); }
 __device__ __forceinline__ uint32_t cvt_e4m3x2_f16x2(uint32_t pair) {
     uint32_t r;
     asm("{ .reg .b16 h; mov.b16 h, %1; cvt.rn.f16x2.e4m3x2 %0, h; }" : "=r"(r) : "h"((unsigned short)pair));
@@ -572,14 +575,203 @@ struct SlidingSmem {
     static constexpr int K16 = STG + STG_BYTES;                    // KEYS x 128 B fp16
     static constexpr int V16 = K16 + KEYS * 128;                   // KEYS x 128 B fp16
     static constexpr int QS = V16 + KEYS * 128;                    // ROWS x QS_STRIDE fp16
-    static constexpr int WTS = QS + ROWS * QS_STRIDE * 2;          // 16 x NW floats
-    static constexpr int LROW = WTS + 16 * NW * 4;                 // 16 floats
-    static constexpr int MROW = LROW + 16 * 4;                     // 16 floats
-    static constexpr int SNEW = MROW + 16 * 4;                     // ROWS x L floats
+    static constexpr int SNEW = QS + ROWS * QS_STRIDE * 2;         // ROWS x L floats
     static constexpr int VNEW = SNEW + ROWS * L * 4;               // L x 64 floats (raw e4m3 values)
     static constexpr int KNEW = VNEW + L * D * 4;                  // L x 64 floats
     static constexpr int BYTES = KNEW + L * D * 4;
 };
+
+struct Geo {                                   // what every phase needs
+    const __nv_bfloat16* qkv; __nv_bfloat16* out;
+    int b, h, seq, HQ, HKV, QKV_W, rank, abl;
+    float qk_scale, k_scale, v_scale, sm_scale_log2, log2_theta;
+};
+
+// ---- prep: queries (RMSNorm x qk_scale x k_scale, RoPE) -> fp16 Qs; the block's new keys/values ----
+template <int L>
+__device__ __noinline__ void prep_phase(const Geo& geo, __half* Qs, float* knew, float* vnew, uint8_t* k_cache, uint8_t* v_cache,
+                                        const int64_t* cache_loc) {
+    using S = SlidingSmem<L>;
+    constexpr int R = S::R, ROWS = S::ROWS;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int ROW_W = geo.HKV * D;
+    const float inv_freq = exp2f(-(2.0f * lane / D) * geo.log2_theta);   // this lane's RoPE pair (dims 2*lane, 2*lane+1)
+    for (int r = warp; r < ROWS; r += NW) {
+        float x0 = 0.f, x1 = 0.f;
+        const int j = r / G, qh = geo.h * G + (r % G);
+        if (r < R && !(geo.abl & 16)) {
+            const __nv_bfloat16* qp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + qh * D + 2 * lane;
+            x0 = __bfloat162float(qp[0]);
+            x1 = __bfloat162float(qp[1]);
+        }
+        float ss = x0 * x0 + x1 * x1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float inv = rsqrtf(ss / D + 1e-5f) * geo.qk_scale * geo.k_scale;
+        x0 *= inv; x1 *= inv;
+        float sn, cs;
+        sincos_fast((float)(geo.seq + j) * inv_freq, sn, cs);
+        *reinterpret_cast<__half2*>(Qs + r * QS_STRIDE + 2 * lane) = __floats2half2_rn(x0 * cs - x1 * sn, x0 * sn + x1 * cs);
+    }
+    if (warp < L) {
+        const int j = warp;
+        float x0 = 0.f, x1 = 0.f, y0v = 0.f, y1v = 0.f;
+        if (!(geo.abl & 16)) {
+            const __nv_bfloat16* kp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + (geo.HQ + geo.h) * D + 2 * lane;
+            const __nv_bfloat16* vp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + (geo.HQ + geo.HKV + geo.h) * D + 2 * lane;
+            x0 = __bfloat162float(kp[0]); x1 = __bfloat162float(kp[1]);
+            y0v = __bfloat162float(vp[0]); y1v = __bfloat162float(vp[1]);
+        }
+        float ss = x0 * x0 + x1 * x1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float inv = rsqrtf(ss / D + 1e-5f);
+        x0 *= inv; x1 *= inv;
+        float sn, cs;
+        sincos_fast((float)(geo.seq + j) * inv_freq, sn, cs);
+        const float y0 = x0 * cs - x1 * sn, y1 = x0 * sn + x1 * cs;
+        __nv_fp8x2_e4m3 k8(make_float2(y0 / geo.k_scale, y1 / geo.k_scale));
+        __nv_fp8x2_e4m3 v8(make_float2(y0v / geo.v_scale, y1v / geo.v_scale));
+        const uint16_t kb = k8.__x, vb = v8.__x;
+        // the raw E4M3 values the cache will hold (what the reference attends to)
+        const float2 kk = f16x2_to_f2(cvt_e4m3x2_f16x2(kb)), vv = f16x2_to_f2(cvt_e4m3x2_f16x2(vb));
+        knew[j * D + 2 * lane] = kk.x; knew[j * D + 2 * lane + 1] = kk.y;
+        vnew[j * D + 2 * lane] = vv.x; vnew[j * D + 2 * lane + 1] = vv.y;
+        if (geo.rank == 0) {
+            const int64_t loc = cache_loc[geo.b * L + j];
+            *reinterpret_cast<uint16_t*>(k_cache + loc * ROW_W + geo.h * D + 2 * lane) = kb;
+            *reinterpret_cast<uint16_t*>(v_cache + loc * ROW_W + geo.h * D + 2 * lane) = vb;
+        }
+    }
+}
+
+// ---- scores of the block's own tokens: snew[r][jj] = q_r . knew[jj] (causal), log2 domain ----
+template <int L>
+__device__ __noinline__ void snew_phase(const Geo& geo, const __half* Qs, const float* knew, float* snew) {
+    using S = SlidingSmem<L>;
+    constexpr int R = S::R, ROWS = S::ROWS;
+    for (int idx = threadIdx.x; idx < ROWS * L; idx += NT) {
+        const int r = idx / L, jj = idx % L;
+        float sc = NEG;
+        if (r < R && jj <= r / G && !(geo.abl & 8)) {
+            float a = 0.f;
+            #pragma unroll 8
+            for (int d = 0; d < D; d++) a += __half2float(Qs[r * QS_STRIDE + d]) * knew[jj * D + d];
+            sc = a * geo.sm_scale_log2;
+        }
+        snew[idx] = sc;
+    }
+}
+
+// ---- the warp's 64 K and V rows -> fp16 tiles (each lane 2 rows) ----
+__device__ __noinline__ void convert_phase(uint32_t k8_base, uint32_t v8_base, uint32_t k16_base, uint32_t v16_base) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wrow0 = warp * 64;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int r = wrow0 + lane + i * 32;
+        #pragma unroll
+        for (int kv = 0; kv < 2; kv++) {
+            const uint32_t src = (kv == 0 ? k8_base : v8_base);
+            const uint32_t dst = (kv == 0 ? k16_base : v16_base);
+            #pragma unroll
+            for (int c8 = 0; c8 < 4; c8++) {         // 16 B of fp8 -> 32 B of fp16 (two 16 B chunks)
+                uint4 w;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(w.x), "=r"(w.y), "=r"(w.z), "=r"(w.w) : "r"(src + swz8(r, c8)));
+                uint4 o0, o1;
+                o0.x = cvt_e4m3x2_f16x2(w.x & 0xffffu); o0.y = cvt_e4m3x2_f16x2(w.x >> 16);
+                o0.z = cvt_e4m3x2_f16x2(w.y & 0xffffu); o0.w = cvt_e4m3x2_f16x2(w.y >> 16);
+                o1.x = cvt_e4m3x2_f16x2(w.z & 0xffffu); o1.y = cvt_e4m3x2_f16x2(w.z >> 16);
+                o1.z = cvt_e4m3x2_f16x2(w.w & 0xffffu); o1.w = cvt_e4m3x2_f16x2(w.w >> 16);
+                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8)), "r"(o0.x), "r"(o0.y), "r"(o0.z), "r"(o0.w));
+                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8 + 1)), "r"(o1.x), "r"(o1.y), "r"(o1.z), "r"(o1.w));
+            }
+        }
+    }
+}
+
+// ---- merge the warps' partials of one row tile (+ the block's own tokens on rank 0) -> fin[rt] ----
+template <int L>
+__device__ __noinline__ void merge_phase(const Geo& geo, int rt, const float* red, const float* snew, const float* vnew, float* F) {
+    const bool own_new = (geo.rank == 0);
+    const int tid = threadIdx.x;
+    #pragma unroll 1
+    for (int k = 0; k < (16 * D) / NT; k++) {
+        const int idx = tid + k * NT, r = idx / D, d = idx % D;
+        float M = NEG;
+        #pragma unroll
+        for (int ww = 0; ww < NW; ww++) M = fmaxf(M, red[ww * RED_W + r]);
+        if (own_new) for (int jj = 0; jj < L; jj++) M = fmaxf(M, snew[(rt * 16 + r) * L + jj]);
+        float O = 0.f, Ls = 0.f;
+        #pragma unroll
+        for (int ww = 0; ww < NW; ww++) {
+            const float w = exp2f(red[ww * RED_W + r] - M);
+            Ls += w * red[ww * RED_W + 16 + r];
+            O += w * red[ww * RED_W + 32 + r * RS + d];
+        }
+        if (own_new) {
+            for (int jj = 0; jj < L; jj++) {
+                const float w = exp2f(snew[(rt * 16 + r) * L + jj] - M);
+                Ls += w;
+                O += w * vnew[jj * D + d];
+            }
+        }
+        F[32 + r * RS + d] = O;
+        if (d == 0) { F[r] = M; F[16 + r] = Ls; }
+    }
+}
+
+// ---- rank 0: combine the four CTAs' partials over distributed shared memory ----
+template <int L>
+__device__ __noinline__ void combine_phase(float* fin, float* cw) {
+    using S = SlidingSmem<L>;
+    constexpr int NRT = S::NRT;
+    cg::cluster_group cluster = cg::this_cluster();
+    const float* P1 = cluster.map_shared_rank(fin, 1);
+    const float* P2 = cluster.map_shared_rank(fin, 2);
+    const float* P3 = cluster.map_shared_rank(fin, 3);
+    const int tid = threadIdx.x;
+    if (tid < NRT * 16) {
+        const int rt = tid / 16, r = tid % 16, off = rt * RED_W;
+        const float M0 = fin[off + r], M1 = P1[off + r], M2 = P2[off + r], M3 = P3[off + r];
+        const float L0 = fin[off + 16 + r], L1 = P1[off + 16 + r], L2 = P2[off + 16 + r], L3 = P3[off + 16 + r];
+        const float M = fmaxf(fmaxf(M0, M1), fmaxf(M2, M3));
+        const float w0 = exp2f(M0 - M), w1 = exp2f(M1 - M), w2 = exp2f(M2 - M), w3 = exp2f(M3 - M);
+        cw[tid * 4 + 0] = w0; cw[tid * 4 + 1] = w1; cw[tid * 4 + 2] = w2; cw[tid * 4 + 3] = w3;
+        fin[off + r] = M;
+        fin[off + 16 + r] = L0 * w0 + L1 * w1 + L2 * w2 + L3 * w3;
+    }
+    __syncthreads();
+    #pragma unroll 1
+    for (int k = 0; k < (NRT * 16 * D) / NT; k++) {
+        const int idx = tid + k * NT, rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D, d = rem % D;
+        const int off = rt * RED_W, e = off + 32 + r * RS + d, wi = (rt * 16 + r) * 4;
+        fin[e] = fin[e] * cw[wi] + P1[e] * cw[wi + 1] + P2[e] * cw[wi + 2] + P3[e] * cw[wi + 3];
+    }
+}
+
+// ---- epilogue: o = O / L x v_scale; per-head RMSNorm x sigmoid(gate) -> bf16 ----
+template <int L>
+__device__ __noinline__ void epilogue_phase(const Geo& geo, const float* fin) {
+    using S = SlidingSmem<L>;
+    constexpr int R = S::R;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = warp; r < R; r += NW) {
+        const float* F = fin + (r / 16) * RED_W;
+        const int rr = r % 16;
+        const float inv = geo.v_scale / F[16 + rr];
+        const float o0 = F[32 + rr * RS + lane] * inv, o1 = F[32 + rr * RS + lane + 32] * inv;
+        float ss = o0 * o0 + o1 * o1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float sc = rsqrtf(ss / D + 1e-5f);
+        const int j = r / G, qh = geo.h * G + (r % G);
+        const __nv_bfloat16* gp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + (geo.HQ + 2 * geo.HKV + qh) * D;
+        const float g0 = __bfloat162float(gp[lane]), g1 = __bfloat162float(gp[lane + 32]);
+        __nv_bfloat16* op = geo.out + ((int64_t)(geo.b * L + j)) * geo.HQ * D + qh * D;
+        op[lane] = __float2bfloat16(o0 * sc / (1.f + expf(-g0)));
+        op[lane + 32] = __float2bfloat16(o1 * sc / (1.f + expf(-g1)));
+    }
+}
 
 template <int L>
 __global__ void __launch_bounds__(NT, 1)
@@ -590,9 +782,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
                     __nv_bfloat16* __restrict__ out, int HQ, int HKV, int max_pages, int PS,
                     float qk_scale, float sm_scale_log2, float log2_theta, int abl) {
     using S = SlidingSmem<L>;
-    constexpr int R = S::R, NRT = S::NRT, ROWS = S::ROWS;
-    constexpr int QPW = ROWS / NW;               // query rows per warp (2 or 8)
-    constexpr int GPW = (R + NW - 1) / NW;       // live rows per warp in the epilogue (1 or 8)
+    constexpr int R = S::R, NRT = S::NRT;
     const int QKV_W = (2 * HQ + 2 * HKV) * D;
     const int ROW_W = HKV * D;                   // one cache row (all KV heads) in bytes
 
@@ -602,9 +792,6 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     float* red = reinterpret_cast<float*>(smem + S::RED);
     float* fin = reinterpret_cast<float*>(smem + S::FIN);
     __half* Qs = reinterpret_cast<__half*>(smem + S::QS);
-    float* wts = reinterpret_cast<float*>(smem + S::WTS);
-    float* Lrow = reinterpret_cast<float*>(smem + S::LROW);
-    float* Mrow = reinterpret_cast<float*>(smem + S::MROW);
     float* snew = reinterpret_cast<float*>(smem + S::SNEW);
     float* vnew = reinterpret_cast<float*>(smem + S::VNEW);
     float* knew = reinterpret_cast<float*>(smem + S::KNEW);
@@ -620,40 +807,12 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
     const int g = lane >> 2, c = lane & 3;
 
-    // ---- trip 1: every load that depends on nothing, issued together ----
+    // ---- trip 1: the request's length and the scales; warm the L2 with the gate rows ----
     if (tid == 0) s_seq = seq_lens[b];
     const float k_scale = *k_scale_p, v_scale = *v_scale_p;
-    float qx[QPW][2], gx[GPW][2];
-    #pragma unroll
-    for (int i = 0; i < QPW; i++) {
-        const int r = warp + i * NW;
-        qx[i][0] = qx[i][1] = 0.f;
-        if (r < R && !(abl & 16)) {
-            const int j = r / G, qh = h * G + (r % G);
-            const __nv_bfloat16* qp = qkv + ((int64_t)(b * L + j)) * QKV_W + qh * D + 2 * lane;
-            qx[i][0] = __bfloat162float(qp[0]);
-            qx[i][1] = __bfloat162float(qp[1]);
-        }
-    }
-    #pragma unroll
-    for (int i = 0; i < GPW; i++) {
-        const int r = warp + i * NW;
-        gx[i][0] = gx[i][1] = 0.f;
-        if (r < R && !(abl & 16)) {
-            const int j = r / G, qh = h * G + (r % G);
-            const __nv_bfloat16* gp = qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + 2 * HKV + qh) * D;
-            gx[i][0] = __bfloat162float(gp[lane]);
-            gx[i][1] = __bfloat162float(gp[lane + 32]);
-        }
-    }
-    float kx0 = 0.f, kx1 = 0.f, vx0 = 0.f, vx1 = 0.f;   // the new key/value row this warp prepares (warp < L)
-    int64_t loc = 0;
-    if (warp < L && !(abl & 16)) {
-        const __nv_bfloat16* kp = qkv + ((int64_t)(b * L + warp)) * QKV_W + (HQ + h) * D + 2 * lane;
-        const __nv_bfloat16* vp = qkv + ((int64_t)(b * L + warp)) * QKV_W + (HQ + HKV + h) * D + 2 * lane;
-        kx0 = __bfloat162float(kp[0]); kx1 = __bfloat162float(kp[1]);
-        vx0 = __bfloat162float(vp[0]); vx1 = __bfloat162float(vp[1]);
-        loc = cache_loc[b * L + warp];
+    for (int r = tid; r < R; r += NT) {
+        const int j = r / G, qh = h * G + (r % G);
+        prefetch_l2(qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + 2 * HKV + qh) * D);
     }
     __syncthreads();
     const int seq = s_seq;
@@ -661,6 +820,10 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     const int n = seq - lo;                      // window keys (<= 2047): slots 0..n-1 <-> positions lo..seq-1
     const int slot0 = rank * KEYS;               // this CTA's first slot
     const int wrow0 = warp * 64;                 // this warp's first row (slot within the CTA)
+    Geo geo;
+    geo.qkv = qkv; geo.out = out; geo.b = b; geo.h = h; geo.seq = seq; geo.HQ = HQ; geo.HKV = HKV; geo.QKV_W = QKV_W;
+    geo.rank = rank; geo.abl = abl; geo.qk_scale = qk_scale; geo.k_scale = k_scale; geo.v_scale = v_scale;
+    geo.sm_scale_log2 = sm_scale_log2; geo.log2_theta = log2_theta;
 
     // ---- trip 2: page indices of this warp's 64 rows (4 lanes per row), then every K and V row ----
     const int ch = lane & 3;
@@ -683,90 +846,20 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     }
     cp_async_commit();
 
-    // ---- meanwhile: queries (RMSNorm x qk_scale x k_scale, RoPE) -> fp16 Qs; new keys/values ----
-    const float inv_freq = exp2f(-(2.0f * lane / D) * log2_theta);   // this lane's RoPE pair (dims 2*lane, 2*lane+1)
-    if (!(abl & 8)) {
-        #pragma unroll
-        for (int i = 0; i < QPW; i++) {
-            const int r = warp + i * NW;
-            float x0 = qx[i][0], x1 = qx[i][1];
-            float ss = x0 * x0 + x1 * x1;
-            #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-            const float inv = rsqrtf(ss / D + 1e-5f) * qk_scale * k_scale;
-            x0 *= inv; x1 *= inv;
-            float sn, cs;
-            sincos_fast((float)(seq + r / G) * inv_freq, sn, cs);
-            *reinterpret_cast<__half2*>(Qs + r * QS_STRIDE + 2 * lane) = __floats2half2_rn(x0 * cs - x1 * sn, x0 * sn + x1 * cs);
-        }
-        if (warp < L) {
-            const int j = warp;
-            float x0 = kx0, x1 = kx1;
-            float ss = x0 * x0 + x1 * x1;
-            #pragma unroll
-            for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-            const float inv = rsqrtf(ss / D + 1e-5f);
-            x0 *= inv; x1 *= inv;
-            float sn, cs;
-            sincos_fast((float)(seq + j) * inv_freq, sn, cs);
-            const float y0 = x0 * cs - x1 * sn, y1 = x0 * sn + x1 * cs;
-            __nv_fp8x2_e4m3 k8(make_float2(y0 / k_scale, y1 / k_scale));
-            __nv_fp8x2_e4m3 v8(make_float2(vx0 / v_scale, vx1 / v_scale));
-            const uint16_t kb = k8.__x, vb = v8.__x;
-            // the raw E4M3 values the cache will hold (what the reference attends to)
-            const float2 kk = f16x2_to_f2(cvt_e4m3x2_f16x2(kb)), vv = f16x2_to_f2(cvt_e4m3x2_f16x2(vb));
-            knew[j * D + 2 * lane] = kk.x; knew[j * D + 2 * lane + 1] = kk.y;
-            vnew[j * D + 2 * lane] = vv.x; vnew[j * D + 2 * lane + 1] = vv.y;
-            if (rank == 0) {
-                *reinterpret_cast<uint16_t*>(k_cache + loc * ROW_W + h * D + 2 * lane) = kb;
-                *reinterpret_cast<uint16_t*>(v_cache + loc * ROW_W + h * D + 2 * lane) = vb;
-            }
-        }
-    }
+    // ---- meanwhile: the queries and the block's new keys/values ----
+    if (!(abl & 8)) prep_phase<L>(geo, Qs, knew, vnew, k_cache, v_cache, cache_loc);
     __syncthreads();
-    // scores of the block's own tokens: snew[r][jj] = q_r . knew[jj] (causal: jj <= token(r)), log2 domain
-    for (int idx = tid; idx < ROWS * L; idx += NT) {
-        const int r = idx / L, jj = idx % L;
-        float sc = NEG;
-        if (r < R && jj <= r / G && !(abl & 8)) {
-            float a = 0.f;
-            #pragma unroll 8
-            for (int d = 0; d < D; d++) a += __half2float(Qs[r * QS_STRIDE + d]) * knew[jj * D + d];
-            sc = a * sm_scale_log2;
-        }
-        snew[idx] = sc;
-    }
+    snew_phase<L>(geo, Qs, knew, snew);
 
-    // ---- K and V rows -> fp16 tiles (each warp its own 64 rows, each lane 2 rows) ----
+    // ---- K and V rows -> fp16 tiles ----
     if (!(abl & 1)) cp_async_wait_all();
     __syncthreads();                             // every lane's copies have landed
-    if (!(abl & 2)) {
-        #pragma unroll
-        for (int i = 0; i < 2; i++) {
-            const int r = wrow0 + lane + i * 32;
-            #pragma unroll
-            for (int kv = 0; kv < 2; kv++) {
-                const uint32_t src = (kv == 0 ? k8_base : v8_base);
-                const uint32_t dst = (kv == 0 ? k16_base : v16_base);
-                #pragma unroll
-                for (int c8 = 0; c8 < 4; c8++) {         // 16 B of fp8 -> 32 B of fp16 (two 16 B chunks)
-                    uint4 w;
-                    asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(w.x), "=r"(w.y), "=r"(w.z), "=r"(w.w) : "r"(src + swz8(r, c8)));
-                    uint4 o0, o1;
-                    o0.x = cvt_e4m3x2_f16x2(w.x & 0xffffu); o0.y = cvt_e4m3x2_f16x2(w.x >> 16);
-                    o0.z = cvt_e4m3x2_f16x2(w.y & 0xffffu); o0.w = cvt_e4m3x2_f16x2(w.y >> 16);
-                    o1.x = cvt_e4m3x2_f16x2(w.z & 0xffffu); o1.y = cvt_e4m3x2_f16x2(w.z >> 16);
-                    o1.z = cvt_e4m3x2_f16x2(w.w & 0xffffu); o1.w = cvt_e4m3x2_f16x2(w.w >> 16);
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8)), "r"(o0.x), "r"(o0.y), "r"(o0.z), "r"(o0.w));
-                    asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8 + 1)), "r"(o1.x), "r"(o1.y), "r"(o1.z), "r"(o1.w));
-                }
-            }
-        }
-    }
+    if (!(abl & 2)) convert_phase(k8_base, v8_base, k16_base, v16_base);
     __syncthreads();                             // fp16 tiles complete; the staging tile is free for the merge buffers
 
-    // ---- the window: each warp its 64 keys, per 16-row tile ----
+    // ---- the window: each warp its 64 keys, per 16-row tile (rolled: one body in the instruction cache) ----
     const int wslot0 = slot0 + wrow0;            // global slot of this warp's first key
+    #pragma unroll 1
     for (int rt = 0; rt < ((abl & 32) ? 0 : NRT); rt++) {
         float m_run[2] = {NEG, NEG}, l_run[2] = {0.f, 0.f};
         float acc[8][4];
@@ -789,8 +882,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
                 }
                 #pragma unroll
                 for (int p2 = 0; p2 < 4; p2++) {          // 2 n-tiles (16 keys) per ldmatrix.x4
-                    // matrices: (n-tile 2p2 | 2p2+1) x (k half 0 | 1): lane -> matrix m = lane>>3
-                    const int m = lane >> 3;
+                    const int m = lane >> 3;             // matrices: (n-tile 2p2 | 2p2+1) x (k half 0 | 1)
                     const int key = wrow0 + p2 * 16 + (m >> 1) * 8 + (lane & 7);
                     uint32_t b00, b01, b10, b11;
                     ldmatrix_x4(k16_base + swz16(key, ks * 2 + (m & 1)), b00, b01, b10, b11);
@@ -832,8 +924,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             for (int ks = 0; ks < 4; ks++) {
                 #pragma unroll
                 for (int p2 = 0; p2 < 4; p2++) {          // 2 n-tiles (16 dims) per ldmatrix.x4.trans
-                    // matrices: (keys lo | hi) x (n-tile 2p2 | 2p2+1): lane -> matrix m = lane>>3
-                    const int m = lane >> 3;
+                    const int m = lane >> 3;             // matrices: (keys lo | hi) x (n-tile 2p2 | 2p2+1)
                     const int key = wrow0 + ks * 16 + (m & 1) * 8 + (lane & 7);
                     uint32_t b00, b01, b10, b11;
                     ldmatrix_x4_trans(v16_base + swz16(key, p2 * 2 + (m >> 1)), b00, b01, b10, b11);
@@ -858,35 +949,7 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
             my[32 + (g + 8) * RS + d0 + 1] = acc[nt][3];
         }
         __syncthreads();
-        // ---- merge the warps (+ the block's own tokens, on rank 0): one pass, one barrier ----
-        const bool own_new = (rank == 0);
-        float* F = fin + rt * RED_W;
-        if (!(abl & 4)) {
-            #pragma unroll
-            for (int k = 0; k < (16 * D) / NT; k++) {
-                const int idx = tid + k * NT, r = idx / D, d = idx % D;
-                float M = NEG;
-                #pragma unroll
-                for (int ww = 0; ww < NW; ww++) M = fmaxf(M, red[ww * RED_W + r]);
-                if (own_new) for (int jj = 0; jj < L; jj++) M = fmaxf(M, snew[(rt * 16 + r) * L + jj]);
-                float O = 0.f, Ls = 0.f;
-                #pragma unroll
-                for (int ww = 0; ww < NW; ww++) {
-                    const float w = exp2f(red[ww * RED_W + r] - M);
-                    Ls += w * red[ww * RED_W + 16 + r];
-                    O += w * red[ww * RED_W + 32 + r * RS + d];
-                }
-                if (own_new) {
-                    for (int jj = 0; jj < L; jj++) {
-                        const float w = exp2f(snew[(rt * 16 + r) * L + jj] - M);
-                        Ls += w;
-                        O += w * vnew[jj * D + d];
-                    }
-                }
-                F[32 + r * RS + d] = O;
-                if (d == 0) { F[r] = M; F[16 + r] = Ls; }
-            }
-        }
+        if (!(abl & 4)) merge_phase<L>(geo, rt, red, snew, vnew, fin + rt * RED_W);
         __syncthreads();
     }
 
@@ -894,53 +957,12 @@ sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __rest
     if (!(abl & 128)) {
         cluster.sync();
         if (rank != 0) { cluster.sync(); return; }
-    } else if (rank != 0) return;
-    if (!(abl & 4) && !(abl & 128)) {
-        const float* P1 = cluster.map_shared_rank(fin, 1);
-        const float* P2 = cluster.map_shared_rank(fin, 2);
-        const float* P3 = cluster.map_shared_rank(fin, 3);
-        float* cw = red;                         // NRT x 16 x 4 weights, then the combined M, L (red is free now)
-        if (tid < NRT * 16) {
-            const int rt = tid / 16, r = tid % 16, off = rt * RED_W;
-            const float M0 = fin[off + r], M1 = P1[off + r], M2 = P2[off + r], M3 = P3[off + r];
-            const float L0 = fin[off + 16 + r], L1 = P1[off + 16 + r], L2 = P2[off + 16 + r], L3 = P3[off + 16 + r];
-            const float M = fmaxf(fmaxf(M0, M1), fmaxf(M2, M3));
-            const float w0 = exp2f(M0 - M), w1 = exp2f(M1 - M), w2 = exp2f(M2 - M), w3 = exp2f(M3 - M);
-            cw[tid * 4 + 0] = w0; cw[tid * 4 + 1] = w1; cw[tid * 4 + 2] = w2; cw[tid * 4 + 3] = w3;
-            fin[off + r] = M;
-            fin[off + 16 + r] = L0 * w0 + L1 * w1 + L2 * w2 + L3 * w3;
-        }
-        __syncthreads();
-        #pragma unroll
-        for (int k = 0; k < (NRT * 16 * D) / NT; k++) {
-            const int idx = tid + k * NT, rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D, d = rem % D;
-            const int off = rt * RED_W, e = off + 32 + r * RS + d, wi = (rt * 16 + r) * 4;
-            fin[e] = fin[e] * cw[wi] + P1[e] * cw[wi + 1] + P2[e] * cw[wi + 2] + P3[e] * cw[wi + 3];
-        }
+        if (!(abl & 4)) combine_phase<L>(fin, red);   // red is free now: the weights go there
         cluster.sync();
-    } else if (!(abl & 128)) {
-        cluster.sync();
+    } else if (rank != 0) {
+        return;
     }
-    if (abl & 64) return;
-
-    // ---- epilogue: o = O / L x v_scale; per-head RMSNorm x sigmoid(gate) -> bf16 ----
-    #pragma unroll
-    for (int i = 0; i < GPW; i++) {
-        const int r = warp + i * NW;
-        if (r >= R) break;
-        const float* F = fin + (r / 16) * RED_W;
-        const int rr = r % 16;
-        const float inv = v_scale / F[16 + rr];
-        const float o0 = F[32 + rr * RS + lane] * inv, o1 = F[32 + rr * RS + lane + 32] * inv;
-        float ss = o0 * o0 + o1 * o1;
-        #pragma unroll
-        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
-        const float sc = rsqrtf(ss / D + 1e-5f);
-        const int j = r / G, qh = h * G + (r % G);
-        __nv_bfloat16* op = out + ((int64_t)(b * L + j)) * HQ * D + qh * D;
-        op[lane] = __float2bfloat16(o0 * sc / (1.f + expf(-gx[i][0])));
-        op[lane + 32] = __float2bfloat16(o1 * sc / (1.f + expf(-gx[i][1])));
-    }
+    if (!(abl & 64)) epilogue_phase<L>(geo, fin);
 }
 
 template <int L>
