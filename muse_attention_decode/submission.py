@@ -30,6 +30,11 @@ the log2 domain with one FMA per logit and exp2 in fp16 pairs (half the MUFU wor
 sum is a packed fp16 add. The merge is two-level above 16 splits (groups of G1), on
 normalized partials. Plan per shape (_plan) from the judge's CUDA-graph timings: check
 7e9fc08da010431f, 1.548x over SGLang.
+
+The CUDA SLIDING section is a dedicated sliding-window kernel (one cluster of four CTAs per
+request x KV head, all K/V rows issued at once, mma.sync + ldmatrix, in-CTA and DSMEM merges).
+It passes the tests but measured slower than the Triton plan on every scored sliding shape, so
+SLIDING_CUDA leaves it off.
 """
 
 import math
@@ -988,7 +993,9 @@ void sliding_attn(torch::Tensor qkv, torch::Tensor cache_loc, torch::Tensor seq_
                   double qk_scale, double sm_scale_log2, double log2_theta, int64_t abl);
 """
 
-SLIDING_CUDA = True     # sliding-window layers: the dedicated CUDA kernel (False: the Triton kernel)
+SLIDING_CUDA = False    # sliding-window layers: the dedicated CUDA kernel below (correct; measured slower than the
+                        # Triton plan on every scored sliding shape: B1 decode 15.2 vs 15.5 us, B1 verify 43 vs 23,
+                        # B16/B32 wave-bound with 212 KB smem per CTA; kept as a documented experiment, off)
 _SLIDING_EXT = None
 _SLIDING_FAILED = False
 
@@ -1084,7 +1091,7 @@ def _plan(cfg):
 
 
 _PLAN_OVERRIDE = None   # dict of plan keys to force, during benchmarking
-ATTN_BENCH = True       # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
+ATTN_BENCH = False      # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
 _BENCH_DONE = False
 
 

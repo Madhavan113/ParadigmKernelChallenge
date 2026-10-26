@@ -510,7 +510,9 @@ void sliding_attn(torch::Tensor qkv, torch::Tensor cache_loc, torch::Tensor seq_
                   double qk_scale, double sm_scale_log2, double log2_theta, int64_t abl);
 """
 
-SLIDING_CUDA = True     # sliding-window layers: the dedicated CUDA kernel (False: the Triton kernel)
+SLIDING_CUDA = False    # sliding-window layers: the dedicated CUDA kernel below (correct; measured slower than the
+                        # Triton plan on every scored sliding shape: B1 decode 15.2 vs 15.5 us, B1 verify 43 vs 23,
+                        # B16/B32 wave-bound with 212 KB smem per CTA; kept as a documented experiment, off)
 _SLIDING_EXT = None
 _SLIDING_FAILED = False
 
