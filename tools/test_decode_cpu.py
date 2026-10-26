@@ -17,6 +17,7 @@ S.FP8_ASM = False
 S.DEQUANT_ASM = False
 S.ROW_SPLIT = False
 S.MOE_BACKEND = "triton"
+S.GEMV_SHAPES = {}; S.MMA_SHAPES = {}; S.BMM_SHAPES = {}   # CUDA-only proj paths
 S.MOE_OUT_DTYPE = torch.float16
 S.MAX_M = 64
 fast = len(sys.argv) > 1 and sys.argv[1] == "fast"
