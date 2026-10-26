@@ -853,13 +853,13 @@ _CUDA_OVERRIDE = None
 
 
 def _cuda_variant(M: int):
-    """(rows per block / 16, n8 blocks per warp, K-split warp groups, K-split CTAs)."""
+    """(rows per block / 16, n8 blocks per warp, K-split warp groups, K-split CTAs). On-device
+    sweeps (runs 30863d92, cc8d876d): (1,2,1) is best up to 64 tokens, 32-row blocks above; the
+    warp-group and inter-CTA K splits both cost more than they save."""
     if _CUDA_OVERRIDE is not None:
         return _CUDA_OVERRIDE
-    if M <= 32:
-        return 1, 2, 1, 4      # few blocks: split K over 4 CTAs (fp32 atomics), 8 chunks each
     if M <= 64:
-        return 1, 2, 1, 2
+        return 1, 2, 1, 1
     return 2, 2, 1, 1
 
 
@@ -1145,7 +1145,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 

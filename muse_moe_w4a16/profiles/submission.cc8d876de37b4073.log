@@ -1,0 +1,12 @@
+cuda backend ready in 0s
+BENCH cuda variants (graph replays, us): (rows/16, n8 per warp, K-split groups, K-split CTAs)
+  marlin        : bs1   104.2  bs8   265.9  bs16   366.3  bs32   465.2  bs128   675.6  bs256  1030.2
+  None          : bs1   157.8  bs8   394.5  bs16   482.7  bs32   568.9  bs128   783.6  bs256  1298.0
+  (1, 2, 1, 1)  : bs1   139.3  bs8   370.6  bs16   458.0  bs32   540.8  bs128  1046.3  bs256  1827.4
+  (1, 2, 1, 2)  : bs1   165.2  bs8   395.3  bs16   483.0  bs32   558.3  bs128  1117.4  bs256  1989.9
+  (1, 2, 1, 4)  : bs1   157.9  bs8   394.8  bs16   484.2  bs32   568.7  bs128  1166.7  bs256  2095.6
+  (1, 2, 1, 8)  : bs1   166.0  bs8   399.3  bs16   493.1  bs32   590.4  bs128  1285.6  bs256  2342.9
+  (1, 1, 1, 4)  : bs1   190.4  bs8   472.8  bs16   578.7  bs32   682.1  bs128  1391.4  bs256  2488.9
+  (2, 2, 1, 1)  : bs1   168.4  bs8   437.0  bs16   541.7  bs32   577.6  bs128   784.2  bs256  1298.2
+  (2, 2, 1, 2)  : bs1   188.5  bs8   479.0  bs16   583.8  bs32   622.1  bs128   856.6  bs256  1465.6
+BENCH cuda done in 10s
