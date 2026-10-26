@@ -14,9 +14,9 @@ sig = {"qkv_ptr": "*bf16", "loc_ptr": "*i64", "seq_ptr": "*i32", "pt_ptr": "*i32
        "kscale_ptr": "*fp32", "vscale_ptr": "*fp32", "out_ptr": "*bf16", "part_ptr": "*fp16", "ml_ptr": "*fp32", "cnt_ptr": "*i32",
        "max_pages": "i32", "qk_scale": "fp32", "sm_scale_log2": "fp32", "log2_theta": "fp32",
        "L": "constexpr", "HQ": "constexpr", "HKV": "constexpr", "D": "constexpr", "PS": "constexpr", "WINDOW": "constexpr",
-       "ROPE": "constexpr", "SPLITS": "constexpr", "RB": "constexpr", "LB": "constexpr", "BLOCK_T": "constexpr", "ACT": "constexpr", "FP8_ASM": "constexpr", "CH": "constexpr", "QK_FP8": "constexpr", "HP": "constexpr", "BD": "constexpr", "EX2H": "constexpr", "PV8": "constexpr", "G1": "constexpr"}
+       "ROPE": "constexpr", "SPLITS": "constexpr", "RB": "constexpr", "LB": "constexpr", "BLOCK_T": "constexpr", "ACT": "constexpr", "FP8_ASM": "constexpr", "CH": "constexpr", "QK_FP8": "constexpr", "HP": "constexpr", "BD": "constexpr", "EX2H": "constexpr", "PV8": "constexpr", "G1": "constexpr", "PF": "constexpr"}
 consts = {"L": L, "HQ": HQ, "HKV": HKV, "D": D, "PS": PS, "WINDOW": WINDOW, "ROPE": WINDOW > 0, "SPLITS": SPLITS,
-          "RB": RB, "LB": 32 if PV8 else 16, "BLOCK_T": BLOCK_T, "ACT": tl.float16, "FP8_ASM": bool(ASM), "CH": min(SPLITS, 8 if RB <= 16 else 4), "QK_FP8": (RB > 16) if QK8 < 0 else bool(QK8), "HP": HP, "BD": bool(BD), "EX2H": bool(EX2H), "PV8": bool(PV8), "G1": {1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 8, 64: 8, 128: 16}[SPLITS]}
+          "RB": RB, "LB": 32 if PV8 else 16, "BLOCK_T": BLOCK_T, "ACT": tl.float16, "FP8_ASM": bool(ASM), "CH": min(SPLITS, 8 if RB <= 16 else 4), "QK_FP8": (RB > 16) if QK8 < 0 else bool(QK8), "HP": HP, "BD": bool(BD), "EX2H": bool(EX2H), "PV8": bool(PV8), "G1": {1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 8, 64: 8, 128: 16, 256: 16}[SPLITS], "PF": bool(ASM)}
 names = list(sig)
 attrs = {(i,): [["tt.divisibility", 16]] for i, n in enumerate(names) if sig[n].startswith("*")}
 src = ASTSource(fn=S._attn_decode_kernel, signature=sig, constexprs=consts, attrs=attrs)

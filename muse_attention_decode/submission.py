@@ -98,6 +98,14 @@ def _ex2_f16(x):
 
 
 @triton.jit
+def _prefetch_l2(ptrs):
+    """Warm the L2 with the lines at ptrs (a hint: no data, no fault), so a later dependent load
+    or atomic on them does not pay a cold DRAM round trip."""
+    tl.inline_asm_elementwise(asm="prefetch.global.L2 [$1]; mov.b32 $0, 0;", constraints="=r,l",
+                              args=[ptrs.to(tl.int64, bitcast=True)], dtype=tl.int32, is_pure=False, pack=1)
+
+
+@triton.jit
 def _rms_rope(xe, xo, pos, inv_freq, scale, ROPE: tl.constexpr, D: tl.constexpr):
     """Per-row RMSNorm of a 64-wide head row split into even/odd halves [R, DW/2] (a row's
     other-head columns, if any, are zero), scaled, then interleaved RoPE (pairs (2i, 2i+1)
@@ -238,7 +246,7 @@ def _attn_decode_kernel(
     PS: tl.constexpr, WINDOW: tl.constexpr, ROPE: tl.constexpr, SPLITS: tl.constexpr,
     RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr, ACT: tl.constexpr, FP8_ASM: tl.constexpr,
     CH: tl.constexpr, QK_FP8: tl.constexpr, HP: tl.constexpr, BD: tl.constexpr, EX2H: tl.constexpr, PV8: tl.constexpr,
-    G1: tl.constexpr,
+    G1: tl.constexpr, PF: tl.constexpr,
 ):
     GROUP: tl.constexpr = HQ // HKV
     HPS: tl.constexpr = HP if BD else 1        # heads sharing one row set
@@ -268,6 +276,15 @@ def _attn_decode_kernel(
     c = tl.arange(0, DW)
     dh = tl.arange(0, DW // 2)   # pair index: dims 2i (even) and 2i+1 (odd) of head dh // 32
     inv_freq = tl.exp2(-(2.0 * (dh % (D // 2)).to(tl.float32) / D) * log2_theta)
+
+    if PF:
+        # warm the lines the merge chain ends on: this CTA's ticket and the gate rows
+        qh_c = tl.minimum((h0 + hh) * GROUP + g, HQ - 1)
+        _prefetch_l2(qkv_ptr + tok * QKV_W + (HQ + 2 * HKV + qh_c) * D)
+        if NSET == 2:
+            _prefetch_l2(qkv_ptr + tok * QKV_W + (HQ + 2 * HKV + tl.minimum(qh_c + GROUP, HQ - 1)) * D)
+        if SPLITS > 1:
+            _prefetch_l2(cnt_ptr + bp * (G2 + 1) + s // G1 + rows * 0)
 
     # ---- queries ----
     q0 = _prep_q(qkv_ptr, kc_ptr, tok, g, hh, rmask, h0, seq + j, inv_freq, qk_scale, k_scale,
@@ -465,8 +482,8 @@ def _pow2(n: int) -> int:
 
 
 def _plan(cfg):
-    """Kernel configuration from the shape only: dict(splits, block_t, hp, bd, warps, stages, ex2h, pv8[, g1, qk8]).
-    Measured on the H200 (checks 2b260c60, ef648771: CUDA-graph replays after an L2 flush)."""
+    """Kernel configuration from the shape only: dict(splits, block_t, hp, bd, warps, stages, ex2h, pv8[, g1, qk8, pf]).
+    Measured on the H200 (checks ef648771, 1994f6b7: CUDA-graph replays after an L2 flush)."""
     b, hkv, L = cfg["batch"], cfg["num_kv_heads"], cfg["q_len"]
     rows = L * (cfg["num_q_heads"] // hkv)   # query rows per KV head
     sliding = cfg["window"] > 0
@@ -477,15 +494,15 @@ def _plan(cfg):
             # tiny batches: many CTAs, one head each
             return dict(base, splits=_pow2(min(128, 1024 // ctas)))
         # full-context decode: both heads per CTA over whole 128-byte cache rows, 64-key tiles
-        return dict(base, splits=_pow2(min(16, 2048 // ctas)), block_t=64, hp=2, bd=True)
+        return dict(base, splits=_pow2(min(16, 512 // ctas)), block_t=64, hp=2, bd=True)
     if rows <= 16:
-        return dict(base, splits=_pow2(min(16 if ctas <= 2 else 8, 512 // ctas)))   # sliding decode
+        return dict(base, splits=_pow2(min(16 if ctas <= 2 else 8, 256 // ctas)))   # sliding decode
     if sliding:
-        # sliding verify: 1 (tiny batch) to 16 tiles per CTA; 8 warps when the SMs would idle
-        return dict(base, splits=_pow2(min(16, 128 // ctas)), warps=8 if ctas <= 8 else 4)
+        # sliding verify: 1 (tiny batch) to 4 tiles per CTA, 8 warps (shorter per-tile latency)
+        return dict(base, splits=_pow2(min(16, 128 // ctas)), warps=8)
     if ctas <= 4:
         return dict(base, splits=_pow2(min(128, 1024 // ctas)))
-    return dict(base, splits=_pow2(min(8, 512 // ctas)))
+    return dict(base, splits=_pow2(min(8, 256 // ctas)))
 
 
 _PLAN_OVERRIDE = None   # dict of plan keys to force, during benchmarking
@@ -548,24 +565,24 @@ def _attn_bench(data):
              "B16 L8 sliding": (16, 8, W), "B16 L8 full": (16, 8, 0), "B32 L8 sliding": (32, 8, W), "B32 L8 full": (32, 8, 0)}
     bd = dict(hp=2, bd=True, stages=5, block_t=64)                   # both heads per CTA, whole 128B rows
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128)      # one head per CTA
+    w8 = dict(nw, warps=8)
     plans = {
-        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, block_t=256), dict(nw, splits=8, block_t=256), dict(nw, splits=16, warps=8)],
-        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=256), dict(nw, splits=128, stages=7), dict(nw, splits=64, block_t=256),
-                       dict(nw, splits=128, qk8=True)],
-        "B16 L1 sliding": [dict(nw, splits=8), dict(nw, splits=4), dict(nw, splits=8, block_t=256), dict(nw, splits=4, block_t=256)],
-        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=8), dict(bd, splits=16, qk8=True), dict(bd, splits=8, qk8=True),
-                        dict(bd, splits=16, block_t=128), dict(nw, splits=16, qk8=True)],
-        "B32 L1 sliding": [dict(nw, splits=8), dict(nw, splits=4), dict(nw, splits=4, block_t=256)],
-        "B32 L1 full": [dict(bd, splits=16), dict(bd, splits=8), dict(bd, splits=16, qk8=True), dict(bd, splits=8, qk8=True)],
-        "B1 L8 sliding": [dict(nw, splits=16, warps=8), dict(nw, splits=8, warps=8, block_t=256), dict(nw, splits=16, warps=8, stages=3),
-                          dict(nw, splits=32, warps=8)],
-        "B1 L8 full": [dict(nw, splits=128), dict(nw, splits=256), dict(nw, splits=128, block_t=256), dict(nw, splits=64, block_t=256),
-                       dict(nw, splits=128, warps=8, g1=16)],
-        "B16 L8 sliding": [dict(nw, splits=4), dict(nw, splits=2), dict(nw, splits=4, block_t=256), dict(nw, splits=2, block_t=256),
-                           dict(nw, splits=4, warps=8)],
-        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=4), dict(nw, splits=8, block_t=256), dict(nw, splits=4, block_t=256)],
-        "B32 L8 sliding": [dict(nw, splits=2), dict(nw, splits=1), dict(nw, splits=2, block_t=256), dict(nw, splits=1, block_t=256)],
-        "B32 L8 full": [dict(nw, splits=8), dict(nw, splits=4), dict(nw, splits=8, block_t=256)],
+        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, pf=False), dict(nw, splits=16, block_t=64), dict(nw, splits=32, block_t=64)],
+        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=256), dict(nw, splits=128, pf=False), dict(nw, splits=128, g1=8)],
+        "B16 L1 sliding": [dict(nw, splits=8), dict(nw, splits=8, pf=False), dict(nw, splits=16, block_t=64), dict(nw, splits=8, block_t=64)],
+        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16, pf=False)],
+        "B32 L1 sliding": [dict(nw, splits=4), dict(nw, splits=4, pf=False), dict(nw, splits=8, block_t=64), dict(nw, splits=2)],
+        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=4)],
+        "B1 L8 sliding": [dict(w8, splits=16), dict(w8, splits=16, pf=False), dict(w8, splits=8), dict(w8, splits=16, block_t=64),
+                          dict(w8, splits=32, block_t=64)],
+        "B1 L8 full": [dict(nw, splits=128), dict(nw, splits=256), dict(w8, splits=256), dict(nw, splits=128, pf=False), dict(nw, splits=128, g1=8),
+                       dict(w8, splits=128)],
+        "B16 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, pf=False), dict(w8, splits=8), dict(w8, splits=2), dict(w8, splits=4, block_t=64),
+                           dict(w8, splits=8, block_t=64)],
+        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, pf=False)],
+        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=2), dict(w8, splits=4, pf=False), dict(w8, splits=8), dict(w8, splits=4, block_t=64),
+                           dict(w8, splits=2, block_t=64)],
+        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, pf=False), dict(nw, splits=2)],
     }
     for name, (B, L, window) in cases.items():
         d = make(B, L, window)
@@ -616,7 +633,7 @@ def _attention_forward(data) -> torch.Tensor:
     ex2h = bool(plan["ex2h"]) and FP8_ASM
     pv8 = bool(plan["pv8"]) and FP8_ASM
     lb = 32 if pv8 else 16
-    g1 = plan.get("g1") or {1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 8, 64: 8, 128: 16}[splits]   # merge groups of g1 splits (one level up to 16)
+    g1 = plan.get("g1") or {1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 8, 64: 8, 128: 16, 256: 16, 512: 32}[splits]   # merge groups (one level up to 16)
     g2 = splits // g1
     nset = hp // hps
     n_rows = ctas * nset * rb * (splits + g2)          # split partials, then the group partials
@@ -636,7 +653,8 @@ def _attention_forward(data) -> torch.Tensor:
         math.log2(theta) if theta else 0.0,
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
         ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=plan["block_t"], ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
-        CH=ch, QK_FP8=qk_fp8, HP=hp, BD=bd, EX2H=ex2h, PV8=pv8, G1=g1, num_warps=plan["warps"], num_stages=plan["stages"],
+        CH=ch, QK_FP8=qk_fp8, HP=hp, BD=bd, EX2H=ex2h, PV8=pv8, G1=g1, PF=FP8_ASM and bool(plan.get("pf", True)),
+        num_warps=plan["warps"], num_stages=plan["stages"],
         **extra,
     )
     return out
