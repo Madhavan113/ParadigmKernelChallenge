@@ -576,6 +576,7 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
 {
     constexpr int GROUPS = 4 / RPW, KS = 8 / GROUPS, MR = 16 * MT;
     __shared__ float red[32][MR + 1];
+    __shared__ float redw[8][32][MR];
     __shared__ int s_en[64];
     __shared__ float s_ev[64][MR];
     __shared__ int s_last;
@@ -677,18 +678,26 @@ __global__ void __launch_bounds__(256) mma12_kernel(const __nv_bfloat16* __restr
     }
 
     // reduce the KS warps of each row group: red[n_local][m]
-    for (int idx = threadIdx.x; idx < 32 * (MR + 1); idx += 256) (&red[0][0])[idx] = 0.f;
-    __syncthreads();
+    // cross-warp reduction without atomics: each warp writes its fragments to its own slab
+    // (distinct addresses per lane), then every thread sums the KS warps of its row group
     #pragma unroll
     for (int i = 0; i < MT; ++i)
         #pragma unroll
         for (int r = 0; r < RPW; ++r) {
             const int n0 = grp * RPW * 8 + 8 * r + 2 * t;
-            atomicAdd(&red[n0][16 * i + g], acc[i][r][0]);
-            atomicAdd(&red[n0 + 1][16 * i + g], acc[i][r][1]);
-            atomicAdd(&red[n0][16 * i + g + 8], acc[i][r][2]);
-            atomicAdd(&red[n0 + 1][16 * i + g + 8], acc[i][r][3]);
+            redw[warp][n0][16 * i + g] = acc[i][r][0];
+            redw[warp][n0 + 1][16 * i + g] = acc[i][r][1];
+            redw[warp][n0][16 * i + g + 8] = acc[i][r][2];
+            redw[warp][n0 + 1][16 * i + g + 8] = acc[i][r][3];
         }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+        const int n = idx & 31, i = idx >> 5, gq = n / (RPW * 8);
+        float v = 0.f;
+        #pragma unroll
+        for (int kq = 0; kq < KS; ++kq) v += redw[gq * KS + kq][n][i];
+        red[n][i] = v;
+    }
     __syncthreads();
     if (SK > 1) {
         // partials [SK][MR][N] fp32 of this n-tile, ticket, last CTA sums
@@ -768,9 +777,10 @@ __global__ void __launch_bounds__(256) mma12cp_kernel(const __nv_bfloat16* __res
         __nv_bfloat16* __restrict__ out, int ldo, float* __restrict__ part, int* __restrict__ cnt, int N, int K)
 {
     constexpr int GROUPS = 4 / RPW, KS = 8 / GROUPS, MR = 16 * MT;
-    constexpr int LOB = RPW * 16, NBB = RPW * 8, XB = MT * 2 * 32, LANEB = LOB + NBB + XB, WSTAGE = 32 * LANEB;
+    constexpr int LOB = RPW * 16, NBB = RPW * 8, XB = MT * 2 * 32, LANEB = ((LOB + NBB + XB + 15) / 16) * 16, WSTAGE = 32 * LANEB;
     extern __shared__ __align__(16) uint8_t dsmem[];
     __shared__ float red[32][MR + 1];
+    __shared__ float redw[8][32][MR];
     __shared__ int s_en[64];
     __shared__ float s_ev[64][MR];
     __shared__ int s_last;
@@ -877,18 +887,26 @@ __global__ void __launch_bounds__(256) mma12cp_kernel(const __nv_bfloat16* __res
     }
     cp_async_wait<0>();
 
-    for (int idx = threadIdx.x; idx < 32 * (MR + 1); idx += 256) (&red[0][0])[idx] = 0.f;
-    __syncthreads();
+    // cross-warp reduction without atomics: each warp writes its fragments to its own slab
+    // (distinct addresses per lane), then every thread sums the KS warps of its row group
     #pragma unroll
     for (int i = 0; i < MT; ++i)
         #pragma unroll
         for (int r = 0; r < RPW; ++r) {
             const int n0 = grp * RPW * 8 + 8 * r + 2 * t;
-            atomicAdd(&red[n0][16 * i + g], acc[i][r][0]);
-            atomicAdd(&red[n0 + 1][16 * i + g], acc[i][r][1]);
-            atomicAdd(&red[n0][16 * i + g + 8], acc[i][r][2]);
-            atomicAdd(&red[n0 + 1][16 * i + g + 8], acc[i][r][3]);
+            redw[warp][n0][16 * i + g] = acc[i][r][0];
+            redw[warp][n0 + 1][16 * i + g] = acc[i][r][1];
+            redw[warp][n0][16 * i + g + 8] = acc[i][r][2];
+            redw[warp][n0 + 1][16 * i + g + 8] = acc[i][r][3];
         }
+    __syncthreads();
+    for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
+        const int n = idx & 31, i = idx >> 5, gq = n / (RPW * 8);
+        float v = 0.f;
+        #pragma unroll
+        for (int kq = 0; kq < KS; ++kq) v += redw[gq * KS + kq][n][i];
+        red[n][i] = v;
+    }
     __syncthreads();
     if (SK > 1) {
         for (int idx = threadIdx.x; idx < 32 * MR; idx += 256) {
@@ -942,7 +960,7 @@ template <int MT, int RPW, int NSTAGE, int SK>
 void launch_mma12cp(const __nv_bfloat16* X, int ldx, int m, const uint8_t* LO, const uint8_t* NB, int eb, const int* eo, const int* en, const int* ek, const float* ed,
                     __nv_bfloat16* out, int ldo, float* part, int* cnt, int N, int K, cudaStream_t stream)
 {
-    constexpr int LANEB = RPW * 16 + RPW * 8 + MT * 2 * 32;
+    constexpr int LANEB = ((RPW * 16 + RPW * 8 + MT * 2 * 32 + 15) / 16) * 16;
     constexpr int smem = NSTAGE * 8 * 32 * LANEB;
     static bool attr = false;
     if (!attr) { cudaFuncSetAttribute(mma12cp_kernel<MT, RPW, NSTAGE, SK>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
@@ -1188,7 +1206,7 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_proj_cuda10", cpp_sources=[CPP_SRC],
+            name="okc_proj_cuda11", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
             functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12", "mma12", "mma12cp"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _EXT
