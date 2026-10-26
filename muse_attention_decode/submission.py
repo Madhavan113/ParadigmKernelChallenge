@@ -155,10 +155,14 @@ def _prep_q(qkv_ptr, kc_ptr, tok, g, hh, rmask, hbase, pos, inv_freq, qk_scale, 
 
 @triton.jit
 def _tile(q, k8, v8, ok, m_i, l_i, acc, mult, MASKED: tl.constexpr, QK_FP8: tl.constexpr, ACT: tl.constexpr,
-          FP8_ASM: tl.constexpr, EX2H: tl.constexpr, PV8: tl.constexpr):
+          FP8_ASM: tl.constexpr, EX2H: tl.constexpr, PV8: tl.constexpr, ABL: tl.constexpr):
     """One online-softmax step over a key tile: k8/v8 [T, DW] raw E4M3, q [RB, DW].
-    mult turns raw scores into log2-domain logits; m_i/l_i/acc are the running statistics."""
-    if QK_FP8:
+    mult turns raw scores into log2-domain logits; m_i/l_i/acc are the running statistics.
+    ABL (benchmark ablations, wrong results): 1 = skip the V path, 2 = skip the QK^T dot."""
+    if ABL == 2:
+        kmax = tl.max(k8.to(tl.uint8, bitcast=True), 1).to(tl.float32)        # a cheap use of the K tile
+        sc = tl.zeros((q.shape[0], k8.shape[0]), tl.float32) + kmax[None, :] * 1e-30
+    elif QK_FP8:
         sc = tl.dot(q, tl.trans(k8))                              # e4m3 x e4m3, fp32 accumulate
     else:
         sc = tl.dot(q, tl.trans(_cache_to_act(k8, ACT, FP8_ASM)))  # [RB, T]
@@ -178,7 +182,10 @@ def _tile(q, k8, v8, ok, m_i, l_i, acc, mult, MASKED: tl.constexpr, QK_FP8: tl.c
             p = tl.where(ok, p, 0.0)
         l_i = l_i * alpha + tl.sum(p, 1)
         p16 = p.to(ACT)
-    if PV8:
+    if ABL == 1:
+        vmax = tl.max(v8.to(tl.uint8, bitcast=True), 0).to(tl.float32)        # a cheap use of the V tile
+        pv = tl.zeros_like(acc) + vmax[None, :] * 1e-30
+    elif PV8:
         pv = tl.dot(p16.to(tl.float8e4nv), v8)
     else:
         pv = tl.dot(p16, _cache_to_act(v8, ACT, FP8_ASM))
@@ -253,7 +260,7 @@ def _attn_decode_kernel(
     PS: tl.constexpr, WINDOW: tl.constexpr, ROPE: tl.constexpr, SPLITS: tl.constexpr,
     RB: tl.constexpr, LB: tl.constexpr, BLOCK_T: tl.constexpr, ACT: tl.constexpr, FP8_ASM: tl.constexpr,
     CH: tl.constexpr, QK_FP8: tl.constexpr, HP: tl.constexpr, BD: tl.constexpr, EX2H: tl.constexpr, PV8: tl.constexpr,
-    G1: tl.constexpr, PF: tl.constexpr,
+    G1: tl.constexpr, PF: tl.constexpr, ABL: tl.constexpr,
 ):
     GROUP: tl.constexpr = HQ // HKV
     HPS: tl.constexpr = HP if BD else 1        # heads sharing one row set
@@ -368,11 +375,11 @@ def _attn_decode_kernel(
             ok = valid[None, :] & (t[None, :] >= first[:, None])
             k8 = tl.load(kc_ptr + cp, mask=valid[:, None], other=0.0)
             v8 = tl.load(vc_ptr + cp, mask=valid[:, None], other=0.0)
-            m0, l0, acc0 = _tile(q0, k8, v8, ok, m0, l0, acc0, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+            m0, l0, acc0 = _tile(q0, k8, v8, ok, m0, l0, acc0, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
             if NSET == 2:
                 k8 = tl.load(kc_ptr + cp + D, mask=valid[:, None], other=0.0)
                 v8 = tl.load(vc_ptr + cp + D, mask=valid[:, None], other=0.0)
-                m1, l1, acc1 = _tile(q1, k8, v8, ok, m1, l1, acc1, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+                m1, l1, acc1 = _tile(q1, k8, v8, ok, m1, l1, acc1, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
             t0 = t0 + BLOCK_T
     # interior tiles: every key valid, no masks at all
     for tt in range(t0, end - (BLOCK_T - 1), BLOCK_T):
@@ -382,11 +389,11 @@ def _attn_decode_kernel(
         cp = row[:, None] * ROW_W + h0 * D + c[None, :]
         k8 = tl.load(kc_ptr + cp)
         v8 = tl.load(vc_ptr + cp)
-        m0, l0, acc0 = _tile(q0, k8, v8, rmask, m0, l0, acc0, qk_mult, False, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+        m0, l0, acc0 = _tile(q0, k8, v8, rmask, m0, l0, acc0, qk_mult, False, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
         if NSET == 2:
             k8 = tl.load(kc_ptr + cp + D)
             v8 = tl.load(vc_ptr + cp + D)
-            m1, l1, acc1 = _tile(q1, k8, v8, rmask, m1, l1, acc1, qk_mult, False, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+            m1, l1, acc1 = _tile(q1, k8, v8, rmask, m1, l1, acc1, qk_mult, False, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
     # the slice's tail (fewer than BLOCK_T keys): masked tile
     tt = t0 + (tl.maximum(end - t0, 0) // BLOCK_T) * BLOCK_T
     if tt < end:
@@ -401,18 +408,18 @@ def _attn_decode_kernel(
             ok = valid[None, :] & (rows[:, None] >= 0)
         k8 = tl.load(kc_ptr + cp, mask=valid[:, None], other=0.0)
         v8 = tl.load(vc_ptr + cp, mask=valid[:, None], other=0.0)
-        m0, l0, acc0 = _tile(q0, k8, v8, ok, m0, l0, acc0, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+        m0, l0, acc0 = _tile(q0, k8, v8, ok, m0, l0, acc0, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
         if NSET == 2:
             k8 = tl.load(kc_ptr + cp + D, mask=valid[:, None], other=0.0)
             v8 = tl.load(vc_ptr + cp + D, mask=valid[:, None], other=0.0)
-            m1, l1, acc1 = _tile(q1, k8, v8, ok, m1, l1, acc1, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+            m1, l1, acc1 = _tile(q1, k8, v8, ok, m1, l1, acc1, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
 
     # ---- split 0: the block's own tokens (causal inside the block, own head only) ----
     if s == 0:
         ok = kmask[None, :] & (kj[None, :] <= j[:, None]) & (khh[None, :] == hh[:, None])
-        m0, l0, acc0 = _tile(q0, k_new0, v_new0, ok, m0, l0, acc0, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+        m0, l0, acc0 = _tile(q0, k_new0, v_new0, ok, m0, l0, acc0, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
         if NSET == 2:
-            m1, l1, acc1 = _tile(q1, k_new1, v_new1, ok, m1, l1, acc1, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8)
+            m1, l1, acc1 = _tile(q1, k_new1, v_new1, ok, m1, l1, acc1, qk_mult, True, QK_FP8, ACT, FP8_ASM, EX2H, PV8, ABL)
 
     acc0 = acc0 * v_scale   # values were accumulated as raw E4M3
     if NSET == 2:
@@ -577,25 +584,24 @@ def _attn_bench(data):
              "B16 L8 sliding": (16, 8, W), "B16 L8 full": (16, 8, 0), "B32 L8 sliding": (32, 8, W), "B32 L8 full": (32, 8, 0)}
     bd = dict(hp=2, bd=True, stages=5, block_t=64)                   # both heads per CTA, whole 128B rows
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128)      # one head per CTA
-    n64 = dict(nw, block_t=64)
-    w8 = dict(n64, warps=8)
     plans = {
-        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16)],
-        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=128, g1=8), dict(nw, splits=128, pf=False), dict(nw, splits=64, warps=8)],
-        "B16 L1 sliding": [dict(n64, splits=8)],
-        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16)],
-        "B32 L1 sliding": [dict(n64, splits=8)],
-        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=8)],
-        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, g1=32), dict(w8, splits=32, g1=4), dict(w8, splits=32, stages=3),
-                          dict(w8, splits=64, stages=3), dict(w8, splits=16, stages=3), dict(w8, splits=32, pf=False)],
-        "B1 L8 full": [dict(nw, splits=64, warps=8), dict(nw, splits=128), dict(nw, splits=64), dict(nw, splits=32, warps=8),
-                       dict(nw, splits=64, warps=8, g1=64), dict(nw, splits=64, warps=8, pf=False), dict(nw, splits=64, warps=8, stages=3),
-                       dict(n64, splits=64, warps=8)],
-        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, g1=4)],
-        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8)],
-        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, g1=2)],
-        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4)],
+        "B16 L1 full": [dict(bd, splits=16), dict(bd, splits=16, abl=1), dict(bd, splits=16, abl=2), dict(bd, splits=16, qk8=True, abl=1),
+                        dict(bd, splits=16, rb=64), dict(bd, splits=16, rb=64, stages=7), dict(bd, splits=16, rb=64, block_t=128),
+                        dict(nw, splits=16, rb=64), dict(nw, splits=16, rb=64, block_t=64), dict(bd, splits=32, rb=64),
+                        dict(bd, splits=16, stages=8), dict(bd, splits=16, rb=64, abl=1)],
+        "B32 L1 full": [dict(bd, splits=8), dict(bd, splits=8, abl=1), dict(bd, splits=8, rb=64), dict(bd, splits=16, rb=64),
+                        dict(bd, splits=8, rb=64, stages=7)],
+        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, abl=1), dict(nw, splits=8, abl=2), dict(nw, splits=8, stages=8),
+                        dict(bd, splits=8, warps=8), dict(bd, splits=16, warps=8), dict(bd, splits=4, warps=8), dict(bd, splits=8, warps=8, stages=7),
+                        dict(bd, splits=8, warps=8, block_t=128), dict(bd, splits=8, warps=8, abl=1), dict(bd, splits=8, warps=16),
+                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=8, splits=8),
+                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=128, warps=8, splits=8),
+                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=8, splits=16)],
+        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, abl=1), dict(nw, splits=4, abl=2), dict(bd, splits=4, warps=8),
+                        dict(bd, splits=8, warps=8), dict(bd, splits=4, warps=16),
+                        dict(hp=2, bd=False, stages=5, ex2h=True, block_t=64, warps=8, splits=4)],
     }
+    cases = {k: v for k, v in cases.items() if k in plans}
     for name, (B, L, window) in cases.items():
         d = make(B, L, window)
         for plan in plans[name]:
@@ -637,7 +643,7 @@ def _attention_forward(data) -> torch.Tensor:
     hp = plan["hp"] if HKV % plan["hp"] == 0 else 1
     bd = plan["bd"] and hp == 2
     hps = hp if bd else 1
-    rb = max(16, triton.next_power_of_2(L * group * hps))   # dots need >= 16 rows
+    rb = max(int(plan.get("rb", 16)), triton.next_power_of_2(L * group * hps))   # dots need >= 16 rows
     ctas = B * HKV // hp
     splits = max(1, min(plan["splits"], 1 << (max(1, 1024 // ctas).bit_length() - 1)))
     splits = 1 << (splits.bit_length() - 1)
@@ -653,7 +659,7 @@ def _attention_forward(data) -> torch.Tensor:
     page_table = data["page_table"]
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
-    ch = min(max(g1, g2), 8 if rb <= 16 else 4)         # partial sets merged per load group
+    ch = min(max(g1, g2), 8 if rb <= 16 else (4 if rb <= 64 else 1))   # partial sets merged per load group
     extra = {}
     if plan.get("maxnreg"):
         extra["maxnreg"] = plan["maxnreg"]
@@ -666,7 +672,7 @@ def _attention_forward(data) -> torch.Tensor:
         L=L, HQ=HQ, HKV=HKV, D=D, PS=cfg["page_size"], WINDOW=cfg["window"],
         ROPE=bool(theta), SPLITS=splits, RB=rb, LB=lb, BLOCK_T=plan["block_t"], ACT=ACT_DTYPE, FP8_ASM=FP8_ASM,
         CH=ch, QK_FP8=qk_fp8, HP=hp, BD=bd, EX2H=ex2h, PV8=pv8, G1=g1, PF=FP8_ASM and bool(plan.get("pf", True)),
-        num_warps=plan["warps"], num_stages=plan["stages"],
+        ABL=int(plan.get("abl", 0)), num_warps=plan["warps"], num_stages=plan["stages"],
         **extra,
     )
     return out
