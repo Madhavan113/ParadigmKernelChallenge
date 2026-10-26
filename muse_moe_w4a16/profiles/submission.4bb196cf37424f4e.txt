@@ -1,0 +1,65 @@
+okc run 4bb196cf37424f4e on muse_moe_w4a16
+submission  /Users/madhavanp/kerneloptimizer/.claude/worktrees/agent-a072cf0f190a7d540/muse_moe_w4a16/submission.py
+status      ok
+passed      true
+speedup     1.7012263175061784
+speedup_ci  [1.6757079227435856 1.726744712268771]
+score_us    7905.179846802575
+tests       5/5 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+bs=1 load=decode 1 sharding=ep8                               78.51      47.80   1.642x      11.42  
+bs=16 load=decode 16 sharding=ep8                            194.43     125.21   1.553x      52.52  
+bs=32 load=decode 32 sharding=ep8                            209.55     147.25   1.423x      70.76  
+bs=8 load=verify 1 sharding=ep8                              141.34      87.65   1.613x      37.32  
+bs=128 load=verify 16 sharding=ep8                           461.14     225.02   2.049x     101.34  
+bs=256 load=verify 32 sharding=ep8                           617.07     305.29   2.021x     108.94  
+
+profile 0: bs=1 load=decode 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_wt_kernel<true, 1, ...      23.4 µs  47.6%      1
+void (anonymous namespace)::moe_w4a16_wt_kernel<false, 1,...      18.2 µs  37.1%      1
+void (anonymous namespace)::moe_finalize_kernel<4096>(__n...       4.5 µs   9.2%      1
+void (anonymous namespace)::moe_route_kernel<8, 32, 8>(in...       3.0 µs   6.2%      1
+total                                                             49.1 µs
+
+profile 1: bs=16 load=decode 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_wt_kernel<true, 1, ...      47.5 µs  53.2%      1
+void (anonymous namespace)::moe_w4a16_wt_kernel<false, 1,...      34.6 µs  38.8%      1
+void (anonymous namespace)::moe_finalize_kernel<4096>(__n...       4.1 µs   4.6%      1
+void (anonymous namespace)::moe_route_kernel<8, 32, 8>(in...       3.0 µs   3.4%      1
+total                                                             89.2 µs
+
+profile 2: bs=32 load=decode 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_wt_kernel<true, 1, ...     103.8 µs  61.8%      1
+void (anonymous namespace)::moe_w4a16_wt_kernel<false, 2,...      56.8 µs  33.8%      1
+void (anonymous namespace)::moe_finalize_kernel<4096>(__n...       4.2 µs   2.5%      1
+void (anonymous namespace)::moe_route_kernel<8, 32, 8>(in...       3.1 µs   1.8%      1
+total                                                            167.9 µs
+
+profile 3: bs=8 load=verify 1 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_wt_kernel<true, 1, ...      63.4 µs  61.2%      1
+void (anonymous namespace)::moe_w4a16_wt_kernel<false, 1,...      32.7 µs  31.6%      1
+void (anonymous namespace)::moe_finalize_kernel<4096>(__n...       4.4 µs   4.3%      1
+void (anonymous namespace)::moe_route_kernel<8, 32, 8>(in...       3.0 µs   2.9%      1
+total                                                            103.6 µs
+
+profile 4: bs=128 load=verify 16 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_wt_kernel<true, 1, ...     159.9 µs  64.5%      1
+void (anonymous namespace)::moe_w4a16_wt_kernel<false, 2,...      79.6 µs  32.1%      1
+void (anonymous namespace)::moe_finalize_kernel<4096>(__n...       5.1 µs   2.1%      1
+void (anonymous namespace)::moe_route_kernel<8, 32, 8>(in...       3.5 µs   1.4%      1
+total                                                            248.0 µs
+
+profile 5: bs=256 load=verify 32 sharding=ep8
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::moe_w4a16_wt_kernel<true, 1, ...     198.6 µs  63.5%      1
+void (anonymous namespace)::moe_w4a16_wt_kernel<false, 2,...     103.6 µs  33.1%      1
+void (anonymous namespace)::moe_finalize_kernel<4096>(__n...       5.6 µs   1.8%      1
+void (anonymous namespace)::moe_route_kernel<8, 32, 8>(in...       4.9 µs   1.6%      1
+total                                                            312.7 µs
