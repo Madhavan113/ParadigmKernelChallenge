@@ -1512,6 +1512,395 @@ void launch_mma12cp(const __nv_bfloat16* X, int ldx, int m, const uint8_t* LO, c
     mma12cp_kernel<MT, RPW, NSTAGE, SK><<<dim3(N / 32, SK), 256, smem, stream>>>(X, ldx, m, LO, NB, eb, eo, en, ek, ed, out, ldo, part, cnt, N, K);
 }
 
+// ---- w12: dense 12-bit W x BF16 x^T GEMM, weights as the mma M side (one m16 tile of W per warp, 4 per CTA),
+// tokens as N (NT n8 blocks, m <= 8*NT), K streamed in 128-wide chunks through an NSTAGE cp.async ring shared by
+// the CTA. Weight layout W12 (see _repack_w12): per (m16 tile, chunk) 3 KB = low bytes [4 quads][32 lanes][16 B]
+// (quad q: k16 steps 2q, 2q+1; per step 8 bytes = L0 (rows g, g+8 at k 2t, 2t+1) then L1 (k 2t+8, 2t+9)) and
+// nibbles [2 halves][32 lanes][16 B] (half h: steps 4h..4h+3; per step one word, nibble i = element i of the
+// L0 then L1 order), grouped by 4 tiles: [N/64][K/128][4][3 KB]. Decode per step: decode4 (PRMT LUT of the
+// high byte, sign OR'd, L/H bytes interleaved) twice -> a0..a3 bf16x2, mma bf16 -> fp32. The CTA writes its
+// fp32 partial slice part[z][i][n]; w12_reduce sums the slices, adds the escapes and writes bf16.
+__device__ __forceinline__ void pdl_wait() { asm volatile("griddepcontrol.wait;\n" ::: "memory"); }
+__device__ __forceinline__ void pdl_trigger() { asm volatile("griddepcontrol.launch_dependents;\n" ::: "memory"); }
+__device__ __forceinline__ void ldsm_x4(uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3, uint32_t addr) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+                 : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr));
+}
+constexpr int W12_KC = 128, W12_XSTRIDE = W12_KC + 8;   // token tile row stride (halves)
+constexpr int W12_TILE_BYTES = 3072;                   // per (m16 tile, chunk)
+__host__ __device__ constexpr int w12_stage_bytes(int nt) { return 4 * W12_TILE_BYTES + 8 * nt * W12_XSTRIDE * 2; }
+
+
+// w12 epilogue, out of line (__noinline__) so the GEMM loop's register allocation and code do not depend on it.
+// SPLITK: the CTA stores its fp32 partial slice (plain stores), takes a ticket on cnt[tile group]; the last arrival
+// sums the slices from L2 (ld.global.cg), adds the group's escapes (two 32-row pack tiles) in parallel over
+// (escape, token) with shared-memory atomics, writes bf16 and resets the ticket. KSPLIT == 1: the CTA's own sums.
+__device__ __forceinline__ void fence_acq_rel_gpu() { asm volatile("fence.acq_rel.gpu;\n" ::: "memory"); }
+
+template <int NT, bool SPLITK>
+__device__ __noinline__ void w12_epilogue(const float* __restrict__ accv, int m, int N, int tid, int warp, int g, int t,
+        float* __restrict__ part, int* __restrict__ cnt,
+        const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+        const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo, int emode)
+{
+    // Latency-aware: every loop below issues all of its global loads before using any. emode (bench diagnostics):
+    // 4 = return at entry, 5 = partial stores + ticket only, 6 = skip the escapes; 0 = full.
+    __shared__ __align__(16) float red[64][33];
+    __shared__ int s_last;
+    if (emode == 4) return;
+    const int col0 = (blockIdx.x * 4 + warp) * 16 + g;                  // output column (row of W) of fragment row g
+    if constexpr (SPLITK) {
+        const int KSPLIT = (int)gridDim.y;
+        float* pz = part + (size_t)blockIdx.y * m * N;
+        #pragma unroll
+        for (int nbk = 0; nbk < NT; ++nbk)
+            #pragma unroll
+            for (int hr = 0; hr < 2; ++hr)
+                #pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int tok = nbk * 8 + 2 * t + cc;
+                    if (tok < m) pz[(size_t)tok * N + col0 + 8 * hr] = accv[nbk * 4 + 2 * hr + cc];
+                }
+        __syncthreads();
+        if (tid == 0) {
+            fence_acq_rel_gpu();                                        // release this CTA's slice (cumulative over the barrier)
+            const int old = atomicAdd(cnt + blockIdx.x, 1);
+            s_last = (old == KSPLIT - 1);
+            if (old == KSPLIT - 1) cnt[blockIdx.x] = 0;
+            fence_acq_rel_gpu();                                        // acquire the other slices
+        }
+        __syncthreads();
+        if (!s_last || emode == 5) return;
+        // slice sum, 16 tokens per pass: thread -> token il = tid >> 3, columns 8*oct .. 8*oct+7 (two float4)
+        const int il = tid >> 3, oct = tid & 7;
+        for (int p0 = 0; p0 < m; p0 += 16) {
+            const int i = p0 + il;
+            float4 acc0 = make_float4(0.f, 0.f, 0.f, 0.f), acc1 = acc0;
+            if (i < m) {
+                for (int zb = 0; zb < KSPLIT; zb += 8) {
+                    float4 v0[8], v1[8];
+                    #pragma unroll
+                    for (int z = 0; z < 8; ++z) {
+                        if (zb + z < KSPLIT) {
+                            const float* src = part + ((size_t)(zb + z) * m + i) * N + blockIdx.x * 64 + oct * 8;
+                            v0[z] = __ldcg(reinterpret_cast<const float4*>(src));
+                            v1[z] = __ldcg(reinterpret_cast<const float4*>(src + 4));
+                        } else {
+                            v0[z] = make_float4(0.f, 0.f, 0.f, 0.f); v1[z] = v0[z];
+                        }
+                    }
+                    #pragma unroll
+                    for (int z = 0; z < 8; ++z) {
+                        acc0.x += v0[z].x; acc0.y += v0[z].y; acc0.z += v0[z].z; acc0.w += v0[z].w;
+                        acc1.x += v1[z].x; acc1.y += v1[z].y; acc1.z += v1[z].z; acc1.w += v1[z].w;
+                    }
+                }
+                red[oct * 8 + 0][i] = acc0.x; red[oct * 8 + 1][i] = acc0.y; red[oct * 8 + 2][i] = acc0.z; red[oct * 8 + 3][i] = acc0.w;
+                red[oct * 8 + 4][i] = acc1.x; red[oct * 8 + 5][i] = acc1.y; red[oct * 8 + 6][i] = acc1.z; red[oct * 8 + 7][i] = acc1.w;
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int nbk = 0; nbk < NT; ++nbk)
+            #pragma unroll
+            for (int hr = 0; hr < 2; ++hr)
+                #pragma unroll
+                for (int cc = 0; cc < 2; ++cc) {
+                    const int tok = nbk * 8 + 2 * t + cc;
+                    if (tok < m) red[warp * 16 + g + 8 * hr][tok] = accv[nbk * 4 + 2 * hr + cc];
+                }
+    }
+    __syncthreads();
+    // escapes of pack tiles 2*bx, 2*bx + 1: one escape per thread per batch, its m token values loaded together
+    const int e0 = esc_off[2 * blockIdx.x], e1 = emode == 6 ? esc_off[2 * blockIdx.x] : esc_off[2 * blockIdx.x + 2];   // contiguous lists
+    for (int base = e0; base < e1; base += 128) {
+        const int e = base + tid;
+        if (e < e1) {
+            const int nl = esc_n[e] + (e >= esc_off[2 * blockIdx.x + 1] ? 32 : 0);
+            const int kk = esc_k[e];
+            const float d = esc_d[e];
+            float xv[8 * NT];
+            #pragma unroll
+            for (int i = 0; i < 8 * NT; ++i) xv[i] = i < m ? __bfloat162float(X[(size_t)i * ldx + kk]) : 0.f;
+            #pragma unroll
+            for (int i = 0; i < 8 * NT; ++i)
+                if (i < m) atomicAdd(&red[nl][i], d * xv[i]);
+        }
+    }
+    __syncthreads();
+    // bf16x2 stores: thread -> columns 2*(tid & 31), tokens (tid >> 5) + 4r
+    for (int i = tid >> 5; i < m; i += 4) {
+        const int n = 2 * (tid & 31);
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)i * ldo + blockIdx.x * 64 + n) = __floats2bfloat162_rn(red[n][i], red[n + 1][i]);
+    }
+}
+
+typedef void (*w12_epi_fn)(const float*, int, int, int, int, int, int, float*, int*, const int*, const int*, const int*, const float*,
+                           const __nv_bfloat16*, int, __nv_bfloat16*, int, int);
+
+template <int NT, int NSTAGE, bool SPLITK, int MODE = 0>
+__global__ void __launch_bounds__(128)
+w12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ W, int eb,
+           float* __restrict__ part, int N, int K,
+           const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+           __nv_bfloat16* __restrict__ out, int ldo, int* __restrict__ cnt, int emode)
+{
+    constexpr int STAGE_BYTES = w12_stage_bytes(NT);
+    constexpr int W_STAGE = 4 * W12_TILE_BYTES;
+    constexpr int CH = NT == 1 ? 2 : 1;                                   // accumulator chains (mma latency)
+    extern __shared__ __align__(128) uint8_t w12_smem[];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KSPLIT = SPLITK ? (int)gridDim.y : 1;
+    const int NC_ALL = K / W12_KC;
+    const int NC = NC_ALL / KSPLIT;
+    const int c0 = SPLITK ? (int)blockIdx.y * NC : 0;
+    const int ntb = (m + 7) >> 3;
+    const uint32_t hb = (uint32_t)(eb >> 1);
+    const uint32_t lut0 = hb | (hb + 1) << 8 | (hb + 2) << 16 | (hb + 3) << 24;
+    const uint32_t lut1 = (hb + 4) | (hb + 5) << 8 | (hb + 6) << 16 | (hb + 7) << 24;
+
+    // cp.async segments per chunk: 768 weight segments (6 per thread) + NT x 128 token segments (NT per thread)
+    const uint8_t* wsrc = W + ((size_t)blockIdx.x * NC_ALL + c0) * W_STAGE + tid * 16;      // + i * 2048 + c * W_STAGE
+    const __nv_bfloat16* xsrc[NT]; int xbytes[NT];
+    #pragma unroll
+    for (int i = 0; i < NT; ++i) {
+        const int sidx = tid + i * 128, r = sidx >> 4;
+        xbytes[i] = r < m ? 16 : 0;
+        xsrc[i] = X + (size_t)(r < m ? r : 0) * ldx + c0 * W12_KC + (sidx & 15) * 8;
+    }
+    const uint32_t sbase = smem_u32(w12_smem);
+    auto issue = [&](int c, int stage) {
+        const uint32_t ws = sbase + stage * STAGE_BYTES;
+        #pragma unroll
+        for (int i = 0; i < 6; ++i) cp_async16(ws + i * 2048 + tid * 16, wsrc + (size_t)c * W_STAGE + i * 2048, 16);
+        const uint32_t xs = ws + W_STAGE;
+        #pragma unroll
+        for (int i = 0; i < NT; ++i) {
+            const int sidx = tid + i * 128;
+            cp_async16(xs + ((sidx >> 4) * W12_XSTRIDE + (sidx & 15) * 8) * 2, xsrc[i] + c * W12_KC, xbytes[i]);
+        }
+    };
+
+    float acc[NT * CH][4];
+    #pragma unroll
+    for (int n = 0; n < NT * CH; ++n)
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) acc[n][q] = 0.f;
+
+    #pragma unroll
+    for (int st = 0; st < NSTAGE - 1; ++st) {
+        if (st < NC) issue(st, st);
+        cp_async_commit();
+    }
+    for (int c = 0; c < NC; ++c) {
+        cp_async_wait<NSTAGE - 2>();
+        __syncthreads();
+        {
+            const int cn = c + NSTAGE - 1;
+            if (cn < NC) issue(cn, cn % NSTAGE);
+            cp_async_commit();
+        }
+        const uint8_t* ws = w12_smem + (c % NSTAGE) * STAGE_BYTES + warp * W12_TILE_BYTES;
+        const __half* xs = reinterpret_cast<const __half*>(w12_smem + (c % NSTAGE) * STAGE_BYTES + W_STAGE);
+        if constexpr (MODE == 1) {                                        // loads only
+            if (lane == 0) acc[0][0] += __uint_as_float(*reinterpret_cast<const uint32_t*>(ws + warp * 16) & 0x007FFFFFu);
+            continue;
+        }
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {                                     // steps 4h..4h+3
+            uint4 lo[2]; uint4 nb;
+            lo[0] = *reinterpret_cast<const uint4*>(ws + (2 * h) * 512 + lane * 16);          // steps 4h, 4h+1
+            lo[1] = *reinterpret_cast<const uint4*>(ws + (2 * h + 1) * 512 + lane * 16);      // steps 4h+2, 4h+3
+            nb = *reinterpret_cast<const uint4*>(ws + 2048 + h * 512 + lane * 16);          // steps 4h..4h+3
+            #pragma unroll
+            for (int ps = 0; ps < 2; ++ps) {                                 // steps 4h+2ps, +1
+                uint32_t b[NT][4];
+                #pragma unroll
+                for (int nbk = 0; nbk < NT; ++nbk) {
+                    if (nbk < ntb)
+                        ldsm_x4(b[nbk][0], b[nbk][1], b[nbk][2], b[nbk][3],
+                                smem_u32(xs + (nbk * 8 + (lane & 7)) * W12_XSTRIDE + h * 64 + ps * 32 + (lane >> 3) * 8));
+                }
+                #pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const uint32_t L0 = q == 0 ? lo[ps].x : lo[ps].z, L1 = q == 0 ? lo[ps].y : lo[ps].w;
+                    const int si = 2 * ps + q;
+                    const uint32_t Nw = si == 0 ? nb.x : si == 1 ? nb.y : si == 2 ? nb.z : nb.w;
+                    uint32_t a0, a1, a2, a3;
+                    decode4(L0, Nw & 0xFFFFu, lut0, lut1, a0, a1);
+                    decode4(L1, Nw >> 16, lut0, lut1, a2, a3);
+                    #pragma unroll
+                    for (int nbk = 0; nbk < NT; ++nbk) {
+                        if (nbk < ntb) mma16816(acc[nbk * CH + (CH == 2 ? q : 0)], a0, a1, a2, a3, b[nbk][2 * q], b[nbk][2 * q + 1]);
+                    }
+                }
+            }
+        }
+    }
+    cp_async_wait<0>();
+    float accv[NT * 4];
+    #pragma unroll
+    for (int nbk = 0; nbk < NT; ++nbk)
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) accv[nbk * 4 + q] = acc[nbk * CH][q] + (CH == 2 ? acc[nbk * CH + 1][q] : 0.f);
+    if constexpr (MODE == 2) {                                            // bench: GEMM only (keep the sums live)
+        if (lane == 0 && accv[0] == 12345.678f) part[tid] = accv[NT * 4 - 1];
+        return;
+    }
+    // the epilogue through an opaque pointer: a real call, so the loop's register allocation does not see it
+    w12_epi_fn fp = w12_epilogue<NT, SPLITK>;
+    asm volatile("" : "+l"(fp));
+    fp(accv, m, N, tid, warp, g, t, part, cnt, esc_off, esc_n, esc_k, esc_d, X, ldx, out, ldo, emode);
+}
+
+struct W12Args { const int* eo; const int* en; const int* ek; const float* ed; __nv_bfloat16* out; int ldo; int* cnt; int emode; };
+template <int NT, int NSTAGE, bool SPLITK, int MODE = 0>
+void launch_w12(const __nv_bfloat16* X, int ldx, int m, const uint8_t* W, int eb, float* part, int N, int K, int sk, const W12Args& a, cudaStream_t stream)
+{
+    constexpr int smem = NSTAGE * w12_stage_bytes(NT);
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(w12_kernel<NT, NSTAGE, SPLITK, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    w12_kernel<NT, NSTAGE, SPLITK, MODE><<<dim3(N / 64, sk), 128, smem, stream>>>(X, ldx, m, W, eb, part, N, K, a.eo, a.en, a.ek, a.ed, a.out, a.ldo, a.cnt, a.emode);
+}
+
+// ---- w12b: single launch. CTA = one 16-row tile of W over the full K; W warps, warp w streams chunks
+// [w*NCW, (w+1)*NCW) of the tile through a private NST-stage cp.async ring (3 KB per chunk: the W12 layout),
+// loads its B fragments (x[tok][k]) straight from L2 with a one-chunk register prefetch, and accumulates fp32.
+// Epilogue: the W partial accumulators are summed through smem, the tile's escapes (from the 32-row pack tile's
+// list) are added, bf16 is written. No K-split across CTAs, no second launch.
+template <int NT, int W, int NST>
+__global__ void __launch_bounds__(W * 32, (W <= 8 ? 2 : 1))
+w12b_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ Wt, int eb,
+            const int* __restrict__ esc_off, const int* __restrict__ esc_n, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+            __nv_bfloat16* __restrict__ out, int ldo, int N, int K)
+{
+    constexpr int CH = NT == 1 ? 2 : 1;
+    extern __shared__ __align__(128) uint8_t w12b_smem[];              // W x NST x 3 KB
+    __shared__ float red[16][33];
+    const int tile = blockIdx.x, grp = tile >> 2, slot = tile & 3;
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int NC_ALL = K / W12_KC, NCW = NC_ALL / W, c0 = warp * NCW;
+    const uint32_t hb = (uint32_t)(eb >> 1);
+    const uint32_t lut0 = hb | (hb + 1) << 8 | (hb + 2) << 16 | (hb + 3) << 24;
+    const uint32_t lut1 = (hb + 4) | (hb + 5) << 8 | (hb + 6) << 16 | (hb + 7) << 24;
+    // weights: [grp][chunk][slot][3 KB]; this lane copies 6 x 16 B per chunk (offsets i*512 + lane*16)
+    const uint8_t* wsrc = Wt + ((size_t)grp * NC_ALL + c0) * (4 * W12_TILE_BYTES) + slot * W12_TILE_BYTES + lane * 16;
+    const uint32_t ring = smem_u32(w12b_smem) + warp * (NST * W12_TILE_BYTES);
+    auto issue = [&](int c, int st) {
+        #pragma unroll
+        for (int i = 0; i < 6; ++i)
+            cp_async16(ring + st * W12_TILE_BYTES + i * 512 + lane * 16, wsrc + (size_t)c * (4 * W12_TILE_BYTES) + i * 512, 16);
+    };
+    // x B fragments of chunk c: b0 = x[tok][k0 + 2t, +1], b1 = x[tok][k0 + 2t + 8, +9], tok = nb*8 + g
+    auto load_x = [&](int c, uint32_t (&xb)[NT][8][2]) {
+        #pragma unroll
+        for (int nb = 0; nb < NT; ++nb) {
+            const int tok = nb * 8 + g;
+            const __nv_bfloat16* xr = X + (size_t)(tok < m ? tok : 0) * ldx + (c0 + c) * W12_KC + 2 * t;
+            #pragma unroll
+            for (int st = 0; st < 8; ++st) {
+                uint32_t v0 = 0u, v1 = 0u;
+                if (tok < m) {
+                    v0 = __ldg(reinterpret_cast<const uint32_t*>(xr + st * 16));
+                    v1 = __ldg(reinterpret_cast<const uint32_t*>(xr + st * 16 + 8));
+                }
+                xb[nb][st][0] = v0; xb[nb][st][1] = v1;
+            }
+        }
+    };
+
+    float acc[NT * CH][4];
+    #pragma unroll
+    for (int n = 0; n < NT * CH; ++n)
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) acc[n][q] = 0.f;
+
+    #pragma unroll
+    for (int st = 0; st < NST - 1; ++st) {
+        if (st < NCW) issue(st, st);
+        cp_async_commit();
+    }
+    uint32_t xb[2][NT][8][2];
+    load_x(0, xb[0]);
+    for (int c = 0; c < NCW; ++c) {
+        if (c + 1 < NCW) load_x(c + 1, xb[(c + 1) & 1]);               // prefetch next chunk's B fragments
+        cp_async_wait<NST - 2>();
+        __syncwarp();
+        {
+            const int cn = c + NST - 1;
+            if (cn < NCW) issue(cn, cn % NST);
+            cp_async_commit();
+        }
+        const uint8_t* ws = w12b_smem + warp * (NST * W12_TILE_BYTES) + (c % NST) * W12_TILE_BYTES;
+        uint32_t (&xc)[NT][8][2] = xb[c & 1];
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            uint4 lo[2]; uint4 nbw;
+            lo[0] = *reinterpret_cast<const uint4*>(ws + (2 * h) * 512 + lane * 16);
+            lo[1] = *reinterpret_cast<const uint4*>(ws + (2 * h + 1) * 512 + lane * 16);
+            nbw = *reinterpret_cast<const uint4*>(ws + 2048 + h * 512 + lane * 16);
+            #pragma unroll
+            for (int ps = 0; ps < 2; ++ps) {
+                #pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const int si = 2 * ps + q, s_abs = 4 * h + si;
+                    const uint32_t L0 = q == 0 ? lo[ps].x : lo[ps].z, L1 = q == 0 ? lo[ps].y : lo[ps].w;
+                    const uint32_t Nw = si == 0 ? nbw.x : si == 1 ? nbw.y : si == 2 ? nbw.z : nbw.w;
+                    uint32_t a0, a1, a2, a3;
+                    decode4(L0, Nw & 0xFFFFu, lut0, lut1, a0, a1);
+                    decode4(L1, Nw >> 16, lut0, lut1, a2, a3);
+                    #pragma unroll
+                    for (int nb = 0; nb < NT; ++nb)
+                        mma16816(acc[nb * CH + (CH == 2 ? q : 0)], a0, a1, a2, a3, xc[nb][s_abs][0], xc[nb][s_abs][1]);
+                }
+            }
+        }
+        __syncwarp();                                                   // all lanes done with this ring slot
+    }
+    cp_async_wait<0>();
+    if (CH == 2) {
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) acc[0][q] += acc[1][q];
+    }
+    // reduce the W warps' accumulators through smem: red[row][tok]
+    for (int i = tid; i < 16 * 33; i += W * 32) (&red[0][0])[i] = 0.f;
+    __syncthreads();
+    #pragma unroll
+    for (int nb = 0; nb < NT; ++nb)
+        #pragma unroll
+        for (int hr = 0; hr < 2; ++hr)
+            #pragma unroll
+            for (int cc = 0; cc < 2; ++cc) {
+                const int tok = nb * 8 + 2 * t + cc;
+                if (tok < m) atomicAdd(&red[g + 8 * hr][tok], acc[nb * CH][2 * hr + cc]);
+            }
+    __syncthreads();
+    // escapes of this tile's rows: pack tile = tile / 2, local rows [16 * (tile & 1), +16)
+    const int pt = tile >> 1, rbase = 16 * (tile & 1);
+    const int e0 = esc_off[pt], ecnt = esc_off[pt + 1] - e0;
+    for (int idx = tid; idx < ecnt * m; idx += W * 32) {
+        const int e = e0 + idx / m, i = idx - (idx / m) * m;
+        const int nl = esc_n[e] - rbase;
+        if (nl >= 0 && nl < 16) atomicAdd(&red[nl][i], esc_d[e] * __bfloat162float(X[(size_t)i * ldx + esc_k[e]]));
+    }
+    __syncthreads();
+    for (int idx = tid; idx < 16 * m; idx += W * 32) {
+        const int n = idx & 15, i = idx >> 4;
+        out[(size_t)i * ldo + tile * 16 + n] = __float2bfloat16(red[n][i]);
+    }
+}
+
+template <int NT, int W, int NST>
+void launch_w12b(const __nv_bfloat16* X, int ldx, int m, const uint8_t* Wt, int eb, const int* eo, const int* en, const int* ek, const float* ed,
+                 __nv_bfloat16* out, int ldo, int N, int K, cudaStream_t stream)
+{
+    constexpr int smem = W * NST * W12_TILE_BYTES;
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(w12b_kernel<NT, W, NST>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    w12b_kernel<NT, W, NST><<<N / 16, W * 32, smem, stream>>>(X, ldx, m, Wt, eb, eo, en, ek, ed, out, ldo, N, K);
+}
+
 } // namespace
 
 void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t threads, int64_t unroll)
@@ -1729,6 +2118,72 @@ void mma12cp(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, to
         default: TORCH_CHECK(false, "unsupported mma12cp config");
     }
 }
+
+void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
+         torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t nstage, int64_t sk, int64_t mode)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(n % 64 == 0 && k % 128 == 0 && (k / 128) % sk == 0 && m <= 8 * nt && m <= 32, "w12: shape/config mismatch");
+    TORCH_CHECK(X.stride(1) == 1 && (X.stride(0) * 2) % 16 == 0 && (reinterpret_cast<uintptr_t>(X.data_ptr()) & 15) == 0, "w12: x must be 16 B aligned rows");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(W.data_ptr()) & 127) == 0, "w12: weight layout must be 128 B aligned");
+    TORCH_CHECK(sk * m * n <= part.numel() && n / 64 <= cnt.numel(), "w12: workspace too small");
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const uint8_t* Wp = reinterpret_cast<const uint8_t*>(W.data_ptr());
+    float* pp = part.data_ptr<float>();
+    const int ldx = (int)X.stride(0);
+    W12Args a{esc_off.data_ptr<int>(), esc_n.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
+              reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), (int)out.stride(0), cnt.data_ptr<int>(), (int)(mode >= 4 ? mode : 0)};
+    if (mode == 3) {   // loads-only ablation of the GEMM (4 stages, K split)
+        if (nt == 1) launch_w12<1, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
+        else if (nt == 2) launch_w12<2, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
+        else launch_w12<4, 4, true, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
+        return;
+    }
+    if (mode == 2) {   // GEMM only (no epilogue; output not written), 4 stages, K split
+        if (nt == 1) launch_w12<1, 4, true, 2>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
+        else if (nt == 2) launch_w12<2, 4, true, 2>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
+        else launch_w12<4, 4, true, 2>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, a, stream);
+        return;
+    }
+#define OKC_W12(T, NS, SK) launch_w12<T, NS, SK>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, SK ? (int)sk : 1, a, stream)
+    const int key = (int)nt * 100 + (int)nstage * 10 + (sk > 1 ? 1 : 0);
+    switch (key) {
+        case 140: OKC_W12(1, 4, false); break;  case 141: OKC_W12(1, 4, true); break;
+        case 180: OKC_W12(1, 8, false); break;  case 181: OKC_W12(1, 8, true); break;
+        case 240: OKC_W12(2, 4, false); break;  case 241: OKC_W12(2, 4, true); break;
+        case 220: OKC_W12(2, 2, false); break;  case 221: OKC_W12(2, 2, true); break;
+        case 440: OKC_W12(4, 4, false); break;  case 441: OKC_W12(4, 4, true); break;
+        case 420: OKC_W12(4, 2, false); break;  case 421: OKC_W12(4, 2, true); break;
+        default: TORCH_CHECK(false, "unsupported w12 config (nt, nstage, sk)");
+    }
+#undef OKC_W12
+}
+
+void w12b(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
+          torch::Tensor out, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t warps, int64_t nst)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(n % 64 == 0 && k % 128 == 0 && (k / 128) % warps == 0 && (k / 128) / warps >= 1 && m <= 8 * nt && m <= 32, "w12b: shape/config mismatch");
+    TORCH_CHECK(X.stride(1) == 1 && (X.stride(0) * 2) % 16 == 0 && (reinterpret_cast<uintptr_t>(X.data_ptr()) & 15) == 0, "w12b: x must be 16 B aligned rows");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(W.data_ptr()) & 127) == 0, "w12b: weight layout must be 128 B aligned");
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const uint8_t* Wp = reinterpret_cast<const uint8_t*>(W.data_ptr());
+    __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int* eo = esc_off.data_ptr<int>(); const int* en = esc_n.data_ptr<int>(); const int* ek = esc_k.data_ptr<int>(); const float* ed = esc_d.data_ptr<float>();
+    const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
+#define OKC_B(T, WW, NS) launch_w12b<T, WW, NS>(Xp, ldx, (int)m, Wp, (int)eb, eo, en, ek, ed, op, ldo, (int)n, (int)k, stream)
+    const int key = (int)nt * 1000 + (int)warps * 10 + (int)nst;
+    switch (key) {
+        case 1042: OKC_B(1, 4, 2); break;   case 1043: OKC_B(1, 4, 3); break;
+        case 1082: OKC_B(1, 8, 2); break;   case 1083: OKC_B(1, 8, 3); break;
+        case 1162: OKC_B(1, 16, 2); break;  case 1163: OKC_B(1, 16, 3); break;
+        case 2042: OKC_B(2, 4, 2); break;   case 2082: OKC_B(2, 8, 2); break;  case 2083: OKC_B(2, 8, 3); break;
+        case 2162: OKC_B(2, 16, 2); break;
+        case 4082: OKC_B(4, 8, 2); break;   case 4042: OKC_B(4, 4, 2); break;
+        default: TORCH_CHECK(false, "unsupported w12b config (nt, warps, nst)");
+    }
+#undef OKC_B
+}
 """
 
 PROJ_CPP_SRC = """
@@ -1741,6 +2196,10 @@ void tgemv(torch::Tensor X, torch::Tensor Wt, torch::Tensor out, torch::Tensor p
 void gemv12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t warps, int64_t unroll, int64_t sk);
 void mma12(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t unroll, int64_t sk);
 void mma12cp(torch::Tensor X, torch::Tensor LO, torch::Tensor NB, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d, torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t mt, int64_t rpw, int64_t nstage, int64_t sk);
+void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
+         torch::Tensor out, torch::Tensor part, torch::Tensor cnt, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t nstage, int64_t sk, int64_t mode);
+void w12b(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
+          torch::Tensor out, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t warps, int64_t nst);
 """
 
 _PROJ_EXT = None
@@ -1753,7 +2212,7 @@ def _proj_build():
         _PROJ_EXT = load_inline(
             name="okc_proj_cuda11", cpp_sources=[PROJ_CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + PROJ_CUDA_SRC],
-            functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12", "mma12", "mma12cp"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
+            functions=["stream_bytes", "gemv", "skinny_mma", "tgemv", "gemv12", "mma12", "mma12cp", "w12", "w12b"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
     return _PROJ_EXT
 
 
@@ -1797,6 +2256,52 @@ def mma12_usable(m: int, n: int, k: int, mt: int, rpw: int, unroll: int, sk: int
     if kt % (sk * ks):
         return False
     return (kt // sk // ks * 4) % unroll == 0
+
+
+def w12b_usable(m: int, n: int, k: int, nt: int, warps: int, nst: int) -> bool:
+    return m <= 8 * nt and m <= 32 and n % 64 == 0 and k % 128 == 0 and (k // 128) % warps == 0
+
+
+def w12_usable(m: int, n: int, k: int, nt: int, nstage: int, sk: int) -> bool:
+    return m <= 8 * nt and n % 64 == 0 and k % 128 == 0 and (k // 128) % sk == 0 and (k // 128) // sk >= 1
+
+
+def _repack_w12(pk, n: int, k: int) -> torch.Tensor:
+    """_pack12 codes (same bits, same escapes) in the w12 kernel's fragment order: uint8 [n/64, k/128, 4, 3072]:
+    per (m16 tile, chunk) low bytes [4 quads][32 lanes][16 B] (quad q = steps 2q, 2q+1; per step L0 = rows g, g+8
+    at k 2t, 2t+1 then L1 at k 2t+8, 2t+9) and nibbles [2 halves][32 lanes][16 B] (per step one word, nibble i =
+    element i of the L0, L1 order)."""
+    dev = pk["lo"].device
+    bn, bk = 32, int(pk["lo"].shape[1])                                                 # _pack12's tile shape
+    lo = pk["lo"].view(n // bn, k // bk, bn, bk).permute(0, 2, 1, 3).reshape(n, k)
+    nb = pk["nib"].view(n // bn, k // bk, bn, bk // 2).permute(0, 2, 1, 3).reshape(n, k // 2)
+    nib = torch.stack((nb & 0xF, nb >> 4), -1).reshape(n, k)                            # [n, k] uint8 codes
+    NTL, NC = n // 16, k // 128
+    t = torch.arange(4, device=dev)
+    kidx = torch.stack([2 * t, 2 * t + 1, 2 * t + 8, 2 * t + 9], -1)                 # [t, 4]
+    out = torch.empty((NTL, NC, 3072), dtype=torch.uint8, device=dev)
+    for part_lo in (True, False):
+        src = lo if part_lo else nib
+        s6 = src.view(NTL, 2, 8, NC, 8, 16)                                             # tile, rh, g, chunk, step, k16
+        sel = s6[..., kidx]                                                             # tile, rh, g, chunk, step, t, q
+        # element order: L0 = (rh0,q0),(rh0,q1),(rh1,q0),(rh1,q1); L1 = (rh0,q2),(rh0,q3),(rh1,q2),(rh1,q3)
+        e = torch.stack([sel[:, 0, :, :, :, :, 0], sel[:, 0, :, :, :, :, 1], sel[:, 1, :, :, :, :, 0], sel[:, 1, :, :, :, :, 1],
+                         sel[:, 0, :, :, :, :, 2], sel[:, 0, :, :, :, :, 3], sel[:, 1, :, :, :, :, 2], sel[:, 1, :, :, :, :, 3]], -1)
+        # e: [tile, g, chunk, step, t, 8]
+        e = e.permute(0, 2, 3, 1, 4, 5)                                                 # tile, chunk, step, g, t, 8 -> lane = g*4+t
+        if part_lo:
+            # [tile, chunk, step, lane, 8 B] -> quads: [tile, chunk, 4, 2 steps, lane, 8 B] -> [.., 4, lane, 16 B]
+            w = e.reshape(NTL, NC, 4, 2, 32, 8).permute(0, 1, 2, 4, 3, 5).reshape(NTL, NC, 2048)
+            out[:, :, :2048] = w
+        else:
+            v = e.to(torch.int32)
+            word = torch.zeros((NTL, NC, 8, 32), dtype=torch.int32, device=dev)
+            for i in range(8):
+                word |= v[..., i].reshape(NTL, NC, 8, 32) << (4 * i)
+            # [tile, chunk, step, lane] -> halves: [tile, chunk, 2, 4 steps, lane] -> [.., 2, lane, 4 words]
+            w = word.view(NTL, NC, 2, 4, 32).permute(0, 1, 2, 4, 3).contiguous().view(torch.uint8).reshape(NTL, NC, 1024)
+            out[:, :, 2048:] = w
+    return out.view(NTL // 4, 4, NC, 3072).permute(0, 2, 1, 3).contiguous()           # [n/64, chunk, slot, 3 KB]
 
 
 def mma12cp_usable(m: int, n: int, k: int, mt: int, rpw: int, nstage: int, sk: int) -> bool:
@@ -1874,6 +2379,7 @@ EXTRA_PACKS = {
 }
 USE_TILED = True
 USE_PACK12 = True   # also keep the 12-bit packing of the BF16 layers (the kernels that use it: *_SHAPES tables)
+USE_W12 = True      # the w12 fragment-ordered copy of the 12-bit packing (W12_SHAPES)
 USE_TMA = False  # fetch tiles with TMA descriptors (box inner dim <= 256 elements)
 
 
@@ -1896,6 +2402,11 @@ G12_SHAPES = {("pooler", 4096, 1): (8, 1, 4), ("qkv_gate", 2304, 1): (8, 1, 8)} 
 M12_SHAPES = {}
 # (layer, n, m) -> (mt, rpw, nstage, sk): the cp.async-staged 12-bit mma GEMM (m <= 32)
 M12CP_SHAPES = {}
+# w12: the MoE-style weights-as-M 12-bit GEMM: (layer, n, m) -> (nt, nstage, sk); empty until the judge shows a win
+W12_SHAPES = {}
+# w12b: single-launch form (16-row tile per CTA, W warps over K slices): (layer, n, m) -> (nt, warps, nst)
+W12B_SHAPES = {}   # w12 ties the table at m=8 on the judge (check a6b2bd96: pooler 18.34 vs 18.18, qkv 14.36 vs 14.28) and loses at
+# m=16/32 stay on the table (the w12 GEMM alone is at the memory wall, ~13-17 us, but its K-split reduce launch costs 3-5 us)
 # (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
 T12_SHAPES = {}
 T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
@@ -1935,6 +2446,12 @@ def _config(layer: str, m: int, n: int, k: int):
     if (layer, n, m) in M12CP_SHAPES:
         mt, rpw, nstage, sk = M12CP_SHAPES[(layer, n, m)]
         return dict(m12cp=True, mt=mt, rpw=rpw, nstage=nstage, sk=sk)
+    if (layer, n, m) in W12_SHAPES:
+        nt, nstage, sk = W12_SHAPES[(layer, n, m)]
+        return dict(w12=True, nt=nt, nstage=nstage, sk=sk)
+    if (layer, n, m) in W12B_SHAPES:
+        nt, warps, nst = W12B_SHAPES[(layer, n, m)]
+        return dict(w12b=True, nt=nt, warps=warps, nst=nst)
     if (layer, n, m) in T12_SHAPES:
         sk, nw, ns = T12_SHAPES[(layer, n, m)]
         return dict(t12=True, BLOCK_M=_block_m(m), BLOCK_N=32, BLOCK_K=256, SPLIT_K=sk, num_warps=nw, num_stages=ns)
@@ -2039,6 +2556,10 @@ def _usable(cfg, m: int, n: int, k: int) -> bool:
         return gemv12_usable(m, n, k, cfg["warps"], cfg["unroll"], cfg["sk"])
     if cfg.get("m12cp"):
         return mma12cp_usable(m, n, k, cfg["mt"], cfg["rpw"], cfg["nstage"], cfg["sk"]) and (cfg["sk"] == 1 or cfg["sk"] * 16 * cfg["mt"] * n <= PARTIALS_FLOATS)
+    if cfg.get("w12"):
+        return w12_usable(m, n, k, cfg["nt"], cfg["nstage"], cfg["sk"]) and cfg["sk"] * m * n <= PARTIALS_FLOATS
+    if cfg.get("w12b"):
+        return w12b_usable(m, n, k, cfg["nt"], cfg["warps"], cfg["nst"])
     if cfg.get("m12"):
         return mma12_usable(m, n, k, cfg["mt"], cfg["rpw"], cfg["unroll"], cfg["sk"]) and (cfg["sk"] == 1 or cfg["sk"] * 16 * cfg["mt"] * n <= PARTIALS_FLOATS)
     if cfg.get("t12"):
@@ -2101,6 +2622,12 @@ def _proj_state(weights) -> dict:
             if pk is not None:
                 pk["lo32"] = pk["lo"].view(torch.int32)      # [tiles * 32, 64]
                 pk["nib16"] = pk["nib"].view(torch.int16)    # [tiles * 32, 64]
+                if USE_W12:
+                    try:
+                        nn_, kk_ = state[name].shape
+                        state[name + "_w12"] = _repack_w12(pk, nn_, kk_)
+                    except Exception as e:
+                        print("w12 repack failed for", name, repr(e)[:120])
             state[name + "_p12"] = pk
     return state
 
@@ -2158,6 +2685,22 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
             m, n, k, x.stride(0), out.stride(0), pk["eb"],
             BLOCK_M=cfg["BLOCK_M"], SPLIT_K=cfg["SPLIT_K"], ASM=T12_ASM, INTERP=T12_INTERP,
             num_warps=cfg["num_warps"], num_stages=cfg["num_stages"])
+        return out
+    if cfg.get("w12b"):
+        pk = state.get(layer + "_p12")
+        w12 = state.get(layer + "_w12")
+        if pk is None or w12 is None:
+            return _launch(x, w, w2, out, state, _triton_config(layer, m, n, k), m, n, k, layer)
+        _proj_build().w12b(x, w12, pk["eb"], pk["esc_off"], pk["esc_n"], pk["esc_k"], pk["esc_delta"], out,
+                     m, n, k, cfg["nt"], cfg["warps"], cfg["nst"])
+        return out
+    if cfg.get("w12"):
+        pk = state.get(layer + "_p12")
+        w12 = state.get(layer + "_w12")
+        if pk is None or w12 is None:
+            return _launch(x, w, w2, out, state, _triton_config(layer, m, n, k), m, n, k, layer)
+        _proj_build().w12(x, w12, pk["eb"], pk["esc_off"], pk["esc_n"], pk["esc_k"], pk["esc_delta"], out, state["partials"], state["counters"],
+                    m, n, k, cfg["nt"], cfg["nstage"], cfg["sk"], cfg.get("mode", 0))
         return out
     if cfg.get("m12cp"):
         pk = state.get(layer + "_p12")
@@ -2657,6 +3200,583 @@ def _attn_decode_kernel(
             _finish(qkv_ptr, out_ptr, acc1 / l1[:, None], tok, g, hh, rmask, h0 + 1, QKV_W, HQ, HKV, GROUP, D, DW)
 
 
+# == BEGIN CUDA SLIDING ==
+CUDA_SLIDING_SRC = r"""
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <cuda_fp8.h>
+#include <cooperative_groups.h>
+#include <cstdint>
+namespace cg = cooperative_groups;
+
+// Sliding-window gated attention for one decode / verify step: a cluster of four CTAs per
+// (request, KV head), each owning 512 of the 2048 window slots with 8 warps x 64 keys.
+//   trip 1: every load that depends on nothing (the request's length, the scales, the query rows,
+//           the block's new key/value rows; the gate rows are prefetched into L2);
+//   trip 2: each lane fetches the page indices of its rows (4 lanes per row), then every K and V
+//           row of the CTA goes out at once (cp.async, 16 B per lane, into a staging tile);
+//   the warps convert their own 64 K and V rows once to fp16 (swizzled 128-byte rows), run the
+//   softmax over their keys on mma.sync m16n8k16 with ldmatrix / ldmatrix.trans fragments, and
+//   merge their (m, l, acc) partials in shared memory (the staging tile, now free) together with
+//   the block's own new tokens; rank 0 combines the four CTAs over distributed shared memory and
+//   applies the gated RMSNorm. The phases around the hot loop are __noinline__ functions and the
+//   row-tile loop is rolled, so the loop body stays small in the instruction cache.
+// Every window key enters the softmax; nothing is skipped.
+
+#define D 64
+#define G 8                     // query heads per KV head
+#define WINDOW 2048
+#define NCTA 4
+#define NW 8
+#define NT (NW * 32)
+#define KEYS (WINDOW / NCTA)    // 512 slots per CTA, 64 per warp
+#define QS_STRIDE 72            // fp16 elements per Q row (padded: ldmatrix conflict free)
+#define RS 65                   // padded row stride (floats) of a 16 x 64 partial
+#define RED_W (32 + 16 * RS)    // floats per 16-row partial: 16 m, 16 l, 16 x RS acc
+#define NEG (-1.0e30f)
+
+__device__ __forceinline__ uint32_t smem_u32(const void* p) { return (uint32_t)__cvta_generic_to_shared(p); }
+__device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, int src_bytes) {
+    asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;" :: "r"(dst), "l"(src), "r"(src_bytes));
+}
+__device__ __forceinline__ void cp_async_commit() { asm volatile("cp.async.commit_group;"); }
+__device__ __forceinline__ void cp_async_wait_all() { asm volatile("cp.async.wait_all;" ::: "memory"); }
+__device__ __forceinline__ void prefetch_l2(const void* p) { asm volatile("prefetch.global.L2 [%0];" :: "l"(p)); }
+__device__ __forceinline__ uint32_t cvt_e4m3x2_f16x2(uint32_t pair) {
+    uint32_t r;
+    asm("{ .reg .b16 h; mov.b16 h, %1; cvt.rn.f16x2.e4m3x2 %0, h; }" : "=r"(r) : "h"((unsigned short)pair));
+    return r;
+}
+__device__ __forceinline__ void ldmatrix_x4(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ void ldmatrix_x4_trans(uint32_t addr, uint32_t& r0, uint32_t& r1, uint32_t& r2, uint32_t& r3) {
+    asm volatile("ldmatrix.sync.aligned.m8n8.x4.trans.shared.b16 {%0,%1,%2,%3}, [%4];"
+                 : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(addr));
+}
+__device__ __forceinline__ void mma16816(float* d, const uint32_t* a, uint32_t b0, uint32_t b1) {
+    asm volatile("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};"
+                 : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+                 : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b0), "r"(b1));
+}
+__device__ __forceinline__ uint32_t pack_f16x2(float lo, float hi) {
+    __half2 h = __floats2half2_rn(lo, hi);
+    return *reinterpret_cast<uint32_t*>(&h);
+}
+__device__ __forceinline__ float2 f16x2_to_f2(uint32_t v) {
+    __half2 h = *reinterpret_cast<__half2*>(&v);
+    return __half22float2(h);
+}
+// sin/cos of the RoPE angle x (fp32, as the reference computes it): the range reduction in double,
+// the evaluation with the hardware intrinsic (|r| <= pi: ~2^-21 absolute error; no local memory)
+__device__ __forceinline__ void sincos_fast(float x, float& sn, float& cs) {
+    const double two_pi = 6.283185307179586;
+    const double xd = (double)x;
+    const float r = (float)(xd - rint(xd / two_pi) * two_pi);
+    __sincosf(r, &sn, &cs);
+}
+// byte offset of 16-byte chunk `ch` of row `r` in the fp8 staging tile ([rows][64 B], swizzled)
+__device__ __forceinline__ uint32_t swz8(int r, int ch) { return (uint32_t)r * 64u + (uint32_t)((ch ^ ((r >> 1) & 3)) << 4); }
+// byte offset of 16-byte chunk `ch` (8 fp16) of row `r` in an fp16 tile ([rows][128 B], swizzled)
+__device__ __forceinline__ uint32_t swz16(int r, int ch) { return (uint32_t)r * 128u + (uint32_t)((ch ^ (r & 7)) << 4); }
+
+template <int L>
+struct SlidingSmem {
+    static constexpr int R = L * G, NRT = (R + 15) / 16, ROWS = NRT * 16;
+    static constexpr int STG = 0;                                  // fp8 staging: K rows then V rows (KEYS x 64 B each)
+    static constexpr int RED = STG;                                // after the conversion: NW x RED_W floats
+    static constexpr int FIN = RED + NW * RED_W * 4;               // NRT x RED_W floats
+    static constexpr int STG_BYTES = 2 * KEYS * 64;
+    static_assert(FIN + NRT * RED_W * 4 <= STG_BYTES, "merge buffers must fit the staging tile");
+    static constexpr int K16 = STG + STG_BYTES;                    // KEYS x 128 B fp16
+    static constexpr int V16 = K16 + KEYS * 128;                   // KEYS x 128 B fp16
+    static constexpr int QS = V16 + KEYS * 128;                    // ROWS x QS_STRIDE fp16
+    static constexpr int SNEW = QS + ROWS * QS_STRIDE * 2;         // ROWS x L floats
+    static constexpr int VNEW = SNEW + ROWS * L * 4;               // L x 64 floats (raw e4m3 values)
+    static constexpr int KNEW = VNEW + L * D * 4;                  // L x 64 floats
+    static constexpr int BYTES = KNEW + L * D * 4;
+};
+
+struct Geo {                                   // what every phase needs
+    const __nv_bfloat16* qkv; __nv_bfloat16* out;
+    int b, h, seq, HQ, HKV, QKV_W, rank, abl;
+    float qk_scale, k_scale, v_scale, sm_scale_log2, log2_theta;
+};
+
+// ---- prep: queries (RMSNorm x qk_scale x k_scale, RoPE) -> fp16 Qs; the block's new keys/values ----
+template <int L>
+__device__ __noinline__ void prep_phase(const Geo& geo, __half* Qs, float* knew, float* vnew, uint8_t* k_cache, uint8_t* v_cache,
+                                        const int64_t* cache_loc) {
+    using S = SlidingSmem<L>;
+    constexpr int R = S::R, ROWS = S::ROWS;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int ROW_W = geo.HKV * D;
+    const float inv_freq = exp2f(-(2.0f * lane / D) * geo.log2_theta);   // this lane's RoPE pair (dims 2*lane, 2*lane+1)
+    for (int r = warp; r < ROWS; r += NW) {
+        float x0 = 0.f, x1 = 0.f;
+        const int j = r / G, qh = geo.h * G + (r % G);
+        if (r < R && !(geo.abl & 16)) {
+            const __nv_bfloat16* qp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + qh * D + 2 * lane;
+            x0 = __bfloat162float(qp[0]);
+            x1 = __bfloat162float(qp[1]);
+        }
+        float ss = x0 * x0 + x1 * x1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float inv = rsqrtf(ss / D + 1e-5f) * geo.qk_scale * geo.k_scale;
+        x0 *= inv; x1 *= inv;
+        float sn, cs;
+        sincos_fast((float)(geo.seq + j) * inv_freq, sn, cs);
+        *reinterpret_cast<__half2*>(Qs + r * QS_STRIDE + 2 * lane) = __floats2half2_rn(x0 * cs - x1 * sn, x0 * sn + x1 * cs);
+    }
+    if (warp < L) {
+        const int j = warp;
+        float x0 = 0.f, x1 = 0.f, y0v = 0.f, y1v = 0.f;
+        if (!(geo.abl & 16)) {
+            const __nv_bfloat16* kp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + (geo.HQ + geo.h) * D + 2 * lane;
+            const __nv_bfloat16* vp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + (geo.HQ + geo.HKV + geo.h) * D + 2 * lane;
+            x0 = __bfloat162float(kp[0]); x1 = __bfloat162float(kp[1]);
+            y0v = __bfloat162float(vp[0]); y1v = __bfloat162float(vp[1]);
+        }
+        float ss = x0 * x0 + x1 * x1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float inv = rsqrtf(ss / D + 1e-5f);
+        x0 *= inv; x1 *= inv;
+        float sn, cs;
+        sincos_fast((float)(geo.seq + j) * inv_freq, sn, cs);
+        const float y0 = x0 * cs - x1 * sn, y1 = x0 * sn + x1 * cs;
+        __nv_fp8x2_e4m3 k8(make_float2(y0 / geo.k_scale, y1 / geo.k_scale));
+        __nv_fp8x2_e4m3 v8(make_float2(y0v / geo.v_scale, y1v / geo.v_scale));
+        const uint16_t kb = k8.__x, vb = v8.__x;
+        // the raw E4M3 values the cache will hold (what the reference attends to)
+        const float2 kk = f16x2_to_f2(cvt_e4m3x2_f16x2(kb)), vv = f16x2_to_f2(cvt_e4m3x2_f16x2(vb));
+        knew[j * D + 2 * lane] = kk.x; knew[j * D + 2 * lane + 1] = kk.y;
+        vnew[j * D + 2 * lane] = vv.x; vnew[j * D + 2 * lane + 1] = vv.y;
+        if (geo.rank == 0) {
+            const int64_t loc = cache_loc[geo.b * L + j];
+            *reinterpret_cast<uint16_t*>(k_cache + loc * ROW_W + geo.h * D + 2 * lane) = kb;
+            *reinterpret_cast<uint16_t*>(v_cache + loc * ROW_W + geo.h * D + 2 * lane) = vb;
+        }
+    }
+}
+
+// ---- scores of the block's own tokens: snew[r][jj] = q_r . knew[jj] (causal), log2 domain ----
+template <int L>
+__device__ __noinline__ void snew_phase(const Geo& geo, const __half* Qs, const float* knew, float* snew) {
+    using S = SlidingSmem<L>;
+    constexpr int R = S::R, ROWS = S::ROWS;
+    for (int idx = threadIdx.x; idx < ROWS * L; idx += NT) {
+        const int r = idx / L, jj = idx % L;
+        float sc = NEG;
+        if (r < R && jj <= r / G && !(geo.abl & 8)) {
+            float a = 0.f;
+            #pragma unroll 8
+            for (int d = 0; d < D; d++) a += __half2float(Qs[r * QS_STRIDE + d]) * knew[jj * D + d];
+            sc = a * geo.sm_scale_log2;
+        }
+        snew[idx] = sc;
+    }
+}
+
+// ---- the warp's 64 K and V rows -> fp16 tiles (each lane 2 rows) ----
+__device__ __noinline__ void convert_phase(uint32_t k8_base, uint32_t v8_base, uint32_t k16_base, uint32_t v16_base) {
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, wrow0 = warp * 64;
+    #pragma unroll
+    for (int i = 0; i < 2; i++) {
+        const int r = wrow0 + lane + i * 32;
+        #pragma unroll
+        for (int kv = 0; kv < 2; kv++) {
+            const uint32_t src = (kv == 0 ? k8_base : v8_base);
+            const uint32_t dst = (kv == 0 ? k16_base : v16_base);
+            #pragma unroll
+            for (int c8 = 0; c8 < 4; c8++) {         // 16 B of fp8 -> 32 B of fp16 (two 16 B chunks)
+                uint4 w;
+                asm volatile("ld.shared.v4.b32 {%0,%1,%2,%3}, [%4];" : "=r"(w.x), "=r"(w.y), "=r"(w.z), "=r"(w.w) : "r"(src + swz8(r, c8)));
+                uint4 o0, o1;
+                o0.x = cvt_e4m3x2_f16x2(w.x & 0xffffu); o0.y = cvt_e4m3x2_f16x2(w.x >> 16);
+                o0.z = cvt_e4m3x2_f16x2(w.y & 0xffffu); o0.w = cvt_e4m3x2_f16x2(w.y >> 16);
+                o1.x = cvt_e4m3x2_f16x2(w.z & 0xffffu); o1.y = cvt_e4m3x2_f16x2(w.z >> 16);
+                o1.z = cvt_e4m3x2_f16x2(w.w & 0xffffu); o1.w = cvt_e4m3x2_f16x2(w.w >> 16);
+                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8)), "r"(o0.x), "r"(o0.y), "r"(o0.z), "r"(o0.w));
+                asm volatile("st.shared.v4.b32 [%0], {%1,%2,%3,%4};" :: "r"(dst + swz16(r, 2 * c8 + 1)), "r"(o1.x), "r"(o1.y), "r"(o1.z), "r"(o1.w));
+            }
+        }
+    }
+}
+
+// ---- merge the warps' partials of one row tile (+ the block's own tokens on rank 0) -> fin[rt] ----
+template <int L>
+__device__ __noinline__ void merge_phase(const Geo& geo, int rt, const float* red, const float* snew, const float* vnew, float* F) {
+    const bool own_new = (geo.rank == 0);
+    const int tid = threadIdx.x;
+    #pragma unroll 1
+    for (int k = 0; k < (16 * D) / NT; k++) {
+        const int idx = tid + k * NT, r = idx / D, d = idx % D;
+        float M = NEG;
+        #pragma unroll
+        for (int ww = 0; ww < NW; ww++) M = fmaxf(M, red[ww * RED_W + r]);
+        if (own_new) for (int jj = 0; jj < L; jj++) M = fmaxf(M, snew[(rt * 16 + r) * L + jj]);
+        float O = 0.f, Ls = 0.f;
+        #pragma unroll
+        for (int ww = 0; ww < NW; ww++) {
+            const float w = exp2f(red[ww * RED_W + r] - M);
+            Ls += w * red[ww * RED_W + 16 + r];
+            O += w * red[ww * RED_W + 32 + r * RS + d];
+        }
+        if (own_new) {
+            for (int jj = 0; jj < L; jj++) {
+                const float w = exp2f(snew[(rt * 16 + r) * L + jj] - M);
+                Ls += w;
+                O += w * vnew[jj * D + d];
+            }
+        }
+        F[32 + r * RS + d] = O;
+        if (d == 0) { F[r] = M; F[16 + r] = Ls; }
+    }
+}
+
+// ---- rank 0: combine the four CTAs' partials over distributed shared memory ----
+template <int L>
+__device__ __noinline__ void combine_phase(float* fin, float* cw) {
+    using S = SlidingSmem<L>;
+    constexpr int NRT = S::NRT;
+    cg::cluster_group cluster = cg::this_cluster();
+    const float* P1 = cluster.map_shared_rank(fin, 1);
+    const float* P2 = cluster.map_shared_rank(fin, 2);
+    const float* P3 = cluster.map_shared_rank(fin, 3);
+    const int tid = threadIdx.x;
+    if (tid < NRT * 16) {
+        const int rt = tid / 16, r = tid % 16, off = rt * RED_W;
+        const float M0 = fin[off + r], M1 = P1[off + r], M2 = P2[off + r], M3 = P3[off + r];
+        const float L0 = fin[off + 16 + r], L1 = P1[off + 16 + r], L2 = P2[off + 16 + r], L3 = P3[off + 16 + r];
+        const float M = fmaxf(fmaxf(M0, M1), fmaxf(M2, M3));
+        const float w0 = exp2f(M0 - M), w1 = exp2f(M1 - M), w2 = exp2f(M2 - M), w3 = exp2f(M3 - M);
+        cw[tid * 4 + 0] = w0; cw[tid * 4 + 1] = w1; cw[tid * 4 + 2] = w2; cw[tid * 4 + 3] = w3;
+        fin[off + r] = M;
+        fin[off + 16 + r] = L0 * w0 + L1 * w1 + L2 * w2 + L3 * w3;
+    }
+    __syncthreads();
+    #pragma unroll 1
+    for (int k = 0; k < (NRT * 16 * D) / NT; k++) {
+        const int idx = tid + k * NT, rt = idx / (16 * D), rem = idx % (16 * D), r = rem / D, d = rem % D;
+        const int off = rt * RED_W, e = off + 32 + r * RS + d, wi = (rt * 16 + r) * 4;
+        fin[e] = fin[e] * cw[wi] + P1[e] * cw[wi + 1] + P2[e] * cw[wi + 2] + P3[e] * cw[wi + 3];
+    }
+}
+
+// ---- epilogue: o = O / L x v_scale; per-head RMSNorm x sigmoid(gate) -> bf16 ----
+template <int L>
+__device__ __noinline__ void epilogue_phase(const Geo& geo, const float* fin) {
+    using S = SlidingSmem<L>;
+    constexpr int R = S::R;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
+    for (int r = warp; r < R; r += NW) {
+        const float* F = fin + (r / 16) * RED_W;
+        const int rr = r % 16;
+        const float inv = geo.v_scale / F[16 + rr];
+        const float o0 = F[32 + rr * RS + lane] * inv, o1 = F[32 + rr * RS + lane + 32] * inv;
+        float ss = o0 * o0 + o1 * o1;
+        #pragma unroll
+        for (int o = 16; o > 0; o >>= 1) ss += __shfl_xor_sync(0xffffffffu, ss, o);
+        const float sc = rsqrtf(ss / D + 1e-5f);
+        const int j = r / G, qh = geo.h * G + (r % G);
+        const __nv_bfloat16* gp = geo.qkv + ((int64_t)(geo.b * L + j)) * geo.QKV_W + (geo.HQ + 2 * geo.HKV + qh) * D;
+        const float g0 = __bfloat162float(gp[lane]), g1 = __bfloat162float(gp[lane + 32]);
+        __nv_bfloat16* op = geo.out + ((int64_t)(geo.b * L + j)) * geo.HQ * D + qh * D;
+        op[lane] = __float2bfloat16(o0 * sc / (1.f + expf(-g0)));
+        op[lane + 32] = __float2bfloat16(o1 * sc / (1.f + expf(-g1)));
+    }
+}
+
+template <int L>
+__global__ void __launch_bounds__(NT, 1)
+sliding_attn_kernel(const __nv_bfloat16* __restrict__ qkv, const int64_t* __restrict__ cache_loc,
+                    const int* __restrict__ seq_lens, const int* __restrict__ page_table,
+                    uint8_t* __restrict__ k_cache, uint8_t* __restrict__ v_cache,
+                    const float* __restrict__ k_scale_p, const float* __restrict__ v_scale_p,
+                    __nv_bfloat16* __restrict__ out, int HQ, int HKV, int max_pages, int PS,
+                    float qk_scale, float sm_scale_log2, float log2_theta, int abl) {
+    using S = SlidingSmem<L>;
+    constexpr int R = S::R, NRT = S::NRT;
+    const int QKV_W = (2 * HQ + 2 * HKV) * D;
+    const int ROW_W = HKV * D;                   // one cache row (all KV heads) in bytes
+
+    extern __shared__ __align__(128) uint8_t smem[];
+    uint8_t* K8 = smem + S::STG;
+    uint8_t* V8 = K8 + KEYS * 64;
+    float* red = reinterpret_cast<float*>(smem + S::RED);
+    float* fin = reinterpret_cast<float*>(smem + S::FIN);
+    __half* Qs = reinterpret_cast<__half*>(smem + S::QS);
+    float* snew = reinterpret_cast<float*>(smem + S::SNEW);
+    float* vnew = reinterpret_cast<float*>(smem + S::VNEW);
+    float* knew = reinterpret_cast<float*>(smem + S::KNEW);
+    const uint32_t k8_base = smem_u32(K8), v8_base = smem_u32(V8);
+    const uint32_t k16_base = smem_u32(smem + S::K16), v16_base = smem_u32(smem + S::V16);
+    const uint32_t qs_base = smem_u32(Qs);
+    __shared__ int s_seq;
+
+    cg::cluster_group cluster = cg::this_cluster();
+    const int rank = (int)cluster.block_rank();
+    const int cid = blockIdx.x / NCTA;
+    const int b = cid / HKV, h = cid % HKV;
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const int g = lane >> 2, c = lane & 3;
+
+    // ---- trip 1: the request's length and the scales; warm the L2 with the gate rows ----
+    if (tid == 0) s_seq = seq_lens[b];
+    const float k_scale = *k_scale_p, v_scale = *v_scale_p;
+    for (int r = tid; r < R; r += NT) {
+        const int j = r / G, qh = h * G + (r % G);
+        prefetch_l2(qkv + ((int64_t)(b * L + j)) * QKV_W + (HQ + 2 * HKV + qh) * D);
+    }
+    __syncthreads();
+    const int seq = s_seq;
+    const int lo = max(seq - (WINDOW - 1), 0);
+    const int n = seq - lo;                      // window keys (<= 2047): slots 0..n-1 <-> positions lo..seq-1
+    const int slot0 = rank * KEYS;               // this CTA's first slot
+    const int wrow0 = warp * 64;                 // this warp's first row (slot within the CTA)
+    Geo geo;
+    geo.qkv = qkv; geo.out = out; geo.b = b; geo.h = h; geo.seq = seq; geo.HQ = HQ; geo.HKV = HKV; geo.QKV_W = QKV_W;
+    geo.rank = rank; geo.abl = abl; geo.qk_scale = qk_scale; geo.k_scale = k_scale; geo.v_scale = v_scale;
+    geo.sm_scale_log2 = sm_scale_log2; geo.log2_theta = log2_theta;
+
+    // ---- trip 2: page indices of this warp's 64 rows (4 lanes per row), then every K and V row ----
+    const int ch = lane & 3;
+    int pg[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++) {
+        const int slot = slot0 + wrow0 + i * 8 + (lane >> 2);
+        pg[i] = (slot < n) ? page_table[(int64_t)b * max_pages + (lo + slot) / PS] : 0;
+    }
+    if (!(abl & 1)) {
+        #pragma unroll
+        for (int i = 0; i < 8; i++) {
+            const int r = wrow0 + i * 8 + (lane >> 2);
+            const int slot = slot0 + r;
+            const bool ok = slot < n;
+            const int64_t row = (int64_t)pg[i] * PS + ((lo + slot) % PS);
+            cp_async16(k8_base + swz8(r, ch), k_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
+            cp_async16(v8_base + swz8(r, ch), v_cache + row * ROW_W + h * D + 16 * ch, ok ? 16 : 0);
+        }
+    }
+    cp_async_commit();
+
+    // ---- meanwhile: the queries and the block's new keys/values ----
+    if (!(abl & 8)) prep_phase<L>(geo, Qs, knew, vnew, k_cache, v_cache, cache_loc);
+    __syncthreads();
+    snew_phase<L>(geo, Qs, knew, snew);
+
+    // ---- K and V rows -> fp16 tiles ----
+    if (!(abl & 1)) cp_async_wait_all();
+    __syncthreads();                             // every lane's copies have landed
+    if (!(abl & 2)) convert_phase(k8_base, v8_base, k16_base, v16_base);
+    __syncthreads();                             // fp16 tiles complete; the staging tile is free for the merge buffers
+
+    // ---- the window: each warp its 64 keys, per 16-row tile (rolled: one body in the instruction cache) ----
+    const int wslot0 = slot0 + wrow0;            // global slot of this warp's first key
+    #pragma unroll 1
+    for (int rt = 0; rt < ((abl & 32) ? 0 : NRT); rt++) {
+        float m_run[2] = {NEG, NEG}, l_run[2] = {0.f, 0.f};
+        float acc[8][4];
+        #pragma unroll
+        for (int i = 0; i < 8; i++) { acc[i][0] = acc[i][1] = acc[i][2] = acc[i][3] = 0.f; }
+        if (!(abl & 2)) {
+            // each row's first valid slot (the window's edge): rows rt*16 + g and + g + 8
+            const int first0 = n - (WINDOW - 1) + (rt * 16 + g) / G, first8 = n - (WINDOW - 1) + (rt * 16 + g + 8) / G;
+            // ---- S = Q K^T over the warp's 64 keys (8 n-tiles) ----
+            float s[8][4];
+            #pragma unroll
+            for (int i = 0; i < 8; i++) { s[i][0] = s[i][1] = s[i][2] = s[i][3] = 0.f; }
+            #pragma unroll
+            for (int ks = 0; ks < 4; ks++) {
+                uint32_t a[4];
+                {   // A: rows rt*16.., cols ks*16..: matrices (rows 0-7 | 8-15) x (cols 0-7 | 8-15)
+                    const int arow = rt * 16 + (lane & 7) + ((lane >> 3) & 1) * 8;
+                    const int acol = ks * 16 + (lane >> 4) * 8;
+                    ldmatrix_x4(qs_base + (uint32_t)(arow * QS_STRIDE + acol) * 2u, a[0], a[1], a[2], a[3]);
+                }
+                #pragma unroll
+                for (int p2 = 0; p2 < 4; p2++) {          // 2 n-tiles (16 keys) per ldmatrix.x4
+                    const int m = lane >> 3;             // matrices: (n-tile 2p2 | 2p2+1) x (k half 0 | 1)
+                    const int key = wrow0 + p2 * 16 + (m >> 1) * 8 + (lane & 7);
+                    uint32_t b00, b01, b10, b11;
+                    ldmatrix_x4(k16_base + swz16(key, ks * 2 + (m & 1)), b00, b01, b10, b11);
+                    mma16816(s[p2 * 2 + 0], a, b00, b01);
+                    mma16816(s[p2 * 2 + 1], a, b10, b11);
+                }
+            }
+            // ---- mask (slice end, window edge), softmax in the log2 domain ----
+            float mx0 = NEG, mx8 = NEG;
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                const int slot = wslot0 + nt * 8 + 2 * c;
+                #pragma unroll
+                for (int e = 0; e < 2; e++) {
+                    const int sl = slot + e;
+                    const bool ok = sl < n;
+                    s[nt][e] = (ok && sl >= first0) ? s[nt][e] * sm_scale_log2 : NEG;
+                    s[nt][2 + e] = (ok && sl >= first8) ? s[nt][2 + e] * sm_scale_log2 : NEG;
+                    mx0 = fmaxf(mx0, s[nt][e]);
+                    mx8 = fmaxf(mx8, s[nt][2 + e]);
+                }
+            }
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 1));
+            mx0 = fmaxf(mx0, __shfl_xor_sync(0xffffffffu, mx0, 2));
+            mx8 = fmaxf(mx8, __shfl_xor_sync(0xffffffffu, mx8, 1));
+            mx8 = fmaxf(mx8, __shfl_xor_sync(0xffffffffu, mx8, 2));
+            m_run[0] = mx0; m_run[1] = mx8;
+            uint32_t pa[4][4];                           // P as A fragments: 4 k16 steps over the 64 keys
+            #pragma unroll
+            for (int nt = 0; nt < 8; nt++) {
+                const float p0 = exp2f(s[nt][0] - mx0), p1 = exp2f(s[nt][1] - mx0);
+                const float p2 = exp2f(s[nt][2] - mx8), p3 = exp2f(s[nt][3] - mx8);
+                l_run[0] += p0 + p1; l_run[1] += p2 + p3;
+                pa[nt >> 1][(nt & 1) * 2 + 0] = pack_f16x2(p0, p1);
+                pa[nt >> 1][(nt & 1) * 2 + 1] = pack_f16x2(p2, p3);
+            }
+            // ---- acc = P V: V fragments by ldmatrix.trans on the fp16 tile ----
+            #pragma unroll
+            for (int ks = 0; ks < 4; ks++) {
+                #pragma unroll
+                for (int p2 = 0; p2 < 4; p2++) {          // 2 n-tiles (16 dims) per ldmatrix.x4.trans
+                    const int m = lane >> 3;             // matrices: (keys lo | hi) x (n-tile 2p2 | 2p2+1)
+                    const int key = wrow0 + ks * 16 + (m & 1) * 8 + (lane & 7);
+                    uint32_t b00, b01, b10, b11;
+                    ldmatrix_x4_trans(v16_base + swz16(key, p2 * 2 + (m >> 1)), b00, b01, b10, b11);
+                    mma16816(acc[p2 * 2 + 0], pa[ks], b00, b01);
+                    mma16816(acc[p2 * 2 + 1], pa[ks], b10, b11);
+                }
+            }
+        }
+        // ---- the warp's partial for this row tile -> shared ----
+        l_run[0] += __shfl_xor_sync(0xffffffffu, l_run[0], 1);
+        l_run[0] += __shfl_xor_sync(0xffffffffu, l_run[0], 2);
+        l_run[1] += __shfl_xor_sync(0xffffffffu, l_run[1], 1);
+        l_run[1] += __shfl_xor_sync(0xffffffffu, l_run[1], 2);
+        float* my = red + warp * RED_W;
+        if (c == 0) { my[g] = m_run[0]; my[8 + g] = m_run[1]; my[16 + g] = l_run[0]; my[24 + g] = l_run[1]; }
+        #pragma unroll
+        for (int nt = 0; nt < 8; nt++) {
+            const int d0 = nt * 8 + 2 * c;           // acc tile nt: dims nt*8 + n
+            my[32 + g * RS + d0] = acc[nt][0];
+            my[32 + g * RS + d0 + 1] = acc[nt][1];
+            my[32 + (g + 8) * RS + d0] = acc[nt][2];
+            my[32 + (g + 8) * RS + d0 + 1] = acc[nt][3];
+        }
+        __syncthreads();
+        if (!(abl & 4)) merge_phase<L>(geo, rt, red, snew, vnew, fin + rt * RED_W);
+        __syncthreads();
+    }
+
+    // ---- combine the four CTAs' partials over distributed shared memory (rank 0 finishes) ----
+    if (!(abl & 128)) {
+        cluster.sync();
+        if (rank != 0) { cluster.sync(); return; }
+        if (!(abl & 4)) combine_phase<L>(fin, red);   // red is free now: the weights go there
+        cluster.sync();
+    } else if (rank != 0) {
+        return;
+    }
+    if (!(abl & 64)) epilogue_phase<L>(geo, fin);
+}
+
+template <int L>
+static void launch_sliding(const torch::Tensor& qkv, const torch::Tensor& cache_loc, const torch::Tensor& seq_lens,
+                           const torch::Tensor& page_table, torch::Tensor& k_cache, torch::Tensor& v_cache,
+                           const torch::Tensor& k_scale, const torch::Tensor& v_scale, torch::Tensor& out,
+                           int HQ, int HKV, int PS, float qk_scale, float sm_scale_log2, float log2_theta, int abl) {
+    const int B = seq_lens.size(0);
+    const int smem = SlidingSmem<L>::BYTES;
+    static bool configured = false;
+    if (!configured) {
+        cudaFuncSetAttribute(sliding_attn_kernel<L>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        configured = true;
+    }
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3(B * HKV * NCTA);
+    cfg.blockDim = dim3(NT);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = at::cuda::getCurrentCUDAStream();
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeClusterDimension;
+    attr[0].val.clusterDim.x = NCTA; attr[0].val.clusterDim.y = 1; attr[0].val.clusterDim.z = 1;
+    cfg.attrs = attr; cfg.numAttrs = 1;
+    cudaError_t err = cudaLaunchKernelEx(&cfg, sliding_attn_kernel<L>,
+        reinterpret_cast<const __nv_bfloat16*>(qkv.data_ptr()), cache_loc.data_ptr<int64_t>(), seq_lens.data_ptr<int>(),
+        page_table.data_ptr<int>(), reinterpret_cast<uint8_t*>(k_cache.data_ptr()), reinterpret_cast<uint8_t*>(v_cache.data_ptr()),
+        k_scale.data_ptr<float>(), v_scale.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+        HQ, HKV, (int)page_table.size(1), PS, qk_scale, sm_scale_log2, log2_theta, abl);
+    TORCH_CHECK(err == cudaSuccess, "sliding_attn launch failed: ", cudaGetErrorString(err));
+}
+
+void sliding_attn(torch::Tensor qkv, torch::Tensor cache_loc, torch::Tensor seq_lens, torch::Tensor page_table,
+                  torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale,
+                  torch::Tensor out, int64_t L, int64_t HQ, int64_t HKV, int64_t PS,
+                  double qk_scale, double sm_scale_log2, double log2_theta, int64_t abl) {
+    TORCH_CHECK(HQ == 8 * HKV, "sliding_attn: 8 query heads per KV head");
+    if (L == 1) launch_sliding<1>(qkv, cache_loc, seq_lens, page_table, k_cache, v_cache, k_scale, v_scale, out,
+                                  (int)HQ, (int)HKV, (int)PS, (float)qk_scale, (float)sm_scale_log2, (float)log2_theta, (int)abl);
+    else if (L == 8) launch_sliding<8>(qkv, cache_loc, seq_lens, page_table, k_cache, v_cache, k_scale, v_scale, out,
+                                       (int)HQ, (int)HKV, (int)PS, (float)qk_scale, (float)sm_scale_log2, (float)log2_theta, (int)abl);
+    else TORCH_CHECK(false, "sliding_attn: q_len must be 1 or 8");
+}
+"""
+
+CPP_SLIDING_SRC = """
+#include <torch/extension.h>
+void sliding_attn(torch::Tensor qkv, torch::Tensor cache_loc, torch::Tensor seq_lens, torch::Tensor page_table,
+                  torch::Tensor k_cache, torch::Tensor v_cache, torch::Tensor k_scale, torch::Tensor v_scale,
+                  torch::Tensor out, int64_t L, int64_t HQ, int64_t HKV, int64_t PS,
+                  double qk_scale, double sm_scale_log2, double log2_theta, int64_t abl);
+"""
+
+SLIDING_CUDA = False    # sliding-window layers: the dedicated CUDA kernel below (correct; measured slower than the
+                        # Triton plan on every scored sliding shape: B1 decode 15.2 vs 15.5 us, B1 verify 43 vs 23,
+                        # B16/B32 wave-bound with 212 KB smem per CTA; kept as a documented experiment, off)
+_SLIDING_EXT = None
+_SLIDING_FAILED = False
+
+
+def _sliding_ext():
+    """Build the sliding-window kernel once (nvcc, ~1 min, in the first eager call); None if it fails."""
+    global _SLIDING_EXT, _SLIDING_FAILED
+    if _SLIDING_EXT is None and not _SLIDING_FAILED:
+        try:
+            from torch.utils.cpp_extension import load_inline
+            _SLIDING_EXT = load_inline(
+                name="muse_attn_sliding_ext",
+                cpp_sources=[CPP_SLIDING_SRC],
+                cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SLIDING_SRC],
+                functions=["sliding_attn"], extra_cuda_cflags=["-O3", "-arch=sm_90a"], verbose=False)
+        except Exception as e:   # noqa: BLE001 - any build problem: keep serving with the Triton kernel
+            _SLIDING_FAILED = True
+            print("sliding CUDA kernel unavailable:", str(e)[:400])
+    return _SLIDING_EXT
+
+
+def _sliding_forward(data, out, abl=0):
+    """The dedicated sliding-window kernel; returns False (nothing done) when it does not apply.
+    abl (benchmark ablations, wrong results): 1 no K/V loads, 2 no QK/PV, 4 no merge, 8 no q/k prep."""
+    cfg = data["config"]
+    L, HQ, HKV, D = cfg["q_len"], cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"]
+    if cfg["window"] != 2048 or L not in (1, 8) or HQ != 8 * HKV or D != 64 or not cfg["rope_theta"]:
+        return False
+    ext = _sliding_ext()
+    if ext is None:
+        return False
+    qkv = data["qkv"]
+    if qkv.stride(-1) != 1:
+        qkv = qkv.contiguous()
+    ext.sliding_attn(qkv, data["cache_loc"], data["seq_lens"], data["page_table"], data["k_cache"], data["v_cache"],
+                     data["k_scale"], data["v_scale"], out, L, HQ, HKV, cfg["page_size"],
+                     cfg["qk_scale_factor"], cfg["sm_scale"] * LOG2E, math.log2(cfg["rope_theta"]), int(abl))
+    return True
+
+# == END CUDA SLIDING ==
+
+
 # ----------------------------------------------------------------------------------------------
 # host side
 # ----------------------------------------------------------------------------------------------
@@ -2768,24 +3888,19 @@ def _attn_bench(data):
     cases = {"B1 L1 sliding": (1, 1, W), "B1 L1 full": (1, 1, 0), "B16 L1 sliding": (16, 1, W), "B16 L1 full": (16, 1, 0),
              "B32 L1 sliding": (32, 1, W), "B32 L1 full": (32, 1, 0), "B1 L8 sliding": (1, 8, W), "B1 L8 full": (1, 8, 0),
              "B16 L8 sliding": (16, 8, W), "B16 L8 full": (16, 8, 0), "B32 L8 sliding": (32, 8, W), "B32 L8 full": (32, 8, 0)}
-    bd = dict(hp=2, bd=True, stages=5, block_t=64)                   # both heads per CTA, whole 128B rows
-    nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128)      # one head per CTA
+    nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128, cuda=False)   # the Triton kernel, current plans
     w8 = dict(nw, block_t=64, warps=8)
+    cu = dict(cuda=True)
+    abl = [dict(cuda=True, cabl=k) for k in (1, 2, 4, 8, 16, 32, 64, 128, 255)]   # no K/V loads / no convert+QK+PV / no merge / no prep / no trip-1 loads / no row tiles / no epilogue / no cluster syncs / skeleton
     plans = {
-        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, pfx=True)],
-        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=128, pfx=True)],
-        "B16 L1 sliding": [dict(nw, splits=8, block_t=64), dict(nw, splits=8, block_t=64, pfx=True)],
-        "B16 L1 full": [dict(bd, splits=16)],
-        "B32 L1 sliding": [dict(nw, splits=8, block_t=64), dict(nw, splits=8, block_t=64, pfx=True)],
-        "B32 L1 full": [dict(bd, splits=8)],
-        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, pfx=True), dict(w8, splits=32, g1=8, pfx=True)],
-        "B1 L8 full": [dict(nw, splits=64, warps=8), dict(nw, splits=64, warps=8, pfx=True), dict(nw, splits=64, warps=8, pfx=True, stages=8)],
-        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, pfx=True), dict(w8, splits=4, pfx=True)],
-        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, pfx=True), dict(nw, splits=8, pfx=True, stages=8), dict(nw, splits=16, pfx=True),
-                        dict(nw, splits=4, pfx=True), dict(nw, splits=8, pfx=True, pf=False)],
-        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, pfx=True)],
-        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, pfx=True), dict(nw, splits=4, pfx=True, stages=6), dict(nw, splits=8, pfx=True)],
+        "B1 L1 sliding": [dict(nw, splits=16), cu, cu] + abl,
+        "B16 L1 sliding": [dict(nw, splits=8, block_t=64), cu, cu],
+        "B32 L1 sliding": [dict(nw, splits=8, block_t=64), cu, cu],
+        "B1 L8 sliding": [dict(w8, splits=32), cu, cu] + abl,
+        "B16 L8 sliding": [dict(w8, splits=8), cu, cu],
+        "B32 L8 sliding": [dict(w8, splits=4), cu, cu],
     }
+    cases = {k: v for k, v in cases.items() if k in plans}
     for name, (B, L, window) in cases.items():
         d = make(B, L, window)
         for plan in plans[name]:
@@ -2824,6 +3939,8 @@ def _attention_forward(data) -> torch.Tensor:
     plan = _plan(cfg)
     if _PLAN_OVERRIDE is not None:
         plan.update(_PLAN_OVERRIDE)
+    if cfg["window"] and plan.get("cuda", SLIDING_CUDA) and _sliding_forward(data, out, plan.get("cabl", 0)):
+        return out
     hp = plan["hp"] if HKV % plan["hp"] == 0 else 1
     bd = plan["bd"] and hp == 2
     hps = hp if bd else 1
@@ -3582,13 +4699,15 @@ void launch(const __half* A, int lda, const int* st, const int* be, const int* b
 // and the token tile); KS = 2 splits each chunk's 8 k16 steps across two 4-warp groups.
 //
 // Weight words (repack_weights_wt): per lane and k16 step one 32-bit word holds the 8 nibbles of its
-// A fragment; byte b carries nibble A_b pre-spread into E4M3 position (s<<7 | e1<<4 | e0<<3 | m<<2,
-// exactly e2m1 * 2^-6) and nibble B_b at (e1<<6 | s<<5 | e0<<1 | m), so the dequant is
-//   elo = w & 0x9C9C9C9C                                   bytes A_0..A_3
-//   ehi = (w << 2) & 0x8C8C8C8C | (w >> 2) & 0x10101010    bytes B_0..B_3 (now E4M3-placed)
-// and four cvt.rn.f16x2.e4m3x2: (A_0,A_1) = a0 rows g k 2t,2t+1; (A_2,A_3) = a1 rows g+8; (B_0,B_1) = a2
-// rows g k 2t+8,2t+9; (B_2,B_3) = a3 rows g+8. Each pair is multiplied by its row's E4M3 block scale (as fp16:
-// the product has <= 6 significant bits, so the fp16 weights are exact) and gs * 2^6 scales the fp32 sums.
+// A fragment; byte b carries nibble A_b at the fp16 high-byte positions (s<<7 | e1<<3 | e0<<2 | m<<1) and
+// nibble B_b in the free bits (s<<6 | e1<<5 | e0<<4 | m), so the dequant is
+//   ma = w & 0x8E8E8E8E                                    bytes A_0..A_3
+//   mb = (w << 1) & 0x82828282 | (w >> 2) & 0x0C0C0C0C     bytes B_0..B_3 (now fp16-placed)
+// and four PRMT byte-expands (byte -> high byte of an fp16, low byte 0): (A_0,A_1) = a0 rows g k 2t,2t+1;
+// (A_2,A_3) = a1 rows g+8; (B_0,B_1) = a2 rows g k 2t+8,2t+9; (B_2,B_3) = a3 rows g+8. Such an fp16 is
+// exactly e2m1 * 2^-14 (exponent-aligned placement, subnormals included); times the row's E4M3 block scale
+// (as fp16) the product has <= 8 significant bits and stays in range, so the fp16 weights are exact, and
+// gs * 2^14 scales the fp32 sums. No cvt instruction: the 16-lane/clk conversion pipe was the bottleneck.
 // ---------------------------------------------------------------------------------------------
 
 __device__ __forceinline__ uint32_t prmt(uint32_t a, uint32_t b, uint32_t sel) {
@@ -3705,7 +4824,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             #pragma unroll
             for (int q = 0; q < 4; ++q) acc[i][n][q] = 0.f;
 
-    const float gsf = gs[e] * gs_mul;                                   // gs * 64: applied to the fp32 sums
+    const float gsf = gs[e] * gs_mul;                                   // gs * 2^14: applied to the fp32 sums
 
     #pragma unroll
     for (int st = 0; st < NSTAGE - 1; ++st) {
@@ -3713,15 +4832,18 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         cp_async_commit();
     }
 
+    int stage = 0, stage_n = NSTAGE - 1;                              // ring slots of chunk c and of chunk c + NSTAGE - 1
     for (int c = 0; c < NC; ++c) {
         cp_async_wait<NSTAGE - 2>();
         __syncthreads();
         {
             const int cn = c + NSTAGE - 1;
-            if (cn < NC) issue(cn, cn % NSTAGE);
+            if (cn < NC) issue(cn, stage_n);
             cp_async_commit();
         }
-        const uint8_t* ws = wt_smem + (c % NSTAGE) * STAGE_BYTES;
+        const uint8_t* ws = wt_smem + stage * STAGE_BYTES;
+        stage = stage + 1 == NSTAGE ? 0 : stage + 1;
+        stage_n = stage_n + 1 == NSTAGE ? 0 : stage_n + 1;
         const uint8_t* ss = ws + W_STAGE;
         const __half* xs = reinterpret_cast<const __half*>(ss + S_STAGE);
         #pragma unroll
@@ -3750,16 +4872,21 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                         const uint32_t w = s == 0 ? wq[i].x : s == 1 ? wq[i].y : s == 2 ? wq[i].z : wq[i].w;
                         const uint32_t sw = ps == 0 ? sq[i].x : sq[i].y;
                         const uint32_t sp = q == 0 ? e4m3x2_lo16_to_f16x2(sw) : e4m3x2_hi16_to_f16x2(sw);   // (s_g, s_g8)
-                        const uint32_t S0 = prmt(sp, sp, 0x1010u);          // row g   block scale, both halves
-                        const uint32_t S1 = prmt(sp, sp, 0x3232u);          // row g+8
-                        // fp16 weights = e2m1 * 2^-6 * blockscale: <= 6 significant bits, exact
-                        const uint32_t elo = w & 0x9C9C9C9Cu;
-                        const uint32_t ehi = ((w << 2) & 0x8C8C8C8Cu) | ((w >> 2) & 0x10101010u);
+                        uint32_t S0, S1;                                     // row g / row g+8 block scale, both halves
+                        asm("{ .reg .b16 lo, hi; mov.b32 {lo, hi}, %2; mov.b32 %0, {lo, lo}; mov.b32 %1, {hi, hi}; }\n"
+                            : "=r"(S0), "=r"(S1) : "r"(sp));
+                        // Conversion-free dequant: byte b of the word holds nibble A_b at bits (s:7, e1:3, e0:2, m:1)
+                        // and nibble B_b at (s:6, e1:5, e0:4, m:0). Masked and byte-expanded into the high byte of
+                        // each fp16 (PRMT), the fp16 is s<<15 | e1e0<<10 | m<<9 = e2m1 * 2^-14 exactly (subnormals
+                        // included); x the E4M3 block scale is exact in fp16 (a multiple of 2^-24 below 0.18, for
+                        // any E4M3 scale). No cvt on the 16-lane/clk conversion pipe; gs * 2^14 scales the sums.
+                        const uint32_t ma = w & 0x8E8E8E8Eu;
+                        const uint32_t mb = ((w << 1) & 0x82828282u) | ((w >> 2) & 0x0C0C0C0Cu);
                         uint32_t a[4];
-                        a[0] = f16x2_mul(e4m3x2_lo16_to_f16x2(elo), S0);
-                        a[1] = f16x2_mul(e4m3x2_hi16_to_f16x2(elo), S1);
-                        a[2] = f16x2_mul(e4m3x2_lo16_to_f16x2(ehi), S0);
-                        a[3] = f16x2_mul(e4m3x2_hi16_to_f16x2(ehi), S1);
+                        a[0] = f16x2_mul(prmt(ma, 0u, 0x1404u), S0);        // (A_0, A_1): row g,   k 2t, 2t+1
+                        a[1] = f16x2_mul(prmt(ma, 0u, 0x3424u), S1);        // (A_2, A_3): row g+8
+                        a[2] = f16x2_mul(prmt(mb, 0u, 0x1404u), S0);        // (B_0, B_1): row g,   k 2t+8, 2t+9
+                        a[3] = f16x2_mul(prmt(mb, 0u, 0x3424u), S1);        // (B_2, B_3): row g+8
                         #pragma unroll
                         for (int nb = 0; nb < NT; ++nb) {
                             if (nb < ntb) mma16816(acc[i][nb * CH + (CH == 2 ? q : 0)], a, b[nb][2 * q], b[nb][2 * q + 1]);
@@ -4019,6 +5146,7 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         case 111102: OKC_W(true, 1, 1, 1, 2, false); break;   case 111104: OKC_W(true, 1, 1, 1, 4, false); break;
         case 111108: OKC_W(true, 1, 1, 1, 8, false); break;
         case 112102: OKC_W(true, 1, 2, 1, 2, false); break;   case 112104: OKC_W(true, 1, 2, 1, 4, false); break;
+        case 112103: OKC_W(true, 1, 2, 1, 3, false); break;   case 22103: OKC_W(false, 2, 2, 1, 3, false); break;
         case 114102: OKC_W(true, 1, 4, 1, 2, false); break;   case 114104: OKC_W(true, 1, 4, 1, 4, false); break;
         case 11102: OKC_W(false, 1, 1, 1, 2, false); break;   case 11104: OKC_W(false, 1, 1, 1, 4, false); break;
         case 11108: OKC_W(false, 1, 1, 1, 8, false); break;
@@ -4107,9 +5235,9 @@ def repack_weights(w: torch.Tensor, sf: torch.Tensor):
 def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
     """w uint8 [E, N, K/2] packed E2M1 (low nibble = even k), sf fp8 [E, N, K/16] ->
     Wr uint8 [E, N/16, K/128, 2, 32, 16]: per (expert, m16 tile, chunk, half, lane) 4 words = the lane's
-    A-fragment nibbles for k16 steps 4*half .. 4*half+3 (byte b: nibble A_b at bits {7,4,3,2} = E4M3
-    position, nibble B_b at (e1:6, s:5, e0:1, m:0); A_0,A_1 = row g k 2t,2t+1; A_2,A_3 = row g+8 k 2t,2t+1;
-    B_0,B_1 = row g k 2t+8,2t+9; B_2,B_3 = row g+8 k 2t+8,2t+9);
+    A-fragment nibbles for k16 steps 4*half .. 4*half+3 (byte b: nibble A_b at bits (s:7, e1:3, e0:2, m:1)
+    = the fp16 high-byte placement, nibble B_b at (s:6, e1:5, e0:4, m:0); A_0,A_1 = row g k 2t,2t+1;
+    A_2,A_3 = row g+8 k 2t,2t+1; B_0,B_1 = row g k 2t+8,2t+9; B_2,B_3 = row g+8 k 2t+8,2t+9);
     Sr uint8 [E, N/16, K/128, 8, 16]: per g the 8 steps' (scale row g, scale row g+8) byte pairs.
     A permutation of the stored bits: lossless."""
     E, N, K2 = w.shape
@@ -4131,10 +5259,10 @@ def repack_weights_wt(w: torch.Tensor, sf: torch.Tensor):
                 v = sel[:, rh, :, :, :, :, q]
                 b = rh * 2 + (q & 1)
                 sgn, e1, e0, m = (v >> 3) & 1, (v >> 2) & 1, (v >> 1) & 1, v & 1
-                if q < 2:   # A: E4M3 placement
-                    byte = (sgn << 7) | (e1 << 4) | (e0 << 3) | (m << 2)
-                else:       # B
-                    byte = (e1 << 6) | (sgn << 5) | (e0 << 1) | m
+                if q < 2:   # A: fp16 high-byte placement (s:7, e1:3, e0:2, m:1)
+                    byte = (sgn << 7) | (e1 << 3) | (e0 << 2) | (m << 1)
+                else:       # B: the free bits (s:6, e1:5, e0:4, m:0); the kernel shifts s, m up and e1 e0 down
+                    byte = (sgn << 6) | (e1 << 5) | (e0 << 4) | m
                 word |= byte << (8 * b)
         word = word.view(NTL, 8, NC, 2, 4, 4).permute(0, 2, 3, 1, 5, 4).contiguous()   # tile, chunk, half, g, t, step4
         Wr[e] = word.view(NTL, NC, 2, 32, 4).view(torch.uint8).view(NTL, NC, 2, 32, 16)
@@ -4333,7 +5461,10 @@ def _moe_state(weights) -> dict:
             state["Wt2"], state["St2"] = repack_weights_wt(weights["w2"][:LOCAL], weights["w2_sf"][:LOCAL])
             state["gs13"] = weights["w13_gs"][:LOCAL].float().contiguous()
             state["gs2"] = weights["w2_gs"][:LOCAL].float().contiguous()
-            state["gs_mul"] = 64.0   # the E4M3 placement is e2m1 * 2^-6; applied with gs to the fp32 sums
+            state["gs_mul"] = 16384.0   # the fp16 placement is e2m1 * 2^-14; applied with gs to the fp32 sums
+            for nm in ("w13_sf", "w2_sf"):   # the fp16 products are exact for every E4M3 scale; the stats are for the log
+                sfv = weights[nm][:LOCAL].float()
+                print(f"{nm}: block scales min {float(sfv.min()):.4g} max {float(sfv.max()):.4g}, below 2^-6: {int((sfv < 2.0 ** -6).sum())}")
             state["xscale"] = 1.0
             state["part"] = torch.empty((PART_SPLIT_MAX, PART_ROWS, 2 * I), dtype=torch.float32, device=dev)   # split-K partials
             state["counters"] = torch.zeros((maxb * 64,), dtype=torch.int32, device=dev)   # split-K arrival counters (self-resetting)
