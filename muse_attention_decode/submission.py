@@ -460,21 +460,30 @@ def _workspace(device, n_part: int, n_ml: int, n_cnt: int):
     return ws
 
 
+def _pow2(n: int) -> int:
+    return 1 << (max(1, n).bit_length() - 1)
+
+
 def _plan(cfg):
-    """Kernel configuration from the shape only: dict(splits, block_t, hp, bd, warps, stages, ex2h, pv8)."""
+    """Kernel configuration from the shape only: dict(splits, block_t, hp, bd, warps, stages, ex2h, pv8[, g1])."""
     b, hkv, L = cfg["batch"], cfg["num_kv_heads"], cfg["q_len"]
-    group = cfg["num_q_heads"] // hkv
-    hp = 2 if hkv % 2 == 0 else 1
-    bd = L * group * hp <= 16            # decode tiles: both heads in one 16-row set
-    ctas = b * hkv // hp
-    if bd or hp == 1 and L * group <= 16:
-        cap = (32 if ctas <= 2 else 16) if cfg["window"] else 128
-        splits = max(1, min(cap, (512 if cfg["window"] else 1024) // ctas))
+    rows = L * (cfg["num_q_heads"] // hkv)   # query rows per KV head
+    sliding = cfg["window"] > 0
+    if rows <= 16 and not sliding and hkv % 2 == 0:
+        # full-context decode: both heads per CTA over whole 128-byte cache rows, 64-key tiles
+        ctas = b * hkv // 2
+        splits = min(64 if ctas <= 4 else 32, 1024 // ctas)
+        return dict(splits=_pow2(splits), block_t=64, hp=2, bd=True, warps=4, stages=5, ex2h=EX2_F16, pv8=PV_FP8)
+    ctas = b * hkv
+    warps = 4
+    if rows <= 16:
+        splits = min(16, 512 // ctas)                   # sliding decode: one 128-key tile per CTA
+    elif sliding:
+        splits = min(16, 256 // ctas)                   # sliding verify: 1-4 tiles per CTA
+        warps = 8 if ctas <= 8 else 4
     else:
-        cap = 16 if cfg["window"] else (64 if ctas <= 4 else 16)
-        splits = max(1, min(cap, (256 if cfg["window"] else 512) // ctas))
-    splits = 1 << (splits.bit_length() - 1)   # a power of two: the combine merges CH splits at a time
-    return dict(splits=splits, block_t=64 if bd else 128, hp=hp, bd=bd, warps=4, stages=5, ex2h=EX2_F16, pv8=PV_FP8)
+        splits = min(64 if ctas <= 4 else 16, 512 // ctas)
+    return dict(splits=_pow2(splits), block_t=128, hp=1, bd=False, warps=warps, stages=5, ex2h=EX2_F16, pv8=PV_FP8)
 
 
 _PLAN_OVERRIDE = None   # dict of plan keys to force, during benchmarking
@@ -483,7 +492,8 @@ _BENCH_DONE = False
 
 
 def _attn_bench(data):
-    """Times kernel configurations on synthetic inputs shaped like the scored cases; prints."""
+    """Times kernel configurations on synthetic inputs shaped like the scored cases, the way the
+    judge does: each as a CUDA graph, replayed after an L2 flush; prints the median."""
     import time
     global _PLAN_OVERRIDE
     t0 = time.time()
@@ -491,6 +501,7 @@ def _attn_bench(data):
     cfg0 = dict(data["config"])
     HQ, HKV, D = cfg0["num_q_heads"], cfg0["num_kv_heads"], cfg0["head_dim"]
     g = torch.Generator(device=dev).manual_seed(0)
+    flush = torch.empty((160 << 20,), dtype=torch.uint8, device=dev)
 
     def make(B, L, window, ctx=80000):
         pages = B * (ctx + 8)
@@ -505,47 +516,59 @@ def _attn_bench(data):
         return {"qkv": qkv, "cache_loc": loc, "seq_lens": seq, "page_table": page_table, "k_cache": k_cache,
                 "v_cache": v_cache, "k_scale": data["k_scale"], "v_scale": data["v_scale"], "config": c}
 
-    def timeit(fn, reps=5):
-        fn(); fn()
+    def timeit(fn, reps=11):
+        fn(); fn()                       # compile, allocate the workspace
+        torch.cuda.synchronize()
+        st = torch.cuda.Stream()
+        st.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(st):
+            gph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(gph, stream=st):
+                fn()
+        torch.cuda.current_stream().wait_stream(st)
         torch.cuda.synchronize()
         e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        e0.record()
+        ts = []
         for _ in range(reps):
-            fn()
-        e1.record()
-        torch.cuda.synchronize()
-        return e0.elapsed_time(e1) * 1000.0 / reps
+            flush.fill_(1)               # cold L2, as the judge times it
+            e0.record()
+            gph.replay()
+            e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1) * 1000.0)
+        ts.sort()
+        return ts[len(ts) // 2]
 
-    print("BENCH attention: us per call (eager); plan overrides")
-    cases = [("B16 L1 full", make(16, 1, 0)), ("B16 L8 full", make(16, 8, 0)), ("B32 L8 sliding", make(32, 8, 2048)),
-             ("B1 L8 full", make(1, 8, 0)), ("B1 L1 full", make(1, 1, 0)),
-             ("B1 L8 sliding", make(1, 8, 2048)), ("B1 L1 sliding", make(1, 1, 2048))]
+    print("BENCH attention: us per graph replay after an L2 flush (median), plan overrides")
+    W = 2048
+    cases = {"B1 L1 sliding": (1, 1, W), "B1 L1 full": (1, 1, 0), "B16 L1 sliding": (16, 1, W), "B16 L1 full": (16, 1, 0),
+             "B32 L1 sliding": (32, 1, W), "B32 L1 full": (32, 1, 0), "B1 L8 sliding": (1, 8, W), "B1 L8 full": (1, 8, 0),
+             "B16 L8 sliding": (16, 8, W), "B16 L8 full": (16, 8, 0), "B32 L8 sliding": (32, 8, W), "B32 L8 full": (32, 8, 0)}
     old = dict(hp=1, bd=False, stages=3, ex2h=False, block_t=128)   # the previous kernel's configuration
     bd = dict(hp=2, bd=True, stages=5, block_t=64)                   # both heads per CTA, whole 128B rows
-    sq = dict(hp=2, bd=False, stages=5, ex2h=True, block_t=128)      # both heads per CTA, a dot per head
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128)      # one head per CTA, new loop
     plans = {
-        "B16 L1 full": [dict(old, splits=32), dict(old, splits=32, stages=5), dict(bd, splits=32, block_t=128),
-                        dict(bd, splits=32), dict(bd, splits=64), dict(bd, splits=32, stages=7),
-                        dict(bd, splits=32, maxnreg=128), dict(bd, splits=32, maxnreg=168)],
-        "B16 L8 full": [dict(old, splits=16), dict(old, splits=16, ex2h=True), dict(nw, splits=16),
-                        dict(nw, splits=16, maxnreg=168), dict(nw, splits=16, pv8=True), dict(sq, splits=16),
-                        dict(sq, splits=16, pv8=True), dict(sq, splits=16, maxnreg=168), dict(nw, splits=16, stages=3, block_t=256)],
-        "B32 L8 sliding": [dict(old, splits=4), dict(nw, splits=4), dict(nw, splits=4, maxnreg=168), dict(sq, splits=4),
-                           dict(nw, splits=4, pv8=True)],
-        "B1 L8 full": [dict(old, splits=64, warps=8), dict(nw, splits=64, warps=8), dict(nw, splits=64, warps=4),
-                       dict(nw, splits=128, warps=4), dict(nw, splits=128, warps=8), dict(sq, splits=64, warps=4),
-                       dict(sq, splits=128, warps=4), dict(nw, splits=64, warps=8, g1=64)],
-        "B1 L1 full": [dict(old, splits=64), dict(old, splits=64, stages=5), dict(bd, splits=64), dict(bd, splits=128),
-                       dict(bd, splits=128, stages=7), dict(old, splits=128, stages=5)],
-        "B1 L8 sliding": [dict(old, splits=16, warps=8), dict(nw, splits=16, warps=8), dict(nw, splits=16, warps=4),
-                          dict(sq, splits=16, warps=4), dict(nw, splits=32, warps=8), dict(nw, splits=16, warps=8, g1=16)],
-        "B1 L1 sliding": [dict(old, splits=16), dict(old, splits=16, stages=5), dict(bd, splits=16), dict(bd, splits=32),
-                          dict(old, splits=32, stages=5)],
+        "B1 L1 sliding": [dict(old, splits=16), dict(nw, splits=16), dict(nw, splits=16, stages=3), dict(nw, splits=8), dict(nw, splits=32),
+                          dict(bd, splits=16), dict(bd, splits=32)],
+        "B1 L1 full": [dict(old, splits=64), dict(nw, splits=64), dict(bd, splits=64), dict(bd, splits=128), dict(bd, splits=32),
+                       dict(nw, splits=128), dict(bd, splits=64, stages=7)],
+        "B16 L1 sliding": [dict(old, splits=16), dict(nw, splits=16), dict(nw, splits=8), dict(bd, splits=16), dict(nw, splits=16, stages=3)],
+        "B16 L1 full": [dict(nw, splits=32), dict(bd, splits=32), dict(bd, splits=16), dict(bd, splits=32, block_t=128), dict(bd, splits=32, stages=7)],
+        "B32 L1 sliding": [dict(old, splits=16), dict(nw, splits=16), dict(nw, splits=8), dict(bd, splits=16)],
+        "B32 L1 full": [dict(nw, splits=16), dict(bd, splits=32), dict(bd, splits=16), dict(bd, splits=32, block_t=128)],
+        "B1 L8 sliding": [dict(old, splits=16, warps=8), dict(nw, splits=16, warps=8), dict(nw, splits=16, warps=4), dict(nw, splits=8, warps=8),
+                          dict(nw, splits=4, warps=8), dict(nw, splits=16, warps=8, stages=3), dict(nw, splits=32, warps=8)],
+        "B1 L8 full": [dict(old, splits=64, warps=8), dict(nw, splits=64, warps=8), dict(nw, splits=64, warps=4), dict(nw, splits=128, warps=4),
+                       dict(nw, splits=128, warps=8), dict(nw, splits=32, warps=8), dict(nw, splits=64, warps=8, g1=64), dict(nw, splits=128, warps=8, g1=8)],
+        "B16 L8 sliding": [dict(old, splits=8), dict(nw, splits=8), dict(nw, splits=4), dict(nw, splits=16), dict(nw, splits=8, warps=8)],
+        "B16 L8 full": [dict(nw, splits=16), dict(nw, splits=32), dict(nw, splits=8), dict(nw, splits=16, stages=7), dict(nw, splits=16, warps=8)],
+        "B32 L8 sliding": [dict(old, splits=4), dict(nw, splits=4), dict(nw, splits=8), dict(nw, splits=2), dict(nw, splits=16)],
+        "B32 L8 full": [dict(nw, splits=16), dict(nw, splits=8), dict(nw, splits=16, stages=7)],
     }
-    for name, d in cases:
+    for name, (B, L, window) in cases.items():
+        d = make(B, L, window)
         for plan in plans[name]:
-            if time.time() - t0 > 240:
+            if time.time() - t0 > 300:
                 print("BENCH budget reached"); break
             _PLAN_OVERRIDE = plan
             try:
@@ -554,6 +577,7 @@ def _attn_bench(data):
             except Exception as e:
                 print(f"  {name:15s} {str(plan):75s} failed: {str(e)[:120]}")
         _PLAN_OVERRIDE = None
+        del d
     _PLAN_OVERRIDE = None
     print(f"BENCH attention done in {time.time() - t0:.0f}s")
 
@@ -590,7 +614,7 @@ def _attention_forward(data) -> torch.Tensor:
     ex2h = bool(plan["ex2h"]) and FP8_ASM
     pv8 = bool(plan["pv8"]) and FP8_ASM
     lb = 32 if pv8 else 16
-    g1 = plan.get("g1") or {1: 1, 2: 2, 4: 4, 8: 8, 16: 4, 32: 8, 64: 8, 128: 16}[splits]   # merge groups of g1 splits
+    g1 = plan.get("g1") or {1: 1, 2: 2, 4: 4, 8: 8, 16: 16, 32: 8, 64: 8, 128: 16}[splits]   # merge groups of g1 splits (one level up to 16)
     g2 = splits // g1
     nset = hp // hps
     n_rows = ctas * nset * rb * (splits + g2)          # split partials, then the group partials
@@ -598,11 +622,7 @@ def _attention_forward(data) -> torch.Tensor:
     page_table = data["page_table"]
     theta = cfg["rope_theta"]
     grid = (ctas, splits)
-    gmax = max(g1, g2)
-    if ctas <= 4:
-        ch = min(gmax, 8 if rb <= 16 else 4)             # tiny batches: wide merge loads, registers are free
-    else:
-        ch = max(1, min(gmax, 4096 // (rb * hps * D)))   # <= 32 fp32 per thread in the merge
+    ch = min(max(g1, g2), 8 if rb <= 16 else 4)         # partial sets merged per load group
     extra = {}
     if plan.get("maxnreg"):
         extra["maxnreg"] = plan["maxnreg"]

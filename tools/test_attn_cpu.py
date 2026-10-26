@@ -32,7 +32,7 @@ if not fast:
         (2, 1500, "dp", "full", 8, "mixed", "normal", 64, 1.0),
     ]
 # every case with the default plan (2 heads per CTA), then the fast cases again with 1 head per CTA
-runs = [(c, None) for c in cases] + [(c, dict(hp=1)) for c in cases[:5]]
+runs = [(c, None) for c in cases] + [(c, dict(hp=2)) for c in cases[:5]]
 for i, ((batch, ctx, heads, layer, q_len, spread, dist, page, kv_scale), override) in enumerate(runs):
     S._PLAN_OVERRIDE = override
     data = R.generate_input(batch, ctx, heads, layer, seed=1000 + i, q_len=q_len, spread=spread,
