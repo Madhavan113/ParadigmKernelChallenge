@@ -26,5 +26,5 @@ for f in funcs[1:]:
             out[-1][1] += 1
         else:
             out.append([op, 1])
-    print("==", re.search(r"(stream_kernel|gemv_kernel|skinny_mma_kernel)\w+", name).group(0)[:48], len(seq), "instrs")
+    print("==", re.search(r"(stream_kernel|gemv_kernel|gemv12_kernel|tgemv_kernel|skinny_mma_kernel)\w+", name).group(0)[:48], len(seq), "instrs")
     print("  ", " ".join(f"{o}x{c}" if c > 1 else o for o, c in out if o in keep))
