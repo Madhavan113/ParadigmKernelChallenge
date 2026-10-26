@@ -531,7 +531,7 @@ def _plan(cfg):
 
 
 _PLAN_OVERRIDE = None   # dict of plan keys to force, during benchmarking
-ATTN_BENCH = False      # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
+ATTN_BENCH = True       # True: one on-device sweep in the first eager call (never under graph capture); prints to the log
 _BENCH_DONE = False
 
 
@@ -589,24 +589,21 @@ def _attn_bench(data):
     cases = {"B1 L1 sliding": (1, 1, W), "B1 L1 full": (1, 1, 0), "B16 L1 sliding": (16, 1, W), "B16 L1 full": (16, 1, 0),
              "B32 L1 sliding": (32, 1, W), "B32 L1 full": (32, 1, 0), "B1 L8 sliding": (1, 8, W), "B1 L8 full": (1, 8, 0),
              "B16 L8 sliding": (16, 8, W), "B16 L8 full": (16, 8, 0), "B32 L8 sliding": (32, 8, W), "B32 L8 full": (32, 8, 0)}
-    bd = dict(hp=2, bd=True, stages=5, block_t=64)                   # both heads per CTA, whole 128B rows
     nw = dict(hp=1, bd=False, stages=5, ex2h=True, block_t=128)      # one head per CTA
     w8 = dict(nw, block_t=64, warps=8)
+    def one(block_t, warps, stages=5, splits=1):
+        return dict(nw, splits=splits, block_t=block_t, warps=warps, stages=stages)
     plans = {
-        "B1 L1 sliding": [dict(nw, splits=16), dict(nw, splits=16, pfx=True)],
-        "B1 L1 full": [dict(nw, splits=128), dict(nw, splits=128, pfx=True)],
-        "B16 L1 sliding": [dict(nw, splits=8, block_t=64), dict(nw, splits=8, block_t=64, pfx=True)],
-        "B16 L1 full": [dict(bd, splits=16)],
-        "B32 L1 sliding": [dict(nw, splits=8, block_t=64), dict(nw, splits=8, block_t=64, pfx=True)],
-        "B32 L1 full": [dict(bd, splits=8)],
-        "B1 L8 sliding": [dict(w8, splits=32), dict(w8, splits=32, pfx=True), dict(w8, splits=32, g1=8, pfx=True)],
-        "B1 L8 full": [dict(nw, splits=64, warps=8), dict(nw, splits=64, warps=8, pfx=True), dict(nw, splits=64, warps=8, pfx=True, stages=8)],
-        "B16 L8 sliding": [dict(w8, splits=8), dict(w8, splits=8, pfx=True), dict(w8, splits=4, pfx=True)],
-        "B16 L8 full": [dict(nw, splits=8), dict(nw, splits=8, pfx=True), dict(nw, splits=8, pfx=True, stages=8), dict(nw, splits=16, pfx=True),
-                        dict(nw, splits=4, pfx=True), dict(nw, splits=8, pfx=True, pf=False)],
-        "B32 L8 sliding": [dict(w8, splits=4), dict(w8, splits=4, pfx=True)],
-        "B32 L8 full": [dict(nw, splits=4), dict(nw, splits=4, pfx=True), dict(nw, splits=4, pfx=True, stages=6), dict(nw, splits=8, pfx=True)],
+        "B1 L1 sliding": [dict(nw, splits=16), one(256, 16), one(256, 16, 8), one(512, 8, 3), one(256, 8), one(256, 16, 5, 2),
+                          one(128, 16, 8), one(128, 8, 8)],
+        "B16 L1 sliding": [dict(nw, splits=8, block_t=64), one(256, 16), one(256, 8), one(256, 8, 5, 2), one(512, 8, 3), one(128, 8, 8)],
+        "B32 L1 sliding": [dict(nw, splits=8, block_t=64), one(256, 16), one(256, 8), one(256, 8, 5, 2), one(128, 8, 8)],
+        "B1 L8 sliding": [dict(w8, splits=32), one(128, 16), one(128, 16, 8), one(256, 8), one(128, 8), one(128, 16, 5, 2),
+                          one(256, 8, 5, 2), one(128, 8, 5, 4)],
+        "B16 L8 sliding": [dict(w8, splits=8), one(128, 16), one(128, 8), one(128, 8, 5, 2), one(256, 8), one(128, 8, 5, 4)],
+        "B32 L8 sliding": [dict(w8, splits=4), one(128, 16), one(128, 8), one(128, 8, 5, 2), one(256, 8)],
     }
+    cases = {k: v for k, v in cases.items() if k in plans}
     for name, (B, L, window) in cases.items():
         d = make(B, L, window)
         for plan in plans[name]:
