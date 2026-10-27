@@ -3224,6 +3224,7 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
     constexpr int WG = RB * TB, R = 64 * RB, MP = 128 * TB;             // warpgroups, weight rows per CTA, token rows in smem
     constexpr int KC = 128 * CK, NBOX = KC / 64, BOXB = MP * 128;
     constexpr int WST = RB * 4 * CK * 3072, XST = NBOX * BOXB;
+    static_assert(NSW >= 3 && NSX >= 3, "g12: delayed release needs 3+ stages");
     extern __shared__ __align__(1024) uint8_t g12_smem[];
     __shared__ __align__(8) unsigned long long full[NSW], xfull[NSX];
     const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
@@ -3275,9 +3276,11 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
     for (int c = 0; c < NC; ++c) {
         const int swi = c % NSW, sxi = c % NSX;
         __syncthreads();                                                // chunk c-1 fully consumed (wgmma waited below)
-        if (c > 0 && tid == 0) {
-            if (c - 1 + NSX < NC) issue_x(c - 1 + NSX, (c - 1) % NSX);
-            if (c - 1 + NSW < NC) issue_w(c - 1 + NSW, (c - 1) % NSW);
+        // delayed release: chunk c-2's wgmmas are complete (every warp passed two wait_group 1 steps of chunk c-1
+        // before this barrier), so its slots are refilled here; chunk c-1's wgmmas may still be in flight
+        if (c > 1 && tid == 0) {
+            if (c - 2 + NSX < NC) issue_x(c - 2 + NSX, (c - 2) % NSX);
+            if (c - 2 + NSW < NC) issue_w(c - 2 + NSW, (c - 2) % NSW);
         }
         mbar_wait(smem_u32(&xfull[sxi]), (uint32_t)((c / NSX) & 1));
         mbar_wait(smem_u32(&full[swi]), (uint32_t)((c / NSW) & 1));
@@ -3314,10 +3317,10 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
                 }
             }
         }
-        wgmma_wait<0>();                                                // the stage may be refilled after the next barrier
-        reg_fence4(a[0][0], a[0][1], a[0][2], a[0][3]);
-        reg_fence4(a[1][0], a[1][1], a[1][2], a[1][3]);
     }
+    wgmma_wait<0>();
+    reg_fence4(a[0][0], a[0][1], a[0][2], a[0][3]);
+    reg_fence4(a[1][0], a[1][1], a[1][2], a[1][3]);
     acc_fence(acc);
     unsigned long long t2 = 0;
     if constexpr (DIAG) t2 = gtimer();
@@ -3343,21 +3346,50 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
     }
 }
 
-// sums the K splits of part[z][n][tok] (coalesced over tok), adds row n's escapes, writes bf16 out[tok][n]
+// reduce: block = 16 output columns x all m tokens through a transposed smem tile: the escapes of the 16 rows first
+// (thread = (row, 8-token group); independent of the GEMM, before griddepcontrol.wait), then the K splits of
+// part[z][n][tok] (coalesced over tok), then bf16x2 row stores out[tok][n0 .. n0+16).
+constexpr int G12_RNL = 16;
 __global__ void __launch_bounds__(256)
 g12_reduce_kernel(const float* __restrict__ part, int KS, int m, int N,
                   const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
                   const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
 {
-    const int n = blockIdx.x, tok = threadIdx.x;
-    if (tok >= m) return;
-    const int e0 = esc_roff[n], e1 = esc_roff[n + 1];
-    float ev = 0.f;
-    for (int e = e0; e < e1; ++e) ev += esc_d[e] * __bfloat162float(X[(size_t)tok * ldx + esc_k[e]]);
+    __shared__ float acc[G12_RNL][257];
+    __shared__ int s_off[G12_RNL + 1];
+    const int n0 = blockIdx.x * G12_RNL, tid = threadIdx.x;
+    if (tid <= G12_RNL) s_off[tid] = esc_roff[n0 + tid];
+    for (int i = tid; i < G12_RNL * 256; i += 256) acc[i >> 8][i & 255] = 0.f;
+    __syncthreads();
+    {
+        const int nl = tid >> 4, tg = tid & 15;                          // row, 8-token group (tokens 8*tg .. +7, tg < m/8)
+        for (int e = s_off[nl]; e < s_off[nl + 1]; ++e) {
+            const int kk = esc_k[e];
+            const float d = esc_d[e];
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int tok = 8 * tg + i;
+                if (tok < m) acc[nl][tok] += d * __bfloat162float(X[(size_t)tok * ldx + kk]);
+            }
+        }
+        for (int tg2 = tg + 16; tg2 * 8 < m; tg2 += 16)                   // m = 256: the second half of the tokens
+            for (int e = s_off[nl]; e < s_off[nl + 1]; ++e) {
+                const int kk = esc_k[e];
+                const float d = esc_d[e];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) acc[nl][8 * tg2 + i] += d * __bfloat162float(X[(size_t)(8 * tg2 + i) * ldx + kk]);
+            }
+    }
     pdl_wait();
-    float sum = ev;
-    for (int zz = 0; zz < KS; ++zz) sum += __ldcg(part + ((size_t)zz * N + n) * m + tok);
-    out[(size_t)tok * ldo + n] = __float2bfloat16(sum);
+    for (int zz = 0; zz < KS; ++zz) {
+        const float* pz = part + ((size_t)zz * N + n0) * m;
+        for (int i = tid; i < G12_RNL * m; i += 256) acc[i / m][i % m] += __ldcg(pz + i);   // part[z][n0 + nl][tok], nl = i / m
+    }
+    __syncthreads();
+    for (int i = tid; i < m * (G12_RNL / 2); i += 256) {
+        const int tok = i / (G12_RNL / 2), p = i % (G12_RNL / 2);
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)tok * ldo + n0 + 2 * p) = __floats2bfloat162_rn(acc[2 * p][tok], acc[2 * p + 1][tok]);
+    }
 }
 
 __host__ constexpr int g12_smem_bytes(int rb, int tb, int ck, int nsw, int nsx) { return 1024 + nsw * rb * 4 * ck * 3072 + nsx * (2 * ck) * (128 * tb) * 128; }
@@ -3883,18 +3915,18 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
         if (diag_on) launch_g12<RB_, TB_, CK_, SW_, SX_, true>(xmap, m, Wp, (int)eb, pp, (int)n, (int)k, (int)ks, dg, stream); \
         else launch_g12<RB_, TB_, CK_, SW_, SX_, false>(xmap, m, Wp, (int)eb, pp, (int)n, (int)k, (int)ks, dg, stream); \
         launched = true; }
-    G12_CASE(4, 1, 1, 3, 2)
-    G12_CASE(4, 1, 1, 2, 2)
+    G12_CASE(2, 1, 1, 4, 4)
+    G12_CASE(2, 1, 1, 4, 3)
+    G12_CASE(2, 1, 1, 3, 4)
     G12_CASE(2, 1, 1, 3, 3)
-    G12_CASE(2, 1, 2, 2, 2)
-    G12_CASE(2, 2, 1, 3, 2)
-    G12_CASE(1, 2, 1, 4, 2)
+    G12_CASE(1, 1, 1, 4, 4)
 #undef G12_CASE
     TORCH_CHECK(launched, "g12: unsupported config (rb, tb, ck, nsw, nsx)");
     if (mode == 2) return;                                               // bench: GEMM only
+    TORCH_CHECK(n % G12_RNL == 0 && m <= 256 && out.stride(0) % 2 == 0, "g12: reduce geometry");
     cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3((unsigned)n);
-    cfg.blockDim = dim3((unsigned)m);
+    cfg.gridDim = dim3((unsigned)(n / G12_RNL));
+    cfg.blockDim = dim3(256);
     cfg.dynamicSmemBytes = 0;
     cfg.stream = stream;
     cudaLaunchAttribute attr[1];
@@ -4210,7 +4242,7 @@ _TB12_ON = False   # set by prepare() after the tb12 self-test (table output + p
 # (layer, n, m) -> (rb, tb, ck, nsw, nsx, ks); dispatched only after the prepare self-test (_WG12_ON)
 WG12_SHAPES = {}
 _WG12_ON = False
-G12_LAYOUTS = {(256, 1), (128, 1), (128, 2), (64, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)
+G12_LAYOUTS = {(128, 1), (64, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)
 T12_LAYOUTS = {(16, 4)}   # (r, ck) weight layouts kept in state (the bench sweeps them)
 T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
 T12_INTERP = False   # CPU-interpreter mode (fp32 dot over widened bit patterns); never on the GPU
@@ -4879,31 +4911,35 @@ def _bench(state):
     # == BEGIN g12 bench ==
     if ext is not None and BENCH_G12:
         print("BENCH g12 rb/tb/ck/nsw/nsx/ks (wgmma 12-bit, K split + PDL reduce) vs current; '!' = fp32 rel err > 5e-3; 'g' = GEMM only (no reduce)")
-        g12_cfgs = {128: [(4, 1, 1, 3, 2, 8), (4, 1, 1, 2, 2, 8), (4, 1, 1, 3, 2, 4), (2, 1, 1, 3, 3, 4), (2, 1, 1, 3, 3, 8), (2, 1, 2, 2, 2, 4), (1, 2, 1, 4, 2, 4)],
-                    256: [(2, 2, 1, 3, 2, 8), (2, 2, 1, 3, 2, 4), (1, 2, 1, 4, 2, 4), (1, 2, 1, 4, 2, 8)]}
+        # (rb, tb, ck, nsw, nsx, ks); ks per layer: 128 CTAs (pooler 32 tiles x 4, qkv 18 x 8, unpooler/o 64 x 2); check e38ce861:
+        # the wgmma path is correct; GEMM-only ties cuBLAS at pooler m=128 (23.1 vs 23.3) with the pipe drained per chunk
+        g12_cfgs = {128: [(2, 1, 1, 4, 4, 4), (2, 1, 1, 4, 3, 4), (2, 1, 1, 3, 4, 4), (2, 1, 1, 3, 3, 4), (2, 1, 1, 4, 4, 8), (2, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 4)],
+                    256: []}
+        g12_ks = {"pooler": {4: 4, 8: 8, 2: 2}, "qkv_gate": {4: 8, 8: 16, 2: 4}, "unpooler": {4: 2, 8: 4, 2: 1}, "o": {4: 2, 8: 4, 2: 1}}
 
-        def g12cfg(c, mode=0):
-            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5], mode=mode)
+        def g12cfg(c, layer, mode=0):
+            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=g12_ks[layer][c[5]], mode=mode)
 
         for m in (128, 256):
             for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 8192), ("o", 8192)):
-                if not budget():
+                if not budget() or not g12_cfgs[m]:
                     break
                 parts = [row("current", layer, m, n, None)]
                 for c in g12_cfgs[m]:
                     if layer == "qkv_gate" and n % (64 * c[0]) != 0:
                         continue
-                    parts.append(row("/".join(str(v) for v in c), layer, m, n, g12cfg(c)))
-                    if c == g12_cfgs[m][0]:
-                        parts.append(row("g", layer, m, n, g12cfg(c, 2)))
+                    cc = g12cfg(c, layer)
+                    parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}", layer, m, n, cc))
+                    if c in (g12_cfgs[m][0], g12_cfgs[m][3]):
+                        parts.append(row("g", layer, m, n, g12cfg(c, layer, 2)))
                 print(f"  m={m} {layer:9s} n={n}: " + " | ".join(parts))
         dg = state["diag"]
-        for layer, n, m, c in (("pooler", 4096, 128, (4, 1, 1, 3, 2, 8)), ("pooler", 4096, 128, (2, 1, 1, 3, 3, 4)), ("qkv_gate", 2304, 128, (4, 1, 1, 3, 2, 8)),
-                               ("pooler", 4096, 256, (2, 2, 1, 3, 2, 8)), ("unpooler", 8192, 128, (4, 1, 1, 3, 2, 4))):
+        for layer, n, m, c in (("pooler", 4096, 128, (2, 1, 1, 4, 4, 4)), ("pooler", 4096, 128, (2, 1, 1, 3, 3, 4)), ("qkv_gate", 2304, 128, (2, 1, 1, 4, 4, 4)),
+                               ("unpooler", 8192, 128, (2, 1, 1, 4, 4, 4)), ("pooler", 4096, 128, (1, 1, 1, 4, 4, 4))):
             if not budget():
                 break
             x = xs[(m, layers[layer][1])]
-            cfg = g12cfg(c); cfg["diag"] = True
+            cfg = g12cfg(c, layer); cfg["diag"] = True
             if not _usable(cfg, m, n, layers[layer][1]):
                 continue
             res = []
