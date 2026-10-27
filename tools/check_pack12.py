@@ -9,7 +9,10 @@ import submission as S
 
 seed = int(sys.argv[1]) if len(sys.argv) > 1 else R.WEIGHTS_SEED
 weights = R.generate_weights(seed, device="cpu")
-for name in ("qkv_gate", "o", "pooler", "unpooler"):
+_r = weights["router"]
+weights["router_hi"] = _r.to(torch.bfloat16)
+weights["router_lo"] = (_r - weights["router_hi"].float()).to(torch.bfloat16)
+for name in ("qkv_gate", "o", "pooler", "unpooler", "router_hi", "router_lo"):
     w = weights[name]
     t = time.time()
     pk = S._pack12(w)
@@ -36,4 +39,5 @@ for name in ("qkv_gate", "o", "pooler", "unpooler"):
     print(f"{name:9s} eb {pk['eb']} escapes {pk['n_esc']} ({pk['n_esc'] / w.numel():.1e}) differing {n_diff} covered {covered}"
           f" | max abs err after escapes {maxerr:.2e} (rel on escapes {rel:.1e}) | bytes {bytes_ / (w.numel() * 2):.4f} of bf16 | {time.time() - t:.1f}s")
     assert covered and maxerr < 1e-9
+    assert torch.equal(pk["esc_roff"][::S.PACK_BN], pk["esc_off"]), "per-row offsets disagree with tile offsets"
 print("pack12 ok")
