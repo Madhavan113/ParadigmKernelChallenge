@@ -3662,21 +3662,19 @@ void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
 #define T12E_NTD(R_, C_, W_, SW_, SX_) T12E_CASE_D(R_, C_, W_, SW_, SX_, 1) T12E_CASE_D(R_, C_, W_, SW_, SX_, 2) T12E_CASE_D(R_, C_, W_, SW_, SX_, 4)
     CUtensorMap xmap;
     if (variant == 5) xmap = okc_x_map3(X.data_ptr(), m, (int)k, ldx, 8 * (int)nt, 2 * (int)ck);
-    T12C_NT(32, 4, 8, 5, 3)
-    T12E_NT(32, 4, 8, 4, 3)
-    T12E_NT(32, 4, 8, 5, 3)
-    T12E_NT(32, 4, 8, 4, 4)
-    T12E_NT(32, 4, 8, 6, 3)
-    T12E_NT(32, 2, 8, 8, 4)
-    T12E_NT(32, 2, 8, 8, 6)
-    T12E_NT(32, 2, 8, 12, 4)
-    T12E_NT(16, 4, 8, 4, 3)
-    T12E_NT(16, 4, 4, 4, 3)
-    T12E_NT(16, 4, 4, 4, 4)
-    T12E_NT(16, 2, 4, 8, 4)
-    T12E_NT(16, 2, 4, 6, 6)
-    T12E_NTD(32, 4, 8, 5, 3)
-    T12E_NTD(16, 4, 8, 4, 3)
+    T12E_CASE(16, 4, 4, 4, 4, 1) T12E_CASE(16, 4, 4, 4, 4, 2)
+    T12E_CASE(16, 4, 4, 4, 3, 1) T12E_CASE(16, 4, 4, 4, 3, 2)
+    T12E_CASE(16, 4, 4, 5, 4, 1) T12E_CASE(16, 4, 4, 5, 4, 2)
+    T12E_CASE(16, 4, 4, 5, 3, 1) T12E_CASE(16, 4, 4, 5, 3, 2)
+    T12E_CASE(16, 4, 4, 6, 4, 1) T12E_CASE(16, 4, 4, 6, 4, 2)
+    T12E_CASE(16, 4, 4, 6, 3, 1) T12E_CASE(16, 4, 4, 6, 3, 2)
+    T12E_CASE(16, 4, 4, 3, 4, 1) T12E_CASE(16, 4, 4, 3, 4, 2)
+    T12E_CASE(16, 4, 4, 3, 3, 1) T12E_CASE(16, 4, 4, 3, 3, 2)
+    T12E_CASE(16, 4, 8, 4, 4, 1) T12E_CASE(16, 4, 8, 4, 4, 2)
+    T12E_CASE(16, 4, 8, 4, 3, 1) T12E_CASE(16, 4, 8, 4, 3, 2)
+    T12E_CASE(16, 4, 8, 5, 4, 1) T12E_CASE(16, 4, 8, 5, 4, 2)
+    T12E_CASE(16, 4, 8, 6, 3, 1) T12E_CASE(16, 4, 8, 6, 3, 2)
+    T12E_CASE_D(16, 4, 4, 4, 4, 1) T12E_CASE_D(16, 4, 4, 4, 3, 2)
 #undef T12C_NT
 #undef T12E_NT
 #undef T12E_NTD
@@ -3971,9 +3969,9 @@ W12B_SHAPES = {}   # w12 ties the table at m=8 on the judge (check a6b2bd96: poo
 # (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
 T12_SHAPES = {}
 # tb12: the single-launch TMA bulk-copy 12-bit GEMM (one CTA per r-row tile over the full K): (layer, n, m) -> (r, ck, w, nsw, nsx)
-TB12_SHAPES = {}   # check d777cb3c (t12c, judged): loses everywhere (pooler m=8/16/32 19.6/22.9/30.6 vs 18.2/18.0/20.0)
+TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 4, 4), ("pooler", 4096, 16): (16, 4, 4, 4, 3)}   # t12e (check d59a9b55 bench: 14.9 / 15.8 vs 17.9 / 17.8); the other shapes lose or tie
 _TB12_ON = False   # set by prepare() after the tb12 self-test (table output + probe rows) passes
-T12_LAYOUTS = {(32, 2), (16, 2), (32, 4), (16, 4)}   # (r, ck) weight layouts kept in state (the bench sweeps them)
+T12_LAYOUTS = {(16, 4)}   # (r, ck) weight layouts kept in state (the bench sweeps them)
 T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
 T12_INTERP = False   # CPU-interpreter mode (fp32 dot over widened bit patterns); never on the GPU
 # (layer, n, m) -> (bn, warps, unroll, sk): the tiled CTA-cooperative GEMV (m = 1) over the packed tiles
@@ -4531,8 +4529,8 @@ def _bench(state):
         # ---- STEP 2: the single-launch TMA 12-bit GEMM vs the current path
         print("BENCH tb12 r/ck/w/nsw/nsx vs current; '!' = fp32 rel err > 5e-3; '~' = differs from the table output by > 2e-3")
         # (r, ck, w, nsw, nsx, variant): v1 = t12 (check 11ed8ae1: x bulk copies per row throttle the ring), v2 = t12b
-        cfgs = [(32, 4, 8, 5, 3, 3), (32, 4, 8, 4, 3, 5), (32, 4, 8, 5, 3, 5), (32, 4, 8, 4, 4, 5), (32, 4, 8, 6, 3, 5), (32, 2, 8, 8, 4, 5),
-                (32, 2, 8, 8, 6, 5), (32, 2, 8, 12, 4, 5), (16, 4, 8, 4, 3, 5), (16, 4, 4, 4, 3, 5), (16, 4, 4, 4, 4, 5), (16, 2, 4, 8, 4, 5), (16, 2, 4, 6, 6, 5)]
+        cfgs = [(16, 4, 4, 4, 4, 5), (16, 4, 4, 4, 3, 5), (16, 4, 4, 5, 4, 5), (16, 4, 4, 5, 3, 5), (16, 4, 4, 6, 4, 5), (16, 4, 4, 6, 3, 5),
+                (16, 4, 4, 3, 4, 5), (16, 4, 4, 3, 3, 5), (16, 4, 8, 4, 4, 5), (16, 4, 8, 4, 3, 5), (16, 4, 8, 5, 4, 5), (16, 4, 8, 6, 3, 5)]
 
         def tb(c, m):
             return dict(tb12=True, r=c[0], ck=c[1], w=c[2], nsw=c[3], nsx=c[4], nt=tb12_nt(m), v=c[5])
@@ -4578,7 +4576,7 @@ def _bench(state):
             finally:
                 _OVERRIDE = None
 
-        for m in (8, 16, 32, 1):
+        for m in (8, 16):
             for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192)):
                 if not budget():
                     break
@@ -4596,12 +4594,11 @@ def _bench(state):
                 print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
             if m == 8:
                 for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 1024), ("o", 8192)):
-                    print(f"  probe {layer:9s}: " + " | ".join(f"{c[0]}/{c[1]} {probe(layer, n, c)}" for c in ((32, 4, 8, 5, 3, 5), (16, 4, 8, 4, 3, 5))))
+                    print(f"  probe {layer:9s}: " + " | ".join(f"{c[0]}/{c[1]} {probe(layer, n, c)}" for c in ((16, 4, 4, 4, 4, 5),)))
         # ---- DIAG: %globaltimer phases of CTA 0 (fill = first stage landed, loop, epilogue) and the CTA span
         dg = state["diag"]
-        for layer, n, m, c in (("pooler", 4096, 8, (32, 4, 8, 5, 3, 5)), ("pooler", 4096, 32, (32, 4, 8, 5, 3, 5)), ("pooler", 4096, 8, (16, 4, 8, 4, 3, 5)), ("pooler", 4096, 16, (32, 4, 8, 5, 3, 5)),
-                               ("pooler", 4096, 32, (16, 4, 8, 4, 3, 5)), ("qkv_gate", 2304, 8, (16, 4, 8, 4, 3, 5)), ("unpooler", 8192, 16, (32, 4, 8, 5, 3, 5)),
-                               ("o", 8192, 8, (32, 4, 8, 5, 3, 5)), ("pooler", 4096, 1, (32, 4, 8, 5, 3, 5)), ("qkv_gate", 2304, 32, (16, 4, 8, 4, 3, 5))):
+        for layer, n, m, c in (("pooler", 4096, 8, (16, 4, 4, 4, 4, 5)), ("pooler", 4096, 16, (16, 4, 4, 4, 3, 5)), ("unpooler", 8192, 16, (16, 4, 4, 4, 3, 5)),
+                               ("qkv_gate", 2304, 8, (16, 4, 4, 4, 4, 5))):
             if not budget():
                 break
             x = xs[(m, layers[layer][1])]

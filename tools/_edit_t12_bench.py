@@ -42,8 +42,8 @@ NEW = r'''    TAB = {"table": True}
         # ---- STEP 2: the single-launch TMA 12-bit GEMM vs the current path
         print("BENCH tb12 r/ck/w/nsw/nsx vs current; '!' = fp32 rel err > 5e-3; '~' = differs from the table output by > 2e-3")
         # (r, ck, w, nsw, nsx, variant): v1 = t12 (check 11ed8ae1: x bulk copies per row throttle the ring), v2 = t12b
-        cfgs = [(32, 4, 8, 5, 3, 3), (32, 4, 8, 4, 3, 5), (32, 4, 8, 5, 3, 5), (32, 4, 8, 4, 4, 5), (32, 4, 8, 6, 3, 5), (32, 2, 8, 8, 4, 5),
-                (32, 2, 8, 8, 6, 5), (32, 2, 8, 12, 4, 5), (16, 4, 8, 4, 3, 5), (16, 4, 4, 4, 3, 5), (16, 4, 4, 4, 4, 5), (16, 2, 4, 8, 4, 5), (16, 2, 4, 6, 6, 5)]
+        cfgs = [(16, 4, 4, 4, 4, 5), (16, 4, 4, 4, 3, 5), (16, 4, 4, 5, 4, 5), (16, 4, 4, 5, 3, 5), (16, 4, 4, 6, 4, 5), (16, 4, 4, 6, 3, 5),
+                (16, 4, 4, 3, 4, 5), (16, 4, 4, 3, 3, 5), (16, 4, 8, 4, 4, 5), (16, 4, 8, 4, 3, 5), (16, 4, 8, 5, 4, 5), (16, 4, 8, 6, 3, 5)]
 
         def tb(c, m):
             return dict(tb12=True, r=c[0], ck=c[1], w=c[2], nsw=c[3], nsx=c[4], nt=tb12_nt(m), v=c[5])
@@ -89,7 +89,7 @@ NEW = r'''    TAB = {"table": True}
             finally:
                 _OVERRIDE = None
 
-        for m in (8, 16, 32, 1):
+        for m in (8, 16):
             for layer, n in (("pooler", 4096), ("unpooler", 8192), ("qkv_gate", 2304), ("o", 8192)):
                 if not budget():
                     break
@@ -107,12 +107,11 @@ NEW = r'''    TAB = {"table": True}
                 print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
             if m == 8:
                 for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 1024), ("o", 8192)):
-                    print(f"  probe {layer:9s}: " + " | ".join(f"{c[0]}/{c[1]} {probe(layer, n, c)}" for c in ((32, 4, 8, 5, 3, 5), (16, 4, 8, 4, 3, 5))))
+                    print(f"  probe {layer:9s}: " + " | ".join(f"{c[0]}/{c[1]} {probe(layer, n, c)}" for c in ((16, 4, 4, 4, 4, 5),)))
         # ---- DIAG: %globaltimer phases of CTA 0 (fill = first stage landed, loop, epilogue) and the CTA span
         dg = state["diag"]
-        for layer, n, m, c in (("pooler", 4096, 8, (32, 4, 8, 5, 3, 5)), ("pooler", 4096, 32, (32, 4, 8, 5, 3, 5)), ("pooler", 4096, 8, (16, 4, 8, 4, 3, 5)), ("pooler", 4096, 16, (32, 4, 8, 5, 3, 5)),
-                               ("pooler", 4096, 32, (16, 4, 8, 4, 3, 5)), ("qkv_gate", 2304, 8, (16, 4, 8, 4, 3, 5)), ("unpooler", 8192, 16, (32, 4, 8, 5, 3, 5)),
-                               ("o", 8192, 8, (32, 4, 8, 5, 3, 5)), ("pooler", 4096, 1, (32, 4, 8, 5, 3, 5)), ("qkv_gate", 2304, 32, (16, 4, 8, 4, 3, 5))):
+        for layer, n, m, c in (("pooler", 4096, 8, (16, 4, 4, 4, 4, 5)), ("pooler", 4096, 16, (16, 4, 4, 4, 3, 5)), ("unpooler", 8192, 16, (16, 4, 4, 4, 3, 5)),
+                               ("qkv_gate", 2304, 8, (16, 4, 4, 4, 4, 5))):
             if not budget():
                 break
             x = xs[(m, layers[layer][1])]
