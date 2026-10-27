@@ -3523,6 +3523,8 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 
 BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 200
+BENCH_STREAM = True   # STEP 1: bulk-copy stream sweep
+BENCH_T12 = True      # STEP 2: tb12 rows
 
 
 def _bench(state):
