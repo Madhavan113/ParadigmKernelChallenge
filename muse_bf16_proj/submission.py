@@ -2641,24 +2641,15 @@ void gqx(at::Tensor W, at::Tensor x, at::Tensor out, int64_t M, int64_t N, int64
 # Bytes each SM ingests = W (BM x K/cl x 2) + x (BN x K/cl x 2): at BM = 64 the x re-reads are 2x the weights (m = 128),
 # so wider row blocks with deeper K splits (DSMEM reduce) cut the per-SM traffic; cl <= 8 (portable cluster size).
 GQX_CONFIGS = {
-    # judged (run f3e50d8b, raw graph replay us): qkv m128 (1,3,8) 17.9 | (2,6,6) 29.0 (18 clusters of 6 > 17 active: second
-    # wave) | (3,8,5) 21.8; pooler m128 gq(1,2,8) 24.5 | (2,4,6) 37.3 (32 > 30: wave) | (4,8,4) 43.6 (16 > 15: wave);
-    # unpooler m128 torchT 22.6 | (2,2,6) 24.6 | (4,4,4) 42.1 (wave); o m128 torchT 10.4 | (2,2,6) 10.5 | (1,1,8) 12.8;
-    # m256: qkv (1,3,5) 24.2 vs torch 22.8; pooler (2,4,4) 49 / (2,2,4) 56 vs cutlass 31; unpooler (2,2,4) 32 vs 27.3;
-    # o (2,2,4) 13.3 / (1,1,5) 16.6 vs 12.4. Max active clusters (smem ~200 KB): cl2 66, cl3 39, cl4 30, cl6 17, cl8 15.
-    ("qkv_gate", 128): [(1, 3, 8),    # v141: 36 row blocks x 3 = 108 CTAs
-                        (2, 5, 6),    # 18 x 5 = 90 CTAs (cl 5 capacity unknown: printed)
-                        (2, 4, 6)],   # 18 x 4 = 72 CTAs
-    ("qkv_gate", 256): [(1, 3, 5)],
-    ("pooler", 128): [(2, 3, 6),      # 32 x 3 = 96 CTAs, 32 clusters <= 39
-                      (1, 2, 8)],     # gq's geometry through the gqx epilogue (fragments via DSMEM vs gq's st.async)
-    ("pooler", 256): [(1, 2, 5)],     # 64 x 2 = 128 CTAs, NWG 1 (NWG 2 at BN 256 ran at 35% of peak)
-    ("unpooler", 128): [(1, 1, 8),    # 128 CTAs, no cluster
-                        (2, 2, 6),    # 128 CTAs (24.6 vs torchT 22.6)
-                        (4, 3, 4)],   # 32 x 3 = 96 CTAs
-    ("unpooler", 256): [(1, 1, 5)],   # 128 CTAs, no cluster
-    ("o", 128): [(2, 2, 6)],          # tie with torchT
-    ("o", 256): [(2, 2, 4)],
+    # judged (runs f3e50d8b / prefill-slot 11047a44, raw graph-replay us): qkv m128 (1,3,8) 17.9-18.1 beats every wider /
+    # deeper split ((2,5,6) 19.6, (2,4,6) 20.1, (2,6,6) 29 second wave, (3,8,5) 21.8); pooler m128 gq (1,2,8) 25.4 beats
+    # gqx (1,2,8) 26.0 (its DSMEM epilogue costs 0.6 us over gq's st.async one), (2,3,6) 25.9, (2,4,6) 37 (wave), (4,8,4)
+    # 44 (wave); unpooler m128 torchT 22.7 beats (1,1,8) 23.5, (2,2,6) 24.7, (4,3,4) 28.7, (4,4,4) 42 (wave); o m128
+    # torchT 10.4-10.6 vs (2,2,6) 10.5-12.9; m256: pooler (1,2,5) 32.6 beats torch 33.9, loses to CUTLASS 31.3; qkv (1,3,5)
+    # 24 vs torch 23; unpooler (1,1,5) 29.5 vs torchT 27.6; o (2,2,4) 13.3-16.6 vs 12.4; BN 256 with 2 warpgroups 49-56.
+    # Max active clusters at ~200 KB smem: cl2 66, cl3 39, cl4 30, cl5 22, cl6 17, cl8 15 (a grid beyond runs two waves).
+    ("qkv_gate", 128): [(1, 3, 8)],   # v141: 36 row blocks x 3 K-thirds = 108 CTAs (cuBLAS 16.4 -> 14.0 us at m=128)
+    ("pooler", 256): [(1, 2, 5)],     # 128 CTAs: 32.6 vs cuBLAS 33.9 (CUTLASS 31.3 when its build makes it in time)
 }
 USE_GQX = True
 TORCHT_LAYERS = ("unpooler", "o")   # layers that also get a K-major BF16 copy for the "torchT" (mm(x, W^T)) route
@@ -3513,20 +3504,34 @@ SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC, CL
     ('qkv8t_r144', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),         # tokr8 [0.969 vs 0.979]
     ('qkv16t_r200', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),        # tokr16 [0.985 vs 0.994]
     ('o16t_r68', 'o', 8192, 32, 2, 2, 1, 4, 2, 1),                  # tokr16 [0.937 vs 0.957]
-    # cluster-of-2 variants (autotuned against the picks above; x bytes per SM halve, weight bytes unchanged)
-    ('qkv32c2a', 'qkv_gate', 2304, 48, 3, 2, 4, 1, 1, 2),           # 48 x 2 = 96 CTAs, 8 consumer warps, 256 k/stage
-    ('qkv32c2b', 'qkv_gate', 2304, 48, 3, 2, 2, 2, 1, 2),           # 96 CTAs, 4 consumer warps, 256 k/stage
-    ('pooler32c2', 'pooler', 4096, 64, 4, 2, 2, 2, 1, 2),           # 64 x 2 = 128 CTAs
-    ('pooler16c2', 'pooler', 4096, 64, 4, 2, 2, 4, 1, 2),           # tokr16: 128 CTAs, 512 k/stage
-    ('unpooler32c2', 'unpooler', 8192, 128, 4, 4, 1, 4, 1, 2),      # 64 x 2 = 128 CTAs, 4 consumer warps (no K split inside)
+    # retired after judging (prefill-slot runs f3e50d8b / ba7affa0, raw graph-replay us vs the pick): cluster-of-2 K splits
+    # at R 48-128 (qkv32 16.7-17.7 vs 14.4, pooler32 22.1 vs 19.1, pooler16 20.5 vs 18.0, unpooler32 21.8 vs 18.5) and
+    # small-R rings at 3-4 CTAs per SM (pooler8 R8 23.2 vs 18.1, pooler16 R8/R16 24.3/19.3 vs 18.5, pooler32 R8/R16
+    # 36.2/22.4 vs 19.6, qkv8/16/32 R8 14.4/15.3/21.0 vs 13.6/13.3/14.4, unpooler16/32 R16 22.8/25.4 vs 17.8/18.8,
+    # o8/16/32 R16 11.2/11.5/12.8 vs 9.4/9.3/9.5, slice8 R8 9.4 vs 8.1): neither halving the x bytes per SM nor more
+    # bytes in flight per SM beats the picks above; per-CTA fixed costs and x re-reads dominate at small R.
     # the decode layer's fused pooler + router launch (sk2f, FUSE): pooler rows then one router piece per CTA through the
     # same ring; its stream is built like any other config, the kernel is instantiated only with FUSE
     ('pooler', 'pooler', 4096, 32, 4, 1, 8, 1, 2, 1),
+    # small-R configs (attribution 11047a44: every m <= 32 shape is load-bound at ~3.5 TB/s with 1-2 CTAs per SM, the
+    # mma/decode phases not overlapped at m=32): 14-22 KB stages, 3-stage rings of ~45-70 KB -> 3-4 CTAs per SM
+    ('pooler8q_r48', 'pooler', 4096, 8, 1, 1, 4, 2, 2, 1),          # 512 CTAs, 4 consumer warps, 512 k/stage
+    ('pooler16q_r72', 'pooler', 4096, 8, 1, 1, 4, 2, 2, 1),         # 512 CTAs
+    ('pooler32q_r60', 'pooler', 4096, 8, 1, 1, 4, 1, 2, 1),         # 512 CTAs, 256 k/stage
+    ('pooler16h_r60', 'pooler', 4096, 16, 2, 1, 4, 1, 2, 1),        # 256 CTAs, 256 k/stage
+    ('pooler32h_r72', 'pooler', 4096, 16, 2, 1, 4, 1, 1, 1),        # 256 CTAs
+    ('qkv8q_r48', 'qkv_gate', 2304, 8, 1, 1, 4, 2, 2, 1),           # 288 CTAs
+    ('qkv16q_r72', 'qkv_gate', 2304, 8, 1, 1, 4, 2, 2, 1),
+    ('qkv32q_r60', 'qkv_gate', 2304, 8, 1, 1, 4, 1, 2, 1),
+    ('unpooler16q_r48', 'unpooler', 8192, 16, 2, 1, 4, 1, 2, 1),    # 512 CTAs, 256 k/stage (K = 4096: 16 stages)
+    ('unpooler32q_r72', 'unpooler', 8192, 16, 2, 1, 4, 1, 1, 1),
+    ('o8q_r48', 'o', 8192, 16, 2, 1, 4, 1, 2, 1),                   # 512 CTAs (K = 1024: 4 stages)
+    ('o16q_r48', 'o', 8192, 16, 2, 1, 4, 1, 2, 1),
+    ('o32q_r72', 'o', 8192, 16, 2, 1, 4, 1, 1, 1),
+    ('slice8q_r48', 'unpooler', 1024, 8, 1, 1, 4, 1, 2, 1),         # the m <= 8 slice: 128 CTAs, 256 k/stage
 ]
 SK2_FUSED_CONFIG = 'pooler'   # the config sk2f runs (NT 4, WSK 8, UPW 1: 8 consumer warps = the router piece's 8 K-units)
-SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's
-    # judged (run f3e50d8b, raw us): qkv32c2a 17.7 / qkv32c2b 16.7 vs qkv32_r208 14.4; pooler32c2 22.1 vs 19.1;
-    # pooler16c2 20.5 vs 18.0; unpooler32c2 21.8 vs 18.5: halving the x bytes per SM never paid for the cluster epilogue
+SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's (see the retired list)
 }
 SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
@@ -3585,7 +3590,7 @@ def _sk2_geom(cfg, tokr):
     return hl, nstage
 
 
-DIAG_SK2 = True   # measurement runs: compile the sk2 diagnostics in and time the dg modes from prepare (see _diag_sk2)
+DIAG_SK2 = False   # measurement runs: compile the sk2 diagnostics in and time the dg modes from prepare (see _diag_sk2)
 DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 32), ("unpooler", 16),
                    ("unpooler", 32), ("o", 16)]
 DIAG_SK2_MODES = [(0, "full"), (1, "no-epilogue"), (2, "no-compute"), (4, "no-x"), (6, "loads-only"), (8, "alu-not-mma"),
@@ -3722,8 +3727,9 @@ CG_CONFIGS = {"qkv_gate": (2, 256), "o": (2, 64), "unpooler": (2, 128), "pooler"
 # (v137: pooler m=1 cgemv 2x512 measured -0.34 us vs sk2; 2x256 ties sk2, 4/8 rows or 1 row lose)
 # alternatives the autotuner times against CG_CONFIGS (m = 1): more rows per CTA = fewer CTAs and fewer x re-reads (o at
 # 2 x 64: 4096 CTAs of 3 KB each re-reading 2 KB of x: as many x bytes as weight bytes); K >= 16 threads per CTA
-CG_ALT = {"o": [(4, 64), (8, 64), (4, 32), (2, 32)], "unpooler": [(4, 128), (8, 128), (4, 256), (2, 256)],
-          "qkv_gate": [(4, 256), (2, 128), (4, 128)]}
+# judged (ba7affa0, raw us): o 2x64 8.6 beats 4x64 8.8, 8x64 9.1, 4x32 9.4, 2x32 9.7; unpooler 2x128 7.04 beats 2x256
+# 7.07, 4x128 / 4x256 7.2, 8x128 8.1; qkv 2x256 12.4 beats 4x128 12.9, 2x128 13.6, 4x256 13.8 -> no alternatives kept
+CG_ALT = {}
 CG_K = {"qkv_gate": 8192, "o": 1024, "unpooler": 4096, "pooler": 8192}
 
 
