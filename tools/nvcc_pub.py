@@ -31,6 +31,8 @@ defs = S.wgmma_defs([8, 16, 32, 64, 128])
 only = None
 if "--only" in sys.argv:   # a subset TU (keeps the local nvcc under the Docker memory limit): --only sk2,gq,gqx
     i = sys.argv.index("--only"); only = sys.argv[i + 1].split(","); del sys.argv[i:i + 2]
+if "--diag" in sys.argv:   # assemble the sk2 source as a DIAG build (the dg bits become runtime branches)
+    sys.argv.remove("--diag"); S.DIAG_SK2 = True
 if "--sk2-alt-only" in sys.argv:   # instantiate only the SK2_ALT configs (the picks are already validated on the judge)
     sys.argv.remove("--sk2-alt-only"); S.SK2_PICK = {}
 if only is None:
