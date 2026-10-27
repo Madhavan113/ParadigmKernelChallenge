@@ -2674,6 +2674,9 @@ __device__ __forceinline__ int wgs_cost(int pb, int cnt) {
 #ifndef OKC_WGSMMAN
 #define OKC_WGSMMAN 0  // WGS: jobs with <= this many n-tiles run on per-warp mma.sync (wgs_seg_mma) instead of wgmma
 #endif
+#ifndef OKC_WGSMMANA
+#define OKC_WGSMMANA 4  // wgs_seg_mma: accumulator chains for 1-n-tile jobs
+#endif
 #ifndef OKC_WGSGS4N
 #define OKC_WGSGS4N 0  // WGS: jobs with <= this many n-tiles commit 4 k16 steps per wgmma group (small accumulators)
 #endif
@@ -3351,7 +3354,7 @@ __device__ __forceinline__ void wgs_seg_mma(const Params& p, Smem& S, unsigned c
   const int warp = WARP_IDX(tid);
   const int wg = warp >> 2, wp = warp & 3, g = lane >> 2, t = lane & 3, wt = tid & 127;
   constexpr int UBL = PB ? 4 : 5;
-  constexpr int NA = NTT == 1 ? 4 : 2;  // independent accumulator chains per n-tile
+  constexpr int NA = NTT == 1 ? OKC_WGSMMANA : 2;  // independent accumulator chains per n-tile
   const uint32_t k16c = 16u + p.zero;
   const unsigned char* xring = ring + WGS_NS * UNIT_BYTES + g * 16 + t * 4;
   float acc[NA][NTT][4];
@@ -4541,7 +4544,7 @@ TINY2_MAX_M = 8
 # TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
-DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
+DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
 DIAG_SET = "I"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
@@ -4559,6 +4562,7 @@ DIAG_VARIANT_SETS = {
         "wgs_mma1": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=1",), "shapes": _WGS_SHAPES},
         "wgs_mma2": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=2",), "shapes": _WGS_SHAPES},
         "wgs_mma2_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "wgs_mma2_na2": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=2", "-DOKC_WGSMMANA=2"), "shapes": _WGS_SHAPES},
     },
     "H": {  # WGS for M <= 64: FT_T=32 frees accumulator registers (x slots 16 KB): deeper wgmma pipeline / weight ring
         "main": {"defines": MAIN_DEFINES, "shapes": [32, 128]},
