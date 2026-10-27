@@ -8,7 +8,7 @@ src = "#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + C.C
 p = pathlib.Path("/work/tools/proj_kernel_only.cu"); p.write_text(src)
 import sysconfig
 inc = sum([["-I", d] for d in E.include_paths(device_type="cuda") + [sysconfig.get_paths()["include"]]], [])
-cmd = ["nvcc", "-arch=sm_90a", "-O3", "-std=c++20", "-c", "-o", "/tmp/proj.o", "-Xptxas", "-v", "-DTORCH_API_INCLUDE_EXTENSION_H",
+cmd = ["nvcc", "-gencode", "arch=compute_90a,code=sm_90a", "-O3", "-std=c++20", "-c", "-o", "/tmp/proj.o", "-Xptxas", "-v", "-DTORCH_API_INCLUDE_EXTENSION_H",
        "-D_GLIBCXX_USE_CXX11_ABI=" + ("1" if getattr(E, "_GLIBCXX_USE_CXX11_ABI", True) else "0")] + inc + [str(p)]
 r = subprocess.run(cmd, capture_output=True, text=True)
 out = r.stdout + r.stderr
