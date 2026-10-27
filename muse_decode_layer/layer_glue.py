@@ -258,7 +258,7 @@ def _bnd1_selftest(st):
     g = torch.Generator(device=dev).manual_seed(779)
     f32 = dict(device=dev, dtype=torch.float32)
     report = []
-    for T in (1, 8):
+    for T in (1,):   # the prologue keeps h in 16 KB of shared memory: M = 1 only
         a = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
         s = torch.randn(T, HIDDEN, generator=g, device=dev)
         h = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
@@ -284,6 +284,52 @@ def _bnd1_selftest(st):
             return
     print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
     st["fuse_bnd1_ok"] = True
+
+
+def _norm_selftest(st):
+    """Routing in the MoE kernel + the fused launch's grid-barrier pre-expert norm, against _route_split + the MoE's
+    plain entry on synthetic activations (T = 1, 8, 16, 32): xm must match within rounding, the chosen ids exactly,
+    the expert output within rounding. Any mismatch or exception disables the path (st["route_moe_ok"]); printed."""
+    st["route_moe_ok"] = False
+    if (not ROUTE_IN_MOE or st.get("bfp") is None or "moe_kernel_fn_logits" not in globals()
+            or "norm" not in bfp_fused_pooler_router.__code__.co_varnames or st.get("ma") is None
+            or "wts" not in st["ma"]):
+        print("routing in the MoE kernel: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    g = torch.Generator(device=dev).manual_seed(780)
+    ls = torch.zeros(1, dtype=torch.int32, device=dev)
+    report = []
+    for T in (1, 8, 16, 32):
+        h = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        xm = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
+        ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
+        try:
+            _bfp_pdl(T)
+            pooled, logits = bfp_fused_pooler_router(h, st["bfp"], None, None, (st["g_preexp"], xm))
+            # a synthetic skew so that some routes land on the 32 local experts (as the judge's inputs do)
+            logits = logits + 0.25 * torch.randn(T, N_EXPERTS, generator=g, device=dev)
+            out = _ma_run_logits(st, xm, logits, st["bias"], ls, ids, T)
+            torch.cuda.synchronize()
+        except Exception as ex:  # noqa: BLE001
+            print(f"routing in the MoE kernel T{T}: FAILED {repr(ex)[:300]}", flush=True)
+            return
+        ids2 = torch.empty_like(ids)
+        lids2 = torch.empty_like(ids)
+        wts2 = torch.empty((T, 8), device=dev, dtype=torch.float32)
+        xm2 = torch.empty_like(xm)
+        _route_split[(T,)](pooled, logits, st["bias"], st["g_preexp"], ids2, wts2, xm2, ls, lids2, PERMUTED=False, num_warps=8)
+        out2 = _ma_run(st, xm2, lids2, wts2, T)
+        torch.cuda.synchronize()
+        d_ids = int((ids != ids2).sum())
+        d_x = float((xm.float() - xm2.float()).norm() / max(1e-6, float(xm2.float().norm())))
+        d_o = float((out.float() - out2.float()).norm() / max(1e-6, float(out2.float().norm())))
+        report.append((T, d_ids, d_x, d_o))
+        if d_ids or not d_x < 2e-3 or not d_o < 2e-2:
+            print(f"routing in the MoE kernel T{T}: MISMATCH ids {d_ids} xm {d_x:.2e} out {d_o:.2e}", flush=True)
+            return
+    print("routing in the MoE kernel ok: " + " ".join(f"T{T} ids0 x{x:.1e} o{o:.1e}" for T, _, x, o in report), flush=True)
+    st["route_moe_ok"] = True
 
 
 def _gate_coeffs(g):
@@ -318,13 +364,38 @@ def _moe_sfx(weights):
     return ("-DOKC_PRMTSC=1",) if (moe_PRMT_SCALES and moe__scales_prmt_exact(weights["w13_sf"], weights["w2_sf"])) else ()
 
 
+if "moe_ROUTE_LOGITS_BUILDS" in globals():   # the MoE module's in-kernel routing from the router logits (its prepare()
+    moe_ROUTE_LOGITS_BUILDS = True             # then also builds the OKC_ROUTE_LOGITS variants; see _ma_run_logits)
+ROUTE_IN_MOE = True   # offer "routing in the MoE kernel" (no _route_split launch; the fused pooler+router launch
+                      # normalizes xm after a grid barrier); the tuner picks per T on the chain time, self-test gated
+
+
 def _moe_builds(sfx):
     """The builds the moe module's prepare() will ask for (its rule), so prepare() here can run them in parallel."""
     mods = [tuple(moe__main_defines(sfx)) + sfx]
     for d in (moe_TINY_DEFINES, moe_TINY2_DEFINES, moe_MID_DEFINES):
         if d and (sfx or "-DOKC_WGS=1" not in tuple(d)):   # the WGS build needs the PRMT scale decode
             mods.append(tuple(d) + sfx)
+    if globals().get("moe_ROUTE_LOGITS_BUILDS") and "moe__logits_defines" in globals():
+        mods += [moe__logits_defines(d) for d in list(mods)]
     return mods
+
+
+def _route_in_moe_ok(state, T):
+    return (ROUTE_IN_MOE and state.get("route_moe_ok") and "moe_kernel_fn_logits" in globals()
+            and state.get("route_in_moe", {}).get(T, False))
+
+
+def _ma_run_logits(state, x, logits, bias, ls, ids, T):
+    """The MoE module's in-kernel routing entry: top-8 of sigmoid(logit * 0.1768) + bias per token (ties to the lower
+    id), renormalized weights, local ids, computed by every CTA from the router logits; CTA 0 writes the chosen global
+    ids into `ids`. Returns the expert output bf16 [T, 4096]."""
+    pdl = 1 if _pdl(T) else 0
+    for ext in moe__EXTS.values():
+        ext.okc_set_pdl(pdl)
+    out, _ = moe_kernel_fn_logits({"hidden_states": x, "router_logits": logits, "router_bias": bias, "local_start": ls,
+                                   "topk_out": ids, "config": {"local_count": LOCAL_EXPERTS}}, state["ma"])
+    return out
 
 
 def _ma_prepare(weights, st):
@@ -1541,6 +1612,19 @@ def _tune(st, log=False):
             _PDL_N_BY_T[T] = nbest
             if log:
                 msg.append("pdl[" + " ".join(f"{n}:{t:.0f}" for n, t in ptimes.items()) + f"]->{nbest}")
+        if st.get("route_moe_ok") and T <= 32:   # routing in the MoE kernel (no _route_split launch) vs the kernel,
+            rtimes = {}                            # on the chain: the in-kernel selection costs grow with T
+            for flag in (False, True):
+                st.setdefault("route_in_moe", {})[T] = flag
+                try:
+                    rtimes[flag] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                except Exception as ex:  # noqa: BLE001
+                    rtimes[flag] = 1e30
+                    if log:
+                        msg.append(f"rimX:{repr(ex)[:80]}")
+            st["route_in_moe"][T] = rtimes[True] < rtimes[False]
+            if log:
+                msg.append(f"rim[{rtimes[False]:.0f}/{rtimes[True]:.0f}]->{int(st['route_in_moe'][T])}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -1605,7 +1689,7 @@ def prepare(weights):
         raise errs[0]
     _ma_prepare(weights, st)
     _bfp_prepare(weights, st)
-    for selftest in (_route_selftest, _boundary_selftest, _bnd1_selftest):   # the fused paths, each enabled only when it matches
+    for selftest in (_route_selftest, _boundary_selftest, _bnd1_selftest, _norm_selftest):   # the fused paths, each enabled only when it matches
         try:
             selftest(st)
         except Exception as ex:  # noqa: BLE001
@@ -1917,7 +2001,11 @@ def _after_attention(data, state, o_in, gate, T):
         # bnd1 its prologue computes h (= its x) and s1 from the o-projection output (no _boundary1 launch)
         _bfp_pdl(T)
         route = _fused_route(state, data, ids, lids, wts, xm) if (use_marlin or use_ma) else None
-        if route is None:   # (the standalone proj module's launch takes no route argument)
+        if route is None and use_ma and _route_in_moe_ok(state, T):
+            # the launch also normalizes xm (grid barrier, every CTA its own columns); the routing is the MoE
+            # kernel's, from the router logits: no _route_split launch
+            P, S = bfp_fused_pooler_router(h, state["bfp"], None, bnd1, (state["g_preexp"], xm)), -3
+        elif route is None:   # (the standalone proj module's launch takes no route argument)
             if bnd1 is not None:
                 P, S = bfp_fused_pooler_router(h, state["bfp"], None, bnd1), -1
             else:
@@ -1932,6 +2020,8 @@ def _after_attention(data, state, o_in, gate, T):
         P, S = dense(h, state["pr"], T, state, "pr")
     if S == -2:  # the routing and xm were produced inside the fused pooler + router launch
         pass
+    elif S == -3:  # xm was normalized inside the fused launch; the MoE kernel routes from the logits (below)
+        pooled, logits = P
     elif S == -1:  # pooler and router came from the bf16_proj kernels as two separate tensors
         pooled, logits = P
         _route_split[(T,)](pooled, logits, state["bias"], state["g_preexp"], ids, wts, xm,
@@ -1948,7 +2038,10 @@ def _after_attention(data, state, o_in, gate, T):
         _route[(T,)](P, S, T, state["bias"], state["g_preexp"], ids, wts, xm, data["local_start"], lids,
                      PERMUTED=not (use_marlin or use_ma), num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
     # 5. experts
-    if use_ma:
+    if use_ma and S == -3:
+        # routing in the MoE kernel from the router logits (every CTA; CTA 0 writes the chosen global ids into ids)
+        m = _ma_run_logits(state, xm, logits, state["bias"], data["local_start"], ids, T)
+    elif use_ma:
         m = _ma_run(state, xm, lids, wts, T)   # lids: local expert index, -1 = another GPU's expert
     elif use_marlin:
         m = _marlin_experts(xm, wts, lids, state)
