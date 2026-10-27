@@ -190,7 +190,7 @@ submission_samever.3e87d0e5862f4f29.txt` and `submission.c8b5aab94fd34546.txt`. 
 | 91ec8f0a | standalone-proj composition (v1) | failed | glue passed route=None to the standalone's 2-arg fused_pooler_router |
 | 55cdc71f | standalone-proj composition (muse_bf16_proj with the sk2 PDL + sk2f port, CUTLASS off) | 2.0305 (2.000-2.061) | loses on every T<=32 shape (qkv sk2 picks 16-18 us vs the fork's 14-15, un 19-21 vs 18-19); T>32 unchanged (the layer never routes through the proj module above BFP_MAX_T). proj_fork.py stays |
 | d467a5c5 | route tail + boundary tails (sk2b: o->boundary1, unpooler slice->boundary2, T<=8) behind prepare-time self-tests | 2.011 | self-tests PASS (ids identical, wts/xm 1e-8) but the single-CTA tails are LATENCY-BOUND: fused+route 29/35/43/64 us at T 1/8/16/32 vs 27 separate; the boundary tails made the tuner pick the v2 glue (d1 88 vs 75 us). Both OFF (28fda91), code + self-tests kept |
-| fc83beb0 | clean: mm16 + ATT flags + tuner fixes, tails off (HEAD 28fda91) | see below | |
+| fc83beb0 | clean: mm16 + ATT flags + tuner fixes, tails off (HEAD 28fda91) | 2.0765 (2.045-2.108) | picks as intended (prF T1-16, prB T32, mm16 qkv/o/un at T>=128); per shape vs e150: d16 -4/-7, d32 +4/+19 (attention/MoE noise), verify +-4 us. Best judged file stays e1500783 (commit e36a421, 2.0983); the three clean runs e150/0ac3/fc83 span 2.077-2.098 on near-identical code |
 
 Lessons: (1) a "last CTA finishes the glue" tail has one 16-B load in flight per thread per round (~0.7 us a round):
 T=32 x 4096 bf16 needs 64 rounds; the Triton per-token kernels issue a whole row at once. A tail would need all loads
