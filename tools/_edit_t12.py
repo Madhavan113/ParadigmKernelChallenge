@@ -23,7 +23,7 @@ s = put_region(s, "// == BEGIN t12 host ==", "// == END t12 host ==", host, '\n"
 # CPP declarations + functions list
 decl = ("void bstream(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t nst, int64_t sb, bool bulk, int64_t smem_alloc);\n"
         "void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,\n"
-        "         torch::Tensor out, torch::Tensor diag, int64_t n, int64_t k, int64_t r, int64_t ck, int64_t w, int64_t nsw, int64_t nsx, int64_t nt, bool diag_on);\n")
+        "         torch::Tensor out, torch::Tensor diag, int64_t n, int64_t k, int64_t r, int64_t ck, int64_t w, int64_t nsw, int64_t nsx, int64_t nt, bool diag_on, int64_t variant);\n")
 if "void bstream(" not in s.split('CPP_SRC = """')[1]:
     s = s.replace('int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl, int64_t mode);\n"""', 'int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl, int64_t mode);\n' + decl + '"""')
 if '"w12m", "bstream", "t12"' not in s:

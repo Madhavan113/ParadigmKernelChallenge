@@ -1382,6 +1382,667 @@ void launch_w12b(const __nv_bfloat16* X, int ldx, int m, const uint8_t* Wt, int 
     w12b_kernel<NT, W, NST><<<N / 16, W * 32, smem, stream>>>(X, ldx, m, Wt, eb, eo, en, ek, ed, out, ldo, N, K);
 }
 
+// ---- w12m: 12-bit W x BF16 x^T GEMM for m = 8*NT tokens (128 / 256). CTA = 8 warps, warp w owns MW m16 weight
+// tiles (rows (blockIdx.x*8 + w)*MW*16 ..); the W12 layout [n/64][k/128][4][3 KB] is read as 2*MW consecutive
+// 4-tile groups per chunk. All warps share the chunk's x tile (8*NT tokens x 128 k, cp.async'd once per CTA, B
+// fragments by ldmatrix); the fragments of a warp's MW tiles are reused over the NT n8 token blocks. gridDim.y
+// CTAs split K; each writes fp32 partials part[z][tok][n]; w12m_reduce_kernel (PDL) sums the slices, adds the
+// escapes of row n (esc_roff per row: delta x x[tok][k]) and writes bf16.
+constexpr int W12M_WARPS = 8;
+// non-volatile forms: ptxas may schedule the fragment loads ahead of the mmas (the loads keep a memory clobber so they
+// stay behind the barrier that publishes the stage)
+__device__ __forceinline__ void ldsm_x4_nv(uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3, uint32_t addr) {
+    asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr) : "memory");
+}
+__device__ __forceinline__ void mma16816_nv(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
+__host__ __device__ constexpr int w12m_stage_bytes(int mw, int nt) { return W12M_WARPS * mw * W12_TILE_BYTES + 8 * nt * W12_XSTRIDE * 2; }
+
+template <int MW, int NT, int NSTAGE, int MODE = 0>
+__global__ void __launch_bounds__(256, 1)
+w12m_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ W, int eb,
+            float* __restrict__ part, int N, int K)
+{
+    constexpr int STAGE_BYTES = w12m_stage_bytes(MW, NT);
+    constexpr int W_STAGE = W12M_WARPS * MW * W12_TILE_BYTES;          // 24 KB (MW = 1) / 48 KB
+    constexpr int GROUP_BYTES = 4 * W12_TILE_BYTES;                     // one 4-tile group per chunk: 12 KB
+    constexpr int WSEG = W_STAGE / 16 / 256;                            // 16-B weight segments per thread per chunk
+    constexpr int XSEG = NT * 128 / 256;                                // token-row segments per thread per chunk
+    static_assert(W_STAGE % (16 * 256) == 0 && (NT * 128) % 256 == 0, "w12m: segment counts");
+    extern __shared__ __align__(128) uint8_t w12m_smem[];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+    const int g = lane >> 2, t = lane & 3;
+    const int KSPLIT = (int)gridDim.y;
+    const int NC_ALL = K / W12_KC;
+    const int NC = NC_ALL / KSPLIT;
+    const int c0 = (int)blockIdx.y * NC;
+    const uint32_t hb = (uint32_t)(eb >> 1);
+    const uint32_t lut0 = hb | (hb + 1) << 8 | (hb + 2) << 16 | (hb + 3) << 24;
+    const uint32_t lut1 = (hb + 4) | (hb + 5) << 8 | (hb + 6) << 16 | (hb + 7) << 24;
+
+    // weight segments: the stage holds the CTA's 2*MW groups back to back (tile ti = gi*4 + slot at ti * 3 KB)
+    const int group0 = (int)blockIdx.x * 2 * MW;
+    // segment i of this thread: sidx = tid + 256 i -> group gi = i / 3 (768 segments per group), offset (i % 3) * 4 KB
+    const size_t gstride = (size_t)NC_ALL * GROUP_BYTES;
+    const uint8_t* wbase = W + ((size_t)group0 * NC_ALL + c0) * GROUP_BYTES + tid * 16;
+    const int xr0 = tid >> 4;                                           // token row of segment 0 (+16 per segment)
+    const __nv_bfloat16* xbase = X + (size_t)xr0 * ldx + c0 * W12_KC + (tid & 15) * 8;
+    const uint32_t sbase = smem_u32(w12m_smem);
+    auto issue = [&](int c, int stage) {
+        const uint32_t ws = sbase + stage * STAGE_BYTES;
+        #pragma unroll
+        for (int i = 0; i < WSEG; ++i)
+            cp_async16(ws + (tid + i * 256) * 16, wbase + (size_t)(i / 3) * gstride + (i % 3) * 4096 + (size_t)c * GROUP_BYTES, 16);
+        const uint32_t xs = ws + W_STAGE;
+        #pragma unroll
+        for (int i = 0; i < XSEG; ++i) {
+            const int r = xr0 + 16 * i;
+            cp_async16(xs + (r * W12_XSTRIDE + (tid & 15) * 8) * 2, xbase + (size_t)(r < m ? 16 * i : -xr0) * ldx + c * W12_KC, r < m ? 16 : 0);
+        }
+    };
+
+    float acc[MW][NT][4];
+    #pragma unroll
+    for (int i = 0; i < MW; ++i)
+        #pragma unroll
+        for (int nb = 0; nb < NT; ++nb)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[i][nb][q] = 0.f;
+
+    #pragma unroll
+    for (int st = 0; st < NSTAGE - 1; ++st) {
+        if (st < NC) issue(st, st);
+        cp_async_commit();
+    }
+    int stage = 0, stage_n = NSTAGE - 1;
+    for (int c = 0; c < NC; ++c) {
+        cp_async_wait<NSTAGE - 2>();
+        __syncthreads();
+        {
+            const int cn = c + NSTAGE - 1;
+            if (cn < NC) issue(cn, stage_n);
+            cp_async_commit();
+        }
+        const uint8_t* ws = w12m_smem + stage * STAGE_BYTES + warp * MW * W12_TILE_BYTES;
+        const __half* xs = reinterpret_cast<const __half*>(w12m_smem + stage * STAGE_BYTES + W_STAGE);
+        stage = stage + 1 == NSTAGE ? 0 : stage + 1;
+        stage_n = stage_n + 1 == NSTAGE ? 0 : stage_n + 1;
+        const uint32_t xb = smem_u32(xs) + ((lane & 7) * W12_XSTRIDE + (lane >> 3) * 8) * 2;
+        if constexpr (MODE == 1) {                                        // bench ablation: the cp.async ring only
+            if (lane == 0) acc[0][0][0] += __uint_as_float(*reinterpret_cast<const uint32_t*>(ws + warp * 16) & 0x007FFFFFu);
+            continue;
+        }
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {                                     // k16 steps 4h..4h+3
+            uint4 lo[MW][2], nbw[MW];
+            #pragma unroll
+            for (int i = 0; i < MW; ++i) {
+                lo[i][0] = *reinterpret_cast<const uint4*>(ws + i * W12_TILE_BYTES + (2 * h) * 512 + lane * 16);
+                lo[i][1] = *reinterpret_cast<const uint4*>(ws + i * W12_TILE_BYTES + (2 * h + 1) * 512 + lane * 16);
+                nbw[i] = *reinterpret_cast<const uint4*>(ws + i * W12_TILE_BYTES + 2048 + h * 512 + lane * 16);
+            }
+            #pragma unroll
+            for (int ps = 0; ps < 2; ++ps) {                                 // steps 4h+2ps, +1
+                uint32_t a[MW][2][4];
+                #pragma unroll
+                for (int i = 0; i < MW; ++i)
+                    #pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        const uint32_t L0 = q == 0 ? lo[i][ps].x : lo[i][ps].z, L1 = q == 0 ? lo[i][ps].y : lo[i][ps].w;
+                        const int si = 2 * ps + q;
+                        const uint32_t Nw = si == 0 ? nbw[i].x : si == 1 ? nbw[i].y : si == 2 ? nbw[i].z : nbw[i].w;
+                        decode4(L0, Nw & 0xFFFFu, lut0, lut1, a[i][q][0], a[i][q][1]);
+                        decode4(L1, Nw >> 16, lut0, lut1, a[i][q][2], a[i][q][3]);
+                    }
+                // B fragments of GB token blocks at a time, then their mmas in an order that keeps the mmas on one
+                // accumulator GB*MW apart (warps issue in order: a dependent mma right behind its producer stalls)
+                constexpr int GB = NT <= 16 ? NT : 8;
+                #pragma unroll
+                for (int nb0 = 0; nb0 < NT; nb0 += GB) {
+                    uint32_t b[GB][4];
+                    #pragma unroll
+                    for (int j = 0; j < GB; ++j)
+                        ldsm_x4_nv(b[j][0], b[j][1], b[j][2], b[j][3], xb + ((nb0 + j) * 8 * W12_XSTRIDE + h * 64 + ps * 32) * 2);
+                    #pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        #pragma unroll
+                        for (int j = 0; j < GB; ++j)
+                            #pragma unroll
+                            for (int i = 0; i < MW; ++i)
+                                mma16816_nv(acc[i][nb0 + j], a[i][q][0], a[i][q][1], a[i][q][2], a[i][q][3], b[j][2 * q], b[j][2 * q + 1]);
+                }
+            }
+        }
+    }
+    cp_async_wait<0>();
+    pdl_trigger();                                                       // the reduce may start launching
+    // fp32 partial slice: part[z][tok][n], n = tile*16 + g (+8), tok = nb*8 + 2t (+1)
+    float* pz = part + (size_t)blockIdx.y * m * N;
+    #pragma unroll
+    for (int i = 0; i < MW; ++i) {
+        const int col0 = (((int)blockIdx.x * W12M_WARPS + warp) * MW + i) * 16 + g;
+        #pragma unroll
+        for (int nb = 0; nb < NT; ++nb)
+            #pragma unroll
+            for (int hr = 0; hr < 2; ++hr) {
+                const int tok = nb * 8 + 2 * t;
+                if (tok < m) pz[(size_t)tok * N + col0 + 8 * hr] = acc[i][nb][2 * hr];
+                if (tok + 1 < m) pz[(size_t)(tok + 1) * N + col0 + 8 * hr] = acc[i][nb][2 * hr + 1];
+            }
+    }
+}
+
+__global__ void __launch_bounds__(256)
+w12m_reduce_kernel(const float* __restrict__ part, int KSPLIT, int m, int N,
+                   const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+                   const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
+{
+    const int i = blockIdx.y;                                            // token
+    const int n0 = ((int)blockIdx.x * 256 + (int)threadIdx.x) * 2;       // column pair
+    if (n0 >= N) return;
+    const int e00 = esc_roff[n0], e01 = esc_roff[n0 + 1], e11 = esc_roff[n0 + 2];
+    pdl_wait();                                                          // the partials come from the GEMM launch
+    float sx = 0.f, sy = 0.f;
+    for (int z = 0; z < KSPLIT; ++z) {
+        const float2 v = __ldcg(reinterpret_cast<const float2*>(part + ((size_t)z * m + i) * N + n0));
+        sx += v.x; sy += v.y;
+    }
+    const __nv_bfloat16* xr = X + (size_t)i * ldx;
+    for (int e = e00; e < e01; ++e) sx += esc_d[e] * __bfloat162float(xr[esc_k[e]]);
+    for (int e = e01; e < e11; ++e) sy += esc_d[e] * __bfloat162float(xr[esc_k[e]]);
+    *reinterpret_cast<__nv_bfloat162*>(out + (size_t)i * ldo + n0) = __floats2bfloat162_rn(sx, sy);
+}
+
+template <int MW, int NT, int NSTAGE, int MODE = 0>
+void launch_w12m(const __nv_bfloat16* X, int ldx, int m, const uint8_t* W, int eb, float* part, int N, int K, int sk, cudaStream_t stream)
+{
+    constexpr int smem = NSTAGE * w12m_stage_bytes(MW, NT);
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(w12m_kernel<MW, NT, NSTAGE, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    w12m_kernel<MW, NT, NSTAGE, MODE><<<dim3(N / (128 * MW), sk), 256, smem, stream>>>(X, ldx, m, W, eb, part, N, K);
+}
+
+// == BEGIN t12 device ==
+// ---- TMA bulk-copy helpers (1-D cp.async.bulk global -> shared, completion on an mbarrier)
+__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(bar), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+    asm volatile("{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+                 :: "r"(bar), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+__device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void fence_mbar_init() { asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory"); }
+__device__ __forceinline__ unsigned long long gtimer() {
+    unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t;
+}
+
+// ---- bstream: streaming-read microbenchmark through a shared-memory ring. Each CTA reads a contiguous slice of
+// the buffer in SB-byte stages; BULK: one elected thread issues cp.async.bulk copies (one mbarrier per stage);
+// else every thread copies 16 B segments with cp.async (commit / wait_group). Each stage is touched (128 x 4 B) so
+// the ring is really consumed. 128 threads; the host pads the dynamic smem to pin the CTAs per SM.
+template <int NST, int SB, bool BULK>
+__global__ void __launch_bounds__(128) bstream_kernel(const uint8_t* __restrict__ p, long nbytes, uint32_t* __restrict__ out)
+{
+    extern __shared__ __align__(128) uint8_t bs_smem[];
+    __shared__ __align__(8) unsigned long long bars[NST];
+    const long per = (nbytes / gridDim.x) / SB;                       // stages per CTA
+    const uint8_t* base = p + (long)blockIdx.x * per * SB;
+    const uint32_t sb = smem_u32(bs_smem);
+    const int tid = threadIdx.x;
+    uint32_t acc = 0;
+    if constexpr (BULK) {
+        if (tid == 0) {
+            #pragma unroll
+            for (int s = 0; s < NST; ++s) mbar_init(smem_u32(&bars[s]), 1);
+            fence_mbar_init();
+        }
+        __syncthreads();
+        if (tid == 0) {
+            #pragma unroll
+            for (int s = 0; s < NST; ++s)
+                if (s < per) { mbar_expect_tx(smem_u32(&bars[s]), SB); bulk_g2s(sb + s * SB, base + (long)s * SB, SB, smem_u32(&bars[s])); }
+        }
+        for (long c = 0; c < per; ++c) {
+            const int st = (int)(c % NST);
+            mbar_wait(smem_u32(&bars[st]), (uint32_t)((c / NST) & 1));
+            acc ^= *reinterpret_cast<const uint32_t*>(bs_smem + st * SB + tid * 16);
+            __syncthreads();                                          // everyone has read stage st
+            if (tid == 0) {
+                const long cn = c + NST;
+                if (cn < per) {
+                    fence_proxy_async();
+                    mbar_expect_tx(smem_u32(&bars[st]), SB);
+                    bulk_g2s(sb + st * SB, base + cn * SB, SB, smem_u32(&bars[st]));
+                }
+            }
+        }
+    } else {
+        constexpr int SEG = SB / 2048;                                 // 16 B segments per thread per stage
+        auto issue = [&](long c, int st) {
+            #pragma unroll
+            for (int i = 0; i < SEG; ++i)
+                cp_async16(sb + st * SB + (i * 128 + tid) * 16, base + c * SB + (i * 128 + tid) * 16, 16);
+        };
+        #pragma unroll
+        for (int s = 0; s < NST - 1; ++s) {
+            if (s < per) issue(s, s);
+            cp_async_commit();
+        }
+        for (long c = 0; c < per; ++c) {
+            const int st = (int)(c % NST);
+            cp_async_wait<NST - 2>();
+            __syncthreads();
+            {
+                const long cn = c + NST - 1;
+                if (cn < per) issue(cn, (int)(cn % NST));
+                cp_async_commit();
+            }
+            acc ^= *reinterpret_cast<const uint32_t*>(bs_smem + st * SB + tid * 16);
+        }
+        cp_async_wait<0>();
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((tid & 31) == 0) out[blockIdx.x * 4 + (tid >> 5)] = acc;
+}
+
+// ---- t12: single-launch 12-bit GEMM for m <= 32 (tokens = the mma N side, 8*NT), one CTA per R-row tile of W over
+// the FULL K: no cross-CTA reduction, no second launch. Weights in the T12 layout (_repack_t12): per (R-row tile,
+// KC = 128*CK wide chunk) one contiguous block of (R/16) x CK W12 fragment blocks (3 KB each, [r][ck]), streamed by
+// TMA bulk copies: thread 0 issues one cp.async.bulk per stage into an NSW-deep ring (one mbarrier per stage). The
+// x tile (m token rows x KC bf16, rows padded to KC + 8 halves) comes from L2 by one bulk copy per token row into an
+// NSX-deep ring. Warp w owns the m16 row tile r_w = w / WPR and, per chunk, UPW half-blocks (64 k each): PRMT-LUT
+// decode (decode4) into the A fragments, B fragments by ldmatrix.x4 from the x tile, mma.sync m16n8k16 bf16 -> fp32.
+// The row's escapes (esc_roff / esc_k / esc_d: delta * x[tok][k]) are computed during the pipeline fill; the
+// epilogue sums the warps' partials per (row, token) through smem, adds them and stores bf16. DIAG (bench only):
+// %globaltimer at start / first stage landed / loop end / store end for CTA 0, and the min start / max end over CTAs.
+template <int R, int CK, int W, int NSW, int NSX, int NT, bool DIAG>
+__global__ void __launch_bounds__(W * 32)
+t12_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ Wt, int eb,
+           const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+           __nv_bfloat16* __restrict__ out, int ldo, int K, unsigned long long* __restrict__ diag)
+{
+    constexpr int KC = 128 * CK, XS = KC + 8;                          // x stage row stride (halves): 16 B multiple, conflict-free
+    constexpr int WST = (R / 16) * CK * 3072, XST = 8 * NT * XS * 2;
+    constexpr int U = (R / 8) * CK, UPW = U / W, WPR = W / (R / 16);
+    static_assert(U % W == 0 && (2 * CK) % UPW == 0 && W % (R / 16) == 0, "t12: warp / unit split");
+    constexpr int CH = NT == 1 ? 2 : 1;
+    constexpr int NTHR = W * 32, TPR = NTHR / R;                       // tokens per epilogue pass
+    static_assert(NTHR % R == 0, "t12: threads per row");
+    constexpr int TPT = (8 * NT + TPR - 1) / TPR;                      // tokens per thread
+    static_assert(NSX <= NSW, "t12: x ring deeper than the weight ring");
+    extern __shared__ __align__(128) uint8_t t12_smem[];
+    __shared__ __align__(8) unsigned long long barw[NSW], barx[NSX];
+    __shared__ float red[W][16][8 * NT + 1];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int tile = blockIdx.x, NC = K / KC, ntb = (m + 7) >> 3;
+    const int r_w = warp / WPR;
+    unsigned long long t0 = 0, t1 = 0;
+    if constexpr (DIAG) t0 = gtimer();
+    const uint32_t hb = (uint32_t)(eb >> 1);
+    const uint32_t lut0 = hb | (hb + 1) << 8 | (hb + 2) << 16 | (hb + 3) << 24;
+    const uint32_t lut1 = (hb + 4) | (hb + 5) << 8 | (hb + 6) << 16 | (hb + 7) << 24;
+    const uint8_t* wsrc = Wt + (size_t)tile * NC * WST;
+    const uint32_t sw = smem_u32(t12_smem), sx = sw + NSW * WST;
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NSW; ++s) mbar_init(smem_u32(&barw[s]), 1);
+        #pragma unroll
+        for (int s = 0; s < NSX; ++s) mbar_init(smem_u32(&barx[s]), 1);
+        fence_mbar_init();
+    }
+    __syncthreads();
+    auto issue_w = [&](int c, int st) {                                 // thread 0
+        const uint32_t bar = smem_u32(&barw[st]);
+        mbar_expect_tx(bar, WST);
+        bulk_g2s(sw + st * WST, wsrc + (size_t)c * WST, WST, bar);
+    };
+    auto issue_x = [&](int c, int st) {                                 // warp W-1: lane i copies token row i
+        const uint32_t bar = smem_u32(&barx[st]);
+        if (lane == 0) mbar_expect_tx(bar, (uint32_t)m * KC * 2);
+        if (lane < m) bulk_g2s(sx + st * XST + lane * XS * 2, X + (size_t)lane * ldx + (size_t)c * KC, KC * 2, bar);
+    };
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NSW; ++s) if (s < NC) issue_w(s, s);
+    }
+    if (warp == W - 1) {
+        #pragma unroll
+        for (int s = 0; s < NSX; ++s) if (s < NC) issue_x(s, s);
+    }
+    // the row's escapes, during the pipeline fill: thread -> row rr, tokens i0 + j * TPR
+    const int rr = tid % R, i0 = tid / R, row = tile * R + rr;
+    float esc[TPT];
+    #pragma unroll
+    for (int j = 0; j < TPT; ++j) esc[j] = 0.f;
+    {
+        const int e0 = esc_roff[row], e1 = esc_roff[row + 1];
+        for (int e = e0; e < e1; ++e) {
+            const int kk = esc_k[e];
+            const float d = esc_d[e];
+            #pragma unroll
+            for (int j = 0; j < TPT; ++j) {
+                const int i = i0 + j * TPR;
+                if (i < m) esc[j] += d * __bfloat162float(X[(size_t)i * ldx + kk]);
+            }
+        }
+    }
+    // this warp's units: stage-relative byte offsets of the low-byte quads / nibble words, x k offset (halves)
+    int lo_off[UPW], nb_off[UPW], xk[UPW];
+    #pragma unroll
+    for (int j = 0; j < UPW; ++j) {
+        const int u = warp * UPW + j, ck = (u % (2 * CK)) >> 1, h = u & 1;
+        const int woff = (r_w * CK + ck) * 3072;
+        lo_off[j] = woff + (2 * h) * 512 + lane * 16;
+        nb_off[j] = woff + 2048 + h * 512 + lane * 16;
+        xk[j] = ck * 128 + h * 64;
+    }
+    float acc[NT * CH][4];
+    #pragma unroll
+    for (int n = 0; n < NT * CH; ++n)
+        #pragma unroll
+        for (int q = 0; q < 4; ++q) acc[n][q] = 0.f;
+
+    for (int c = 0; c < NC; ++c) {
+        const int swi = c % NSW, sxi = c % NSX;
+        if (c > 0) {
+            __syncthreads();                                            // all warps are done with chunk c-1
+            if (tid == 0 && c - 1 + NSW < NC) { fence_proxy_async(); issue_w(c - 1 + NSW, (c - 1) % NSW); }
+            if (warp == W - 1 && c - 1 + NSX < NC) { fence_proxy_async(); issue_x(c - 1 + NSX, (c - 1) % NSX); }
+        }
+        mbar_wait(smem_u32(&barw[swi]), (uint32_t)((c / NSW) & 1));
+        mbar_wait(smem_u32(&barx[sxi]), (uint32_t)((c / NSX) & 1));
+        if constexpr (DIAG) { if (c == 0) t1 = gtimer(); }
+        const uint8_t* ws = t12_smem + swi * WST;
+        const uint32_t xs = sx + sxi * XST;
+        #pragma unroll
+        for (int j = 0; j < UPW; ++j) {
+            const uint4 lo0 = *reinterpret_cast<const uint4*>(ws + lo_off[j]);
+            const uint4 lo1 = *reinterpret_cast<const uint4*>(ws + lo_off[j] + 512);
+            const uint4 nb = *reinterpret_cast<const uint4*>(ws + nb_off[j]);
+            #pragma unroll
+            for (int ps = 0; ps < 2; ++ps) {                             // k16 steps 2ps, 2ps+1 of the half-block
+                uint32_t b[NT][4];
+                #pragma unroll
+                for (int nbk = 0; nbk < NT; ++nbk) {
+                    if (nbk < ntb)
+                        ldsm_x4(b[nbk][0], b[nbk][1], b[nbk][2], b[nbk][3],
+                                xs + ((nbk * 8 + (lane & 7)) * XS + xk[j] + ps * 32 + (lane >> 3) * 8) * 2);
+                }
+                const uint4 lo = ps == 0 ? lo0 : lo1;
+                #pragma unroll
+                for (int q = 0; q < 2; ++q) {
+                    const uint32_t L0 = q == 0 ? lo.x : lo.z, L1 = q == 0 ? lo.y : lo.w;
+                    const int si = 2 * ps + q;
+                    const uint32_t Nw = si == 0 ? nb.x : si == 1 ? nb.y : si == 2 ? nb.z : nb.w;
+                    uint32_t a0, a1, a2, a3;
+                    decode4(L0, Nw & 0xFFFFu, lut0, lut1, a0, a1);
+                    decode4(L1, Nw >> 16, lut0, lut1, a2, a3);
+                    #pragma unroll
+                    for (int nbk = 0; nbk < NT; ++nbk) {
+                        if (nbk < ntb) mma16816(acc[nbk * CH + (CH == 2 ? q : 0)], a0, a1, a2, a3, b[nbk][2 * q], b[nbk][2 * q + 1]);
+                    }
+                }
+            }
+        }
+    }
+    unsigned long long t2 = 0;
+    if constexpr (DIAG) t2 = gtimer();
+    // partials -> red[warp][row][token]
+    #pragma unroll
+    for (int nbk = 0; nbk < NT; ++nbk)
+        #pragma unroll
+        for (int hr = 0; hr < 2; ++hr)
+            #pragma unroll
+            for (int cc = 0; cc < 2; ++cc)
+                red[warp][g + 8 * hr][nbk * 8 + 2 * t + cc] = acc[nbk * CH][2 * hr + cc] + (CH == 2 ? acc[nbk * CH + 1][2 * hr + cc] : 0.f);
+    __syncthreads();
+    const int rt = rr >> 4, rl = rr & 15;
+    #pragma unroll
+    for (int j = 0; j < TPT; ++j) {
+        const int i = i0 + j * TPR;
+        if (i < m) {
+            float v = esc[j];
+            #pragma unroll
+            for (int w2 = 0; w2 < WPR; ++w2) v += red[rt * WPR + w2][rl][i];
+            out[(size_t)i * ldo + tile * R + rr] = __float2bfloat16(v);
+        }
+    }
+    if constexpr (DIAG) {
+        __syncthreads();
+        if (tid == 0) {
+            const unsigned long long t3 = gtimer();
+            if (tile == 0) { diag[0] = t0; diag[1] = t1; diag[2] = t2; diag[3] = t3; }
+            atomicMin(diag + 4, t0); atomicMax(diag + 5, t3);
+            if (tile == gridDim.x - 1) { diag[6] = t0; diag[7] = t3; }
+        }
+    }
+}
+
+template <int R, int CK, int W, int NSW, int NSX, int NT, bool DIAG>
+void launch_t12(const __nv_bfloat16* X, int ldx, int m, const uint8_t* Wt, int eb, const int* ero, const int* ek, const float* ed,
+                __nv_bfloat16* out, int ldo, int N, int K, unsigned long long* diag, cudaStream_t stream)
+{
+    constexpr int smem = NSW * (R / 16) * CK * 3072 + NSX * 8 * NT * (128 * CK + 8) * 2;
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(t12_kernel<R, CK, W, NSW, NSX, NT, DIAG>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    t12_kernel<R, CK, W, NSW, NSX, NT, DIAG><<<N / R, W * 32, smem, stream>>>(X, ldx, m, Wt, eb, ero, ek, ed, out, ldo, K, diag);
+}
+__host__ constexpr int t12_smem_bytes(int r, int ck, int nsw, int nsx, int nt) { return nsw * (r / 16) * ck * 3072 + nsx * 8 * nt * (128 * ck + 8) * 2; }
+// ---- t12b: t12 with a producer / consumer split. Warp WC (the producer) issues the weight bulk copies into the
+// NSW-stage ring against full[] (tx) / empty[] (count WC, one arrive per compute warp) mbarriers and, while the ring
+// is full, computes the tile's escapes into esc_s[R][8*NT] (lane = row; delta * x[tok][k]). The WC compute warps
+// fetch the x tile themselves with 16-byte cp.async (rows >= m zero-filled) into an NSX-stage ring ordered by a named
+// barrier (bar.sync 1) once per chunk, decode + mma as t12, and sum / add esc_s / store in the epilogue.
+__device__ __forceinline__ void mbar_arrive(uint32_t bar) {
+    asm volatile("mbarrier.arrive.shared::cta.b64 _, [%0];\n" :: "r"(bar) : "memory");
+}
+__device__ __forceinline__ void named_bar_sync(int id, int count) {
+    asm volatile("bar.sync %0, %1;\n" :: "r"(id), "r"(count) : "memory");
+}
+
+template <int R, int CK, int WC, int NSW, int NSX, int NT, bool DIAG>
+__global__ void __launch_bounds__((WC + 1) * 32)
+t12b_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ Wt, int eb,
+            const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+            __nv_bfloat16* __restrict__ out, int ldo, int K, unsigned long long* __restrict__ diag)
+{
+    constexpr int KC = 128 * CK, XS = KC + 8;
+    constexpr int WST = (R / 16) * CK * 3072, XST = 8 * NT * XS * 2;
+    constexpr int U = (R / 8) * CK, UPW = U / WC, WPR = WC / (R / 16);
+    static_assert(U % WC == 0 && (2 * CK) % UPW == 0 && WC % (R / 16) == 0, "t12b: warp / unit split");
+    constexpr int CH = NT == 1 ? 2 : 1;
+    constexpr int NTC = WC * 32, TPR = NTC / R;                        // compute threads, tokens per epilogue pass
+    static_assert(NTC % R == 0 && R <= 32, "t12b: threads per row");
+    constexpr int TPT = (8 * NT + TPR - 1) / TPR;
+    constexpr int SEGS = 8 * NT * (KC / 8), XSEG = (SEGS + NTC - 1) / NTC;   // 16 B x segments per chunk, per thread
+    extern __shared__ __align__(128) uint8_t t12b_smem[];
+    __shared__ __align__(8) unsigned long long full[NSW], empty[NSW];
+    __shared__ float red[WC][16][8 * NT + 1];
+    __shared__ float esc_s[R][8 * NT];
+    const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31, g = lane >> 2, t = lane & 3;
+    const int tile = blockIdx.x, NC = K / KC, ntb = (m + 7) >> 3;
+    unsigned long long t0 = 0, t1 = 0;
+    if constexpr (DIAG) t0 = gtimer();
+    const uint32_t sw = smem_u32(t12b_smem), sx = sw + NSW * WST;
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NSW; ++s) { mbar_init(smem_u32(&full[s]), 1); mbar_init(smem_u32(&empty[s]), WC); }
+        fence_mbar_init();
+    }
+    __syncthreads();
+    if (warp == WC) {
+        // ---- producer warp
+        const uint8_t* wsrc = Wt + (size_t)tile * NC * WST;
+        auto issue_w = [&](int c, int st) {
+            const uint32_t bar = smem_u32(&full[st]);
+            mbar_expect_tx(bar, WST);
+            bulk_g2s(sw + st * WST, wsrc + (size_t)c * WST, WST, bar);
+        };
+        if (lane == 0) {
+            #pragma unroll
+            for (int s = 0; s < NSW; ++s) if (s < NC) issue_w(s, s);
+        }
+        // the tile's escapes while the ring is full: lane = row
+        for (int i = lane; i < R * 8 * NT; i += 32) (&esc_s[0][0])[i] = 0.f;
+        __syncwarp();
+        if (lane < R) {
+            const int row = tile * R + lane;
+            const int e0 = esc_roff[row], e1 = esc_roff[row + 1];
+            for (int e = e0; e < e1; ++e) {
+                const int kk = esc_k[e];
+                const float d = esc_d[e];
+                for (int i = 0; i < m; ++i) esc_s[lane][i] += d * __bfloat162float(X[(size_t)i * ldx + kk]);
+            }
+        }
+        if (lane == 0) {
+            for (int c = NSW; c < NC; ++c) {
+                const int st = c % NSW;
+                mbar_wait(smem_u32(&empty[st]), (uint32_t)((c / NSW - 1) & 1));
+                issue_w(c, st);
+            }
+        }
+    } else {
+        // ---- compute warps
+        const int r_w = warp / WPR;
+        const uint32_t hb = (uint32_t)(eb >> 1);
+        const uint32_t lut0 = hb | (hb + 1) << 8 | (hb + 2) << 16 | (hb + 3) << 24;
+        const uint32_t lut1 = (hb + 4) | (hb + 5) << 8 | (hb + 6) << 16 | (hb + 7) << 24;
+        const __nv_bfloat16* xsrc[XSEG]; int xbytes[XSEG]; uint32_t xdst[XSEG];
+        #pragma unroll
+        for (int i = 0; i < XSEG; ++i) {
+            const int sidx = tid + i * NTC, row = sidx / (KC / 8), seg = sidx % (KC / 8);
+            const bool ok = sidx < SEGS && row < m;
+            xbytes[i] = ok ? 16 : 0;
+            xsrc[i] = X + (size_t)(ok ? row : 0) * ldx + seg * 8;
+            xdst[i] = (sidx < SEGS) ? (uint32_t)((row * XS + seg * 8) * 2) : 0xFFFFFFFFu;
+        }
+        auto issue_x = [&](int c, int st) {
+            #pragma unroll
+            for (int i = 0; i < XSEG; ++i)
+                if (xdst[i] != 0xFFFFFFFFu) cp_async16(sx + st * XST + xdst[i], xsrc[i] + (size_t)c * KC, xbytes[i]);
+        };
+        int lo_off[UPW], nb_off[UPW], xk[UPW];
+        #pragma unroll
+        for (int j = 0; j < UPW; ++j) {
+            const int u = warp * UPW + j, ck = (u % (2 * CK)) >> 1, h = u & 1;
+            const int woff = (r_w * CK + ck) * 3072;
+            lo_off[j] = woff + (2 * h) * 512 + lane * 16;
+            nb_off[j] = woff + 2048 + h * 512 + lane * 16;
+            xk[j] = ck * 128 + h * 64;
+        }
+        float acc[NT * CH][4];
+        #pragma unroll
+        for (int n = 0; n < NT * CH; ++n)
+            #pragma unroll
+            for (int q = 0; q < 4; ++q) acc[n][q] = 0.f;
+        #pragma unroll
+        for (int s = 0; s < NSX - 1; ++s) {
+            if (s < NC) issue_x(s, s);
+            cp_async_commit();
+        }
+        for (int c = 0; c < NC; ++c) {
+            const int swi = c % NSW, sxi = c % NSX;
+            cp_async_wait<NSX - 2>();                                   // this thread's x segments of chunk c
+            named_bar_sync(1, NTC);                                     // all compute warps: x of chunk c landed, chunk c-1 done
+            if (c > 0 && lane == 0) mbar_arrive(smem_u32(&empty[(c - 1) % NSW]));
+            {
+                const int cn = c + NSX - 1;
+                if (cn < NC) issue_x(cn, cn % NSX);
+                cp_async_commit();
+            }
+            mbar_wait(smem_u32(&full[swi]), (uint32_t)((c / NSW) & 1));
+            if constexpr (DIAG) { if (c == 0) t1 = gtimer(); }
+            const uint8_t* ws = t12b_smem + swi * WST;
+            const uint32_t xs = sx + sxi * XST;
+            #pragma unroll
+            for (int j = 0; j < UPW; ++j) {
+                const uint4 lo0 = *reinterpret_cast<const uint4*>(ws + lo_off[j]);
+                const uint4 lo1 = *reinterpret_cast<const uint4*>(ws + lo_off[j] + 512);
+                const uint4 nb = *reinterpret_cast<const uint4*>(ws + nb_off[j]);
+                #pragma unroll
+                for (int ps = 0; ps < 2; ++ps) {
+                    uint32_t b[NT][4];
+                    #pragma unroll
+                    for (int nbk = 0; nbk < NT; ++nbk) {
+                        if (nbk < ntb)
+                            ldsm_x4(b[nbk][0], b[nbk][1], b[nbk][2], b[nbk][3],
+                                    xs + ((nbk * 8 + (lane & 7)) * XS + xk[j] + ps * 32 + (lane >> 3) * 8) * 2);
+                    }
+                    const uint4 lo = ps == 0 ? lo0 : lo1;
+                    #pragma unroll
+                    for (int q = 0; q < 2; ++q) {
+                        const uint32_t L0 = q == 0 ? lo.x : lo.z, L1 = q == 0 ? lo.y : lo.w;
+                        const int si = 2 * ps + q;
+                        const uint32_t Nw = si == 0 ? nb.x : si == 1 ? nb.y : si == 2 ? nb.z : nb.w;
+                        uint32_t a0, a1, a2, a3;
+                        decode4(L0, Nw & 0xFFFFu, lut0, lut1, a0, a1);
+                        decode4(L1, Nw >> 16, lut0, lut1, a2, a3);
+                        #pragma unroll
+                        for (int nbk = 0; nbk < NT; ++nbk) {
+                            if (nbk < ntb) mma16816(acc[nbk * CH + (CH == 2 ? q : 0)], a0, a1, a2, a3, b[nbk][2 * q], b[nbk][2 * q + 1]);
+                        }
+                    }
+                }
+            }
+        }
+        cp_async_wait<0>();
+        #pragma unroll
+        for (int nbk = 0; nbk < NT; ++nbk)
+            #pragma unroll
+            for (int hr = 0; hr < 2; ++hr)
+                #pragma unroll
+                for (int cc = 0; cc < 2; ++cc)
+                    red[warp][g + 8 * hr][nbk * 8 + 2 * t + cc] = acc[nbk * CH][2 * hr + cc] + (CH == 2 ? acc[nbk * CH + 1][2 * hr + cc] : 0.f);
+    }
+    unsigned long long t2 = 0;
+    if constexpr (DIAG) t2 = gtimer();
+    __syncthreads();                                                    // partials and esc_s complete
+    if (warp < WC) {
+        const int rr = tid % R, i0 = tid / R, rt = rr >> 4, rl = rr & 15;
+        #pragma unroll
+        for (int j = 0; j < TPT; ++j) {
+            const int i = i0 + j * TPR;
+            if (i < m) {
+                float v = esc_s[rr][i];
+                #pragma unroll
+                for (int w2 = 0; w2 < WPR; ++w2) v += red[rt * WPR + w2][rl][i];
+                out[(size_t)i * ldo + tile * R + rr] = __float2bfloat16(v);
+            }
+        }
+    }
+    if constexpr (DIAG) {
+        __syncthreads();
+        if (tid == 0) {
+            const unsigned long long t3 = gtimer();
+            if (tile == 0) { diag[0] = t0; diag[1] = t1; diag[2] = t2; diag[3] = t3; }
+            atomicMin(diag + 4, t0); atomicMax(diag + 5, t3);
+            if (tile == gridDim.x - 1) { diag[6] = t0; diag[7] = t3; }
+        }
+    }
+}
+
+template <int R, int CK, int WC, int NSW, int NSX, int NT, bool DIAG>
+void launch_t12b(const __nv_bfloat16* X, int ldx, int m, const uint8_t* Wt, int eb, const int* ero, const int* ek, const float* ed,
+                 __nv_bfloat16* out, int ldo, int N, int K, unsigned long long* diag, cudaStream_t stream)
+{
+    constexpr int smem = NSW * (R / 16) * CK * 3072 + NSX * 8 * NT * (128 * CK + 8) * 2;
+    static bool attr = false;
+    if (!attr) { cudaFuncSetAttribute(t12b_kernel<R, CK, WC, NSW, NSX, NT, DIAG>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    t12b_kernel<R, CK, WC, NSW, NSX, NT, DIAG><<<N / R, (WC + 1) * 32, smem, stream>>>(X, ldx, m, Wt, eb, ero, ek, ed, out, ldo, K, diag);
+}
+// == END t12 device ==
+
 } // namespace
 
 void stream_bytes(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t threads, int64_t unroll)
@@ -1710,3 +2371,128 @@ void w12b(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, t
     }
 #undef OKC_B
 }
+
+void w12m(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,
+          torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl, int64_t mode)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(n % (128 * mw) == 0 && k % 128 == 0 && (k / 128) % sk == 0 && (k / 128) / sk >= 1 && m <= 8 * nt && m >= 1, "w12m: shape/config mismatch");
+    TORCH_CHECK(X.stride(1) == 1 && (X.stride(0) * 2) % 16 == 0 && (reinterpret_cast<uintptr_t>(X.data_ptr()) & 15) == 0, "w12m: x must be 16 B aligned rows");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(W.data_ptr()) & 127) == 0 && W.is_contiguous(), "w12m: weight layout must be 128 B aligned");
+    TORCH_CHECK(sk * m * n <= part.numel() && (reinterpret_cast<uintptr_t>(part.data_ptr()) & 15) == 0, "w12m: workspace");
+    TORCH_CHECK(out.stride(1) == 1 && out.stride(0) % 2 == 0 && n % 2 == 0 && esc_roff.numel() >= n + 1, "w12m: output / escapes");
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const uint8_t* Wp = reinterpret_cast<const uint8_t*>(W.data_ptr());
+    float* pp = part.data_ptr<float>();
+    const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
+#define OKC_W12M(MWv, NTv, NS) launch_w12m<MWv, NTv, NS>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream)
+    const int key = (int)mw * 1000 + (int)nt * 10 + (int)nstage;
+    if (mode == 1) {   // bench ablation: loads only (1/16/3)
+        launch_w12m<1, 16, 3, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream);
+    } else {
+    switch (key) {
+        case 1163: OKC_W12M(1, 16, 3); break;   case 1162: OKC_W12M(1, 16, 2); break;
+        case 2162: OKC_W12M(2, 16, 2); break;   case 1322: OKC_W12M(1, 32, 2); break;
+        default: TORCH_CHECK(false, "unsupported w12m config (mw, nt, nstage)");
+    }
+    }
+#undef OKC_W12M
+    if (mode == 2) return;   // bench ablation: GEMM only (no reduce launch; output not written)
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((unsigned)((n / 2 + 255) / 256), (unsigned)m);
+    cfg.blockDim = dim3(256);
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = stream;
+    cudaLaunchAttribute attr[1];
+    attr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = attr;
+    cfg.numAttrs = pdl ? 1 : 0;
+    const cudaError_t err = cudaLaunchKernelEx(&cfg, w12m_reduce_kernel, (const float*)pp, (int)sk, (int)m, (int)n,
+        esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(), Xp, ldx,
+        reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
+    TORCH_CHECK(err == cudaSuccess, "w12m reduce launch failed: ", cudaGetErrorString(err));
+}
+
+// == BEGIN t12 host ==
+void bstream(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t nst, int64_t sb, bool bulk, int64_t smem_alloc)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(buf.data_ptr());
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(p) & 127) == 0 && buf.is_contiguous(), "bstream: buffer must be 128 B aligned");
+    const long nbytes = (long)(buf.numel() * buf.element_size());
+    uint32_t* o = reinterpret_cast<uint32_t*>(out.data_ptr());
+    TORCH_CHECK(out.numel() >= grid * 4, "bstream: out too small");
+    const int smem = (int)std::max<int64_t>(smem_alloc, nst * sb);
+#define BS_CASE(NS_, SB_) \
+    if (nst == NS_ && sb == SB_) { \
+        if (bulk) { static bool a1 = false; if (!a1) { cudaFuncSetAttribute(bstream_kernel<NS_, SB_, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448 - 4096); a1 = true; } \
+                    bstream_kernel<NS_, SB_, true><<<(unsigned)grid, 128, smem, stream>>>(p, nbytes, o); } \
+        else { static bool a0 = false; if (!a0) { cudaFuncSetAttribute(bstream_kernel<NS_, SB_, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448 - 4096); a0 = true; } \
+               bstream_kernel<NS_, SB_, false><<<(unsigned)grid, 128, smem, stream>>>(p, nbytes, o); } \
+        return; }
+    BS_CASE(2, 4096) BS_CASE(4, 4096) BS_CASE(6, 4096) BS_CASE(8, 4096)
+    BS_CASE(2, 8192) BS_CASE(4, 8192) BS_CASE(6, 8192) BS_CASE(8, 8192)
+    BS_CASE(2, 16384) BS_CASE(4, 16384) BS_CASE(6, 16384) BS_CASE(8, 16384)
+    BS_CASE(2, 32768) BS_CASE(4, 32768) BS_CASE(6, 32768)
+    BS_CASE(12, 8192) BS_CASE(16, 4096)
+#undef BS_CASE
+    TORCH_CHECK(false, "bstream: unsupported (nst, sb)");
+}
+
+void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,
+         torch::Tensor out, torch::Tensor diag, int64_t n, int64_t k, int64_t r, int64_t ck, int64_t w, int64_t nsw, int64_t nsx, int64_t nt, bool diag_on, int64_t variant)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int m = (int)X.size(0);
+    TORCH_CHECK(1 <= m && m <= 32 && m <= 8 * nt && n % r == 0 && k % (128 * ck) == 0 && nsx <= nsw, "t12: shape/config mismatch");
+    TORCH_CHECK(X.size(1) == k && X.stride(1) == 1 && (X.stride(0) * 2) % 16 == 0 && (reinterpret_cast<uintptr_t>(X.data_ptr()) & 15) == 0, "t12: x must be 16 B aligned rows");
+    TORCH_CHECK(Wt.is_contiguous() && (reinterpret_cast<uintptr_t>(Wt.data_ptr()) & 127) == 0 && Wt.numel() * Wt.element_size() >= n * k * 3 / 2, "t12: weight layout");
+    TORCH_CHECK(out.size(0) == m && out.size(1) == n && out.stride(1) == 1, "t12: output");
+    TORCH_CHECK(esc_roff.numel() >= n + 1 && esc_k.numel() >= 1 && esc_d.numel() >= 1, "t12: escapes");
+    TORCH_CHECK(diag.numel() >= 8, "t12: diag buffer");
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const uint8_t* Wp = reinterpret_cast<const uint8_t*>(Wt.data_ptr());
+    __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int* ero = esc_roff.data_ptr<int>(); const int* ek = esc_k.data_ptr<int>(); const float* ed = esc_d.data_ptr<float>();
+    unsigned long long* dg = reinterpret_cast<unsigned long long*>(diag.data_ptr());
+    const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
+#define T12_CASE(R_, C_, W_, SW_, SX_, NT_) \
+    if (variant == 1 && r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && !diag_on) { \
+        launch_t12<R_, C_, W_, SW_, SX_, NT_, false>(Xp, ldx, m, Wp, (int)eb, ero, ek, ed, op, ldo, (int)n, (int)k, dg, stream); return; }
+#define T12B_CASE(R_, C_, W_, SW_, SX_, NT_) \
+    if (variant == 2 && r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && !diag_on) { \
+        launch_t12b<R_, C_, W_, SW_, SX_, NT_, false>(Xp, ldx, m, Wp, (int)eb, ero, ek, ed, op, ldo, (int)n, (int)k, dg, stream); return; }
+#define T12B_CASE_D(R_, C_, W_, SW_, SX_, NT_) \
+    if (variant == 2 && r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && diag_on) { \
+        launch_t12b<R_, C_, W_, SW_, SX_, NT_, true>(Xp, ldx, m, Wp, (int)eb, ero, ek, ed, op, ldo, (int)n, (int)k, dg, stream); return; }
+#define T12_NT(R_, C_, W_, SW_, SX_) T12_CASE(R_, C_, W_, SW_, SX_, 1) T12_CASE(R_, C_, W_, SW_, SX_, 2) T12_CASE(R_, C_, W_, SW_, SX_, 4)
+#define T12B_NT(R_, C_, W_, SW_, SX_) T12B_CASE(R_, C_, W_, SW_, SX_, 1) T12B_CASE(R_, C_, W_, SW_, SX_, 2) T12B_CASE(R_, C_, W_, SW_, SX_, 4)
+#define T12B_NTD(R_, C_, W_, SW_, SX_) T12B_CASE_D(R_, C_, W_, SW_, SX_, 1) T12B_CASE_D(R_, C_, W_, SW_, SX_, 2) T12B_CASE_D(R_, C_, W_, SW_, SX_, 4)
+    T12_NT(32, 2, 8, 6, 3)
+    T12_NT(32, 4, 8, 4, 2)
+    T12B_NT(32, 2, 8, 6, 3)
+    T12B_NT(32, 2, 8, 8, 3)
+    T12B_NT(32, 2, 8, 8, 2)
+    T12B_NT(32, 2, 4, 8, 3)
+    T12B_NT(32, 4, 8, 4, 2)
+    T12B_NT(32, 4, 8, 5, 2)
+    T12B_NT(32, 4, 8, 6, 2)
+    T12B_NT(16, 2, 4, 8, 3)
+    T12B_NT(16, 2, 4, 6, 3)
+    T12B_NT(16, 4, 4, 4, 2)
+    T12B_NT(16, 4, 8, 4, 2)
+    T12B_NTD(32, 2, 8, 8, 3)
+    T12B_NTD(32, 4, 8, 5, 2)
+    T12B_NTD(16, 2, 4, 8, 3)
+#undef T12_NT
+#undef T12B_NT
+#undef T12B_NTD
+#undef T12_CASE
+#undef T12B_CASE
+#undef T12B_CASE_D
+    TORCH_CHECK(false, "t12: unsupported config (r, ck, w, nsw, nsx, nt, diag)");
+}
+// == END t12 host ==
+
+

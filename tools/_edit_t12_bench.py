@@ -14,16 +14,14 @@ NEW = r'''    TAB = {"table": True}
         buf = state.get("pooler_w12")
         nbytes = int(buf.numel() * buf.element_size())
         print(f"BENCH stream {nbytes / 1e6:.1f} MB (12-bit pooler payload): us (TB/s) per stages x stage KB, c<n> = CTAs per SM")
-        combos = [(2, 4), (4, 4), (8, 4), (16, 4), (2, 8), (4, 8), (6, 8), (8, 8), (12, 8), (2, 16), (4, 16), (6, 16), (8, 16), (2, 32), (4, 32), (6, 32)]
-        for bulk in (True, False):
+        combos = [(4, 8), (8, 8), (12, 8), (4, 16), (6, 16), (8, 16), (2, 32), (4, 32), (6, 32)]   # (check 11ed8ae1: c4 rows + cp.async done)
+        for bulk in (True,):
             for nst, kb in combos:
-                if not bulk and kb > 16:
-                    continue
                 sb = kb * 1024
                 parts = []
-                for cpsm in (1, 2, 4):
+                for cpsm in (1, 2):
                     need = nst * sb
-                    cap = min(233472 // cpsm - 1024, 232448)
+                    cap = min(233472 // cpsm - 1024, 232448 - 4096)
                     if need > cap:
                         parts.append(f"c{cpsm}   n/a      ")
                         continue
@@ -43,11 +41,12 @@ NEW = r'''    TAB = {"table": True}
     if ext is not None and BENCH_T12:
         # ---- STEP 2: the single-launch TMA 12-bit GEMM vs the current path
         print("BENCH tb12 r/ck/w/nsw/nsx vs current; '!' = fp32 rel err > 5e-3; '~' = differs from the table output by > 2e-3")
-        cfgs = [(32, 2, 8, 4, 3), (32, 2, 8, 6, 3), (32, 2, 8, 8, 3), (32, 2, 8, 8, 2), (16, 2, 4, 4, 3), (16, 2, 4, 8, 3), (16, 2, 4, 6, 2),
-                (32, 4, 8, 4, 2), (32, 2, 4, 6, 3)]
+        # (r, ck, w, nsw, nsx, variant): v1 = t12 (check 11ed8ae1: x bulk copies per row throttle the ring), v2 = t12b
+        cfgs = [(32, 2, 8, 6, 3, 1), (32, 4, 8, 4, 2, 1), (32, 2, 8, 6, 3, 2), (32, 2, 8, 8, 3, 2), (32, 2, 8, 8, 2, 2), (32, 2, 4, 8, 3, 2),
+                (32, 4, 8, 4, 2, 2), (32, 4, 8, 5, 2, 2), (32, 4, 8, 6, 2, 2), (16, 2, 4, 8, 3, 2), (16, 2, 4, 6, 3, 2), (16, 4, 4, 4, 2, 2), (16, 4, 8, 4, 2, 2)]
 
         def tb(c, m):
-            return dict(tb12=True, r=c[0], ck=c[1], w=c[2], nsw=c[3], nsx=c[4], nt=tb12_nt(m))
+            return dict(tb12=True, r=c[0], ck=c[1], w=c[2], nsw=c[3], nsx=c[4], nt=tb12_nt(m), v=c[5])
 
         def probe(layer, n, c, m=8):
             # judge-style probe rows: x[i] = one-hot at the k of escape i -> out[i, :] == W[:, k] exactly (bf16)
@@ -108,12 +107,12 @@ NEW = r'''    TAB = {"table": True}
                 print(f"  m={m:2d} {layer:9s} n={n}: " + " | ".join(parts))
             if m == 8:
                 for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 1024), ("o", 8192)):
-                    print(f"  probe {layer:9s}: " + " | ".join(f"{c[0]}/{c[1]} {probe(layer, n, c)}" for c in ((32, 2, 8, 6, 3), (16, 2, 4, 8, 3), (32, 4, 8, 4, 2))))
+                    print(f"  probe {layer:9s}: " + " | ".join(f"{c[0]}/{c[1]} {probe(layer, n, c)}" for c in ((32, 2, 8, 8, 3, 2), (16, 2, 4, 8, 3, 2), (32, 4, 8, 5, 2, 2))))
         # ---- DIAG: %globaltimer phases of CTA 0 (fill = first stage landed, loop, epilogue) and the CTA span
         dg = state["diag"]
-        for layer, n, m, c in (("pooler", 4096, 8, (32, 2, 8, 6, 3)), ("pooler", 4096, 32, (32, 2, 8, 6, 3)), ("pooler", 4096, 8, (16, 2, 4, 8, 3)),
-                               ("pooler", 4096, 32, (16, 2, 4, 8, 3)), ("qkv_gate", 2304, 8, (32, 2, 8, 6, 3)), ("unpooler", 8192, 16, (32, 2, 8, 6, 3)),
-                               ("o", 8192, 8, (32, 2, 8, 6, 3)), ("pooler", 4096, 1, (32, 2, 8, 6, 3))):
+        for layer, n, m, c in (("pooler", 4096, 8, (32, 2, 8, 8, 3, 2)), ("pooler", 4096, 32, (32, 2, 8, 8, 3, 2)), ("pooler", 4096, 8, (16, 2, 4, 8, 3, 2)), ("pooler", 4096, 8, (32, 4, 8, 5, 2, 2)), ("pooler", 4096, 32, (32, 4, 8, 5, 2, 2)),
+                               ("pooler", 4096, 32, (16, 2, 4, 8, 3, 2)), ("qkv_gate", 2304, 8, (16, 2, 4, 8, 3, 2)), ("unpooler", 8192, 16, (32, 2, 8, 8, 3, 2)),
+                               ("o", 8192, 8, (32, 2, 8, 8, 3, 2)), ("pooler", 4096, 1, (32, 2, 8, 8, 3, 2)), ("pooler", 4096, 1, (32, 4, 8, 5, 2, 2))):
             if not budget():
                 break
             x = xs[(m, layers[layer][1])]
