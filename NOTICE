@@ -1,5 +1,5 @@
 Open Kernel Challenge submissions in this repository (muse_attention_decode/submission.py,
-muse_moe_w4a16/submission.py, muse_bf16_proj/submission.py, muse_decode_layer/submission.py)
+muse_moe_w4a16/submission.py, muse_bf16_proj/submission.py, muse_decode_layer/submission.py, muse_prefill_layer/submission.py)
 are derived works based on https://github.com/vjeux/okc-2026, Copyright (c) 2026 vjeux,
 licensed under the Apache License, Version 2.0. Modifications Copyright (c) 2026 Madhavan113.
 The previous original kernels are kept as */submission_ours.py (same license).
