@@ -1,0 +1,11 @@
+calib delta 0.197 routes/token 1.60 experts@32 16.9
+T1/3r3e qkvB:14 oB:10 prB:27 unT:8 mcfg32a:12 mar2:120 mar1:109 age2:81 age1:72
+T2/4r3e qkvB:14 oB:10 prB:26 unT:8 mcfg8a:53 mar2:101 mar1:91 age2:81 age1:72
+T4/11r7e qkvB:14 oB:10 prB:28 unT:8 mcfg8a:77 mar2:146 mar1:137 age2:109 age1:98
+T8/17r9e qkvB:14 oB:10 prB:26 unT:8 mcfg8a:68 mar2:169 mar1:160 age2:119 age1:115
+T16/27r12e qkvB:14 oB:10 prB:26 unB:18 mcfg8a:160 mar2:221 mar1:209 age2:160 age1:151
+T32/49r17e qkvB:15 oB:10 prB:28 unB:19 mcfg8a:196 mar2:276 mar1:265 age2:196 age1:185
+T64/98r23e qkvm:18 om:11 prM:33 unT:24 mcfg8a:270 mar2:403 mar1:386 age2:258 age1:242
+T128/228r26e qkvm:20 om:11 prT:32 unT:24 mcfg8:376 mar2:566 mar1:539 age2:299 age1:270
+T256/478r28e qkvm:23 om:14 prT:39 unm:28 mcfg16:397 mar2:654 mar1:623 age2:381 age1:340
+tune: pbmax 0 moe {1: 'agent', 2: 'agent', 4: 'agent', 8: 'agent', 16: 'agent', 32: 'agent', 64: 'agent', 128: 'agent', 256: 'agent'} gluev2 {1: False, 2: False, 4: False, 8: False, 16: False, 32: False, 64: False, 128: False, 256: False}

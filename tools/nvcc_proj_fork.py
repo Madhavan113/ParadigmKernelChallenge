@@ -14,7 +14,7 @@ import sysconfig
 
 import torch.utils.cpp_extension as E
 
-spec = importlib.util.spec_from_file_location("proj_fork", "/work/muse_decode_layer/proj_fork.py")
+spec = importlib.util.spec_from_file_location("proj_fork", sys.argv[1] if len(sys.argv) > 1 and sys.argv[1].endswith(".py") else "/work/muse_decode_layer/proj_fork.py")
 P = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(P)
 sm90 = True

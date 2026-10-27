@@ -129,18 +129,103 @@ FUSE_ROUTE = True   # the fused pooler + router launch (sk2f) also does the rout
                     # CTA, replacing the _route_split launch (T <= 32, agent/Marlin experts: plain xm layout)
 
 
-def _fused_route(state, data, ids, lids, wts, xm):
+def _fused_route(state, data, ids, lids, wts, xm, selftest=False):
     """The route tuple for bfp_fused_pooler_router, or None when the separate _route_split kernel must run (also
-    when the composed proj module's fused launch has no routing tail: the standalone muse_bf16_proj)."""
+    when the composed proj module's fused launch has no routing tail: the standalone muse_bf16_proj, or when the
+    prepare-time self-test of the tail failed)."""
     ls = data["local_start"]
     if (not FUSE_ROUTE or ls.dtype != torch.int32 or state["g_preexp"].dtype != torch.bfloat16
-            or "route" not in bfp_fused_pooler_router.__code__.co_varnames):
+            or "route" not in bfp_fused_pooler_router.__code__.co_varnames
+            or not (selftest or state.get("fuse_route_ok"))):
         return None
     return (state["bias"], state["g_preexp"], ids, lids, wts, xm, ls)
 
 
-FUSE_BOUNDARY = False   # T <= 8: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
-                        # (proj_fork's sk2b); off until judged
+FUSE_BOUNDARY = True    # T <= 8: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
+                        # (proj_fork's sk2b); enabled only when the prepare-time self-test matches the Triton kernels
+
+
+def _route_selftest(st):
+    """The fused routing tail against _route_split on synthetic activations (T = 1, 8, 16, 32): ids must match, the
+    weights and xm within rounding. Any mismatch or exception disables the tail (st["fuse_route_ok"]); printed."""
+    st["fuse_route_ok"] = False
+    if st.get("bfp") is None or not FUSE_ROUTE or "route" not in bfp_fused_pooler_router.__code__.co_varnames:
+        print("route tail: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    g = torch.Generator(device=dev).manual_seed(777)
+    ls = torch.zeros(1, dtype=torch.int32, device=dev)
+    worst = []
+    for T in (1, 8, 16, 32):
+        h = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        a = [torch.empty((T, 8), dtype=torch.int32, device=dev), torch.empty((T, 8), dtype=torch.int32, device=dev),
+             torch.empty((T, 8), dtype=torch.float32, device=dev), torch.empty((T, D_EXPERT), dtype=torch.bfloat16, device=dev)]
+        b = [torch.empty_like(t) for t in a]
+        rt = _fused_route(st, {"local_start": ls}, *a, selftest=True)
+        try:
+            _bfp_pdl(T)
+            pooled, logits = bfp_fused_pooler_router(h, st["bfp"], rt)
+            torch.cuda.synchronize()
+        except Exception as ex:  # noqa: BLE001
+            print(f"route tail T{T}: FAILED {repr(ex)[:300]}", flush=True)
+            return
+        _route_split[(T,)](pooled, logits, st["bias"], st["g_preexp"], b[0], b[2], b[3], ls, b[1], PERMUTED=False, num_warps=8)
+        torch.cuda.synchronize()
+        d_ids = int((a[0] != b[0]).sum()) + int((a[1] != b[1]).sum())
+        d_w = float((a[2] - b[2]).abs().max())
+        d_x = float((a[3].float() - b[3].float()).abs().max()) / max(1e-6, float(b[3].float().abs().max()))
+        worst.append((T, d_ids, d_w, d_x))
+        if d_ids or not d_w < 1e-4 or not d_x < 2e-2:
+            print(f"route tail T{T}: MISMATCH ids {d_ids} wts {d_w:.2e} xm {d_x:.2e}", flush=True)
+            return
+    print("route tail ok: " + " ".join(f"T{T} ids0 w{w:.1e} x{x:.1e}" for T, _, w, x in worst), flush=True)
+    st["fuse_route_ok"] = True
+
+
+def _boundary_selftest(st):
+    """The sk2b boundary tails (o projection -> _boundary1, unpooler slice -> _boundary2) against the Triton kernels
+    at T = 1, 8 on synthetic inputs; any mismatch or exception disables them (st["fuse_bnd_ok"]); printed."""
+    st["fuse_bnd_ok"] = False
+    if (st.get("bfp") is None or not FUSE_BOUNDARY or "bfp_run_sk2_tail" not in globals()
+            or "ab1" not in st):
+        print("boundary tails: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    g = torch.Generator(device=dev).manual_seed(778)
+    f32 = dict(device=dev, dtype=torch.float32)
+    report = []
+    for T in (1, 8):
+        stream = torch.randn(T, HIDDEN, generator=g, device=dev)
+        o_in = (torch.randn(T, 1024, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        m = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        try:
+            _bfp_pdl(T)
+            s1a, ha = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            P = globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, st["bfp"],
+                                              (st["ab1"][0], st["ab1"][1], stream, None, st["g_preffn"], s1a, ha))
+            s2a, outa = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            Pu = globals()["bfp_run_sk2_tail"](m, "unpooler", T, 1024, D_EXPERT, st["bfp"],
+                                               (st["ab2"][0], st["ab2"][1], s1a, st["g_postffn"], st["g_next"], s2a, outa))
+            torch.cuda.synchronize()
+        except Exception as ex:  # noqa: BLE001
+            print(f"boundary tails T{T}: FAILED {repr(ex)[:300]}", flush=True)
+            return
+        # the Triton kernels on the SAME GEMM outputs (P, Pu are the bf16 products the tails saw)
+        s1b, hb = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        _boundary1[(T,)](P.view(1, T, HIDDEN), 1, T, stream, st["gate1"], st["gate1"], st["g_preffn"], s1b, hb, num_warps=16)
+        s2b, outb = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        _boundary2[(T,)](Pu.view(1, T, 1024), 1, T, 1024, s1a, st["gate2"], st["gate2"], st["g_postffn"], st["g_next"],
+                         s2b, outb, num_warps=16)
+        torch.cuda.synchronize()
+        errs = []
+        for x, y in ((s1a, s1b), (ha, hb), (s2a, s2b), (outa, outb)):
+            errs.append(float((x.float() - y.float()).norm() / max(1e-6, float(y.float().norm()))))
+        report.append((T, errs))
+        if not all(e < 2e-3 for e in errs):
+            print(f"boundary tails T{T}: MISMATCH rel err s1 {errs[0]:.2e} h {errs[1]:.2e} s2 {errs[2]:.2e} out {errs[3]:.2e}", flush=True)
+            return
+    print("boundary tails ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
+    st["fuse_bnd_ok"] = True
 
 
 def _gate_coeffs(g):
@@ -153,8 +238,8 @@ def _gate_coeffs(g):
 
 def _bfp_tail_ok(state, T):
     return (FUSE_BOUNDARY and T <= 8 and state.get("bfp") is not None and "bfp_run_sk2_tail" in globals()
-            and "ab1" in state and state["g_preffn"].dtype == torch.bfloat16 and state["g_postffn"].dtype == torch.bfloat16
-            and state["g_next"].dtype == torch.bfloat16)
+            and state.get("fuse_bnd_ok") and "ab1" in state and state["g_preffn"].dtype == torch.bfloat16
+            and state["g_postffn"].dtype == torch.bfloat16 and state["g_next"].dtype == torch.bfloat16)
 
 
 SCRATCH_GUARD = 1 << 16   # sentinel words after each buffer my glue allocates: wide enough for far overruns (v154m-style state ~4K words out)
@@ -1279,8 +1364,12 @@ def _tune(st, log=False):
                         t_bfpf = _graph_time(lambda: bfp_fused_pooler_router(xd, st["bfp"], rt), flush, reps=5)
                     else:
                         t_bfpf = _graph_time(lambda: _pr_split(*bfp_fused_pooler_router(xd, st["bfp"])), flush, reps=5)
-                except Exception:  # noqa: BLE001  (sm_80 or an older bf16_proj file: not offered)
+                except Exception as ex:  # noqa: BLE001  (sm_80 or an older bf16_proj file: not offered)
                     t_bfpf = 1e30
+                    if log:
+                        msg.append(f"bfpfX:{repr(ex)[:120]}")
+            if log and name == "pr":
+                msg.append(f"pr[T{t_tri:.0f} M{t_mm:.0f} B{t_bfp:.0f} F{t_bfpf:.0f}]")
             t_mm16 = 1e30
             if name != "pr":   # the router logits stay fp32 (hi + lo rows); the other three may come out bf16 as SGLang's
                 st["mm_pick"][(T, name)] = "mm16"
@@ -1413,6 +1502,11 @@ def prepare(weights):
         raise errs[0]
     _ma_prepare(weights, st)
     _bfp_prepare(weights, st)
+    for selftest in (_route_selftest, _boundary_selftest):   # the fused tails, each enabled only when it matches
+        try:
+            selftest(st)
+        except Exception as ex:  # noqa: BLE001
+            print(f"{selftest.__name__} failed: {repr(ex)[:300]}", flush=True)
     st["nsm"] = torch.cuda.get_device_properties(dev).multi_processor_count
     st["fa3"] = None
     st["bank"] = None

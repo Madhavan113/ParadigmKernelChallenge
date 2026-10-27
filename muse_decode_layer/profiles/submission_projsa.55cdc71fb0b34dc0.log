@@ -1,0 +1,63 @@
+[okc] gqx<bn 128, nwg 2, ns 6, cl 4>: smem 197744, max active clusters 30, grid clusters 18
+[okc] gqx<bn 128, nwg 2, ns 6, cl 5>: smem 197744, max active clusters 22, grid clusters 18
+[okc] gqx<bn 128, nwg 1, ns 8, cl 3>: smem 197776, max active clusters 39, grid clusters 36
+[okc] gqx<bn 256, nwg 1, ns 5, cl 3>: smem 205920, max active clusters 39, grid clusters 36
+[okc] gqx<bn 128, nwg 2, ns 6, cl 2>: smem 197744, max active clusters 66, grid clusters 64
+[okc] gqx<bn 256, nwg 2, ns 4, cl 2>: smem 197712, max active clusters 66, grid clusters 64
+[okc] gqx<bn 128, nwg 1, ns 8, cl 2>: smem 197776, max active clusters 66, grid clusters 64
+[okc] gqx<bn 128, nwg 2, ns 6, cl 3>: smem 197744, max active clusters 39, grid clusters 32
+[okc] gqx<bn 256, nwg 1, ns 5, cl 2>: smem 205920, max active clusters 66, grid clusters 64
+[okc] gqx<bn 128, nwg 4, ns 4, cl 3>: smem 197712, max active clusters 39, grid clusters 32
+[okc] gqx<bn 128, nwg 1, ns 8, cl 1>: smem 197776, max active clusters 132, grid clusters 128
+[okc] gqx<bn 256, nwg 1, ns 5, cl 1>: smem 205920, max active clusters 132, grid clusters 128
+[okc] selftest fused pooler+router: worst err/tol 0.123 -> ok
+[okc] tune qkv_gate m=1: cgemv=12.29 sk2=15.58 torch=17.57 -> cgemv
+[okc] tune o m=1: cgemv=8.48 sk2=11.62 torch=9.95 -> cgemv
+[okc] tune pooler m=1: cgemv=17.25 sk2=19.97 torch=24.74 -> cgemv
+[okc] tune unpooler m=1: cgemv=6.85 sgemv=7.1 sk2=8.54 torch=10.3 -> cgemv
+[okc] tune router m=1: rgemv=6.91 sk2=8.42 torch=17.63 -> rgemv
+[okc] tune qkv_gate m=16: sk2=15.42 torch=17.38 -> sk2
+[okc] tune o m=16: sk2=10.05 torch=10.02 -> torch
+[okc] tune pooler m=16: sk2=20.51 torch=24.96 -> sk2
+[okc] tune unpooler m=16: sk2=18.4 torch=22.11 -> sk2
+[okc] tune router m=16: sk2=8.58 torch=18.14 -> sk2
+[okc] tune qkv_gate m=32: sk2=17.86 torch=17.5 -> torch
+[okc] tune o m=32: sk2=10.27 torch=10.05 -> torch
+[okc] tune pooler m=32: sk2=25.5 torch=25.57 -> sk2
+[okc] tune unpooler m=32: sk2=20.29 torch=22.3 -> sk2
+[okc] tune router m=32: sk2=8.99 torch=18.66 -> sk2
+[okc] tune qkv_gate m=8: sk2=15.81 torch=17.86 -> sk2
+[okc] tune o m=8: sk2=11.52 torch=9.79 -> torch
+[okc] tune pooler m=8: sk2=20.19 torch=24.93 -> sk2
+[okc] tune unpooler m=8: sk2=8.54 torch=10.24 -> sk2
+[okc] tune router m=8: sk2=8.51 torch=17.98 -> sk2
+[okc] tune qkv_gate m=128: gqx[2]=20.16 gqx[1]=20.32 gqx[0]=17.89 torch=20.38 -> gqx[0]
+[okc] tune o m=128: gqx[0]=13.02 torch=10.56 torchT=10.69 -> torch
+[okc] tune pooler m=128: gqx[1]=25.38 gqx[0]=26.72 gq=24.96 torch=28.61 -> gq
+[okc] tune unpooler m=128: gqx[2]=29.12 gqx[1]=24.8 gqx[0]=23.07 torch=23.14 torchT=22.37 -> torchT
+[okc] tune router m=128: rk=9.47 wide=12.1 gemm=13.25 torch=19.58 -> rk
+[okc] tune qkv_gate m=256: gqx[0]=24.1 torch=23.2 -> torch
+[okc] tune o m=256: gqx[0]=16.86 torch=12.54 torchT=12.48 -> torchT
+[okc] tune pooler m=256: gqx[0]=31.94 torch=33.54 -> gqx[0]
+[okc] tune unpooler m=256: gqx[0]=29.5 torch=27.87 torchT=27.36 -> torchT
+[okc] tune router m=256: rk=10.43 wide=13.06 gemm=16.96 torch=20.61 -> rk
+[okc] disabled: []
+[okc] diag sk2 pooler m=8 (pooler8h_r72): full=20.5 no-epilogue=20.3 no-compute=18.0 no-x=20.5 loads-only=17.9 alu-not-mma=18.9 no-ldmatrix=19.3
+[okc] diag sk2 pooler m=16 (pooler16t_r192): full=20.7 no-epilogue=20.3 no-compute=18.0 no-x=20.9 loads-only=17.9 alu-not-mma=19.1 no-ldmatrix=19.9
+[okc] diag sk2 pooler m=32 (pooler32_r144): full=25.8 no-epilogue=25.3 no-compute=18.7 no-x=25.8 loads-only=18.2 alu-not-mma=21.7 no-ldmatrix=24.3
+[okc] diag sk2 qkv_gate m=8 (qkv8t_r144): full=16.0 no-epilogue=15.6 no-compute=13.0 no-x=15.9 loads-only=12.9 alu-not-mma=14.7 no-ldmatrix=15.2
+[okc] diag sk2 qkv_gate m=32 (qkv32_r208): full=18.3 no-epilogue=17.6 no-compute=14.0 no-x=18.0 loads-only=13.3 alu-not-mma=15.4 no-ldmatrix=17.3
+[okc] diag sk2 unpooler m=16 (unpooler16t_r72): full=18.7 no-epilogue=18.3 no-compute=17.9 no-x=18.7 loads-only=17.9 alu-not-mma=18.3 no-ldmatrix=18.6
+[okc] diag sk2 unpooler m=32 (unpooler32_r144): full=20.5 no-epilogue=19.6 no-compute=18.3 no-x=20.4 loads-only=18.2 alu-not-mma=18.8 no-ldmatrix=19.7
+[okc] diag sk2 o m=16 (o16t_r68): full=10.4 no-epilogue=9.9 no-compute=9.2 no-x=10.6 loads-only=9.2 alu-not-mma=10.0 no-ldmatrix=10.1
+calib delta 0.385 routes/token 1.60 experts@32 15.8
+T1/3r3e qkvB:13 oB:9 prB:25 unB:7 mcfg48a:12 mar2:128 mar1:122 age2:78 age1:70
+T2/4r3e qkvB:16 om:10 prF:26 unT:8 mcfg48:13 mar2:130 mar1:123 age2:80 age1:74
+T4/8r6e qkvB:16 om:10 prF:26 unT:8 mcfg8a:76 mar2:132 mar1:125 age2:101 age1:94
+T8/13r7e qkvB:16 oB:10 prF:26 unT:8 mcfg8a:68 mar2:148 mar1:139 age2:107 age1:99
+T16/18r7e qkvB:16 om:10 prF:27 unB:19 mcfg8a:160 mar2:170 mar1:160 age2:130 age1:120
+T32/54r14e qkvB:18 oB:10 prF:31 unB:21 mcfg8a:195 mar2:271 mar1:261 age2:186 age1:177
+T64/107r18e qkvM:18 om:11 prM:34 unm:23 mcfg8a:270 mar2:370 mar1:354 age2:228 age1:212
+T128/231r25e qkvM:20 om:11 prM:32 unm:23 mcfg8:373 mar2:563 mar1:537 age2:300 age1:273
+T256/424r27e qkvm:23 om:13 prT:38 unm:29 mcfg16:397 mar2:665 mar1:617 age2:378 age1:329
+tune: pbmax 0 moe {1: 'agent', 2: 'agent', 4: 'agent', 8: 'agent', 16: 'agent', 32: 'agent', 64: 'agent', 128: 'agent', 256: 'agent'} gluev2 {1: False, 2: False, 4: False, 8: False, 16: False, 32: False, 64: False, 128: False, 256: False}
