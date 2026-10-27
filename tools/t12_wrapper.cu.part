@@ -1,0 +1,67 @@
+// == BEGIN t12 host ==
+void bstream(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t nst, int64_t sb, bool bulk, int64_t smem_alloc)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const uint8_t* p = reinterpret_cast<const uint8_t*>(buf.data_ptr());
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(p) & 127) == 0 && buf.is_contiguous(), "bstream: buffer must be 128 B aligned");
+    const long nbytes = (long)(buf.numel() * buf.element_size());
+    uint32_t* o = reinterpret_cast<uint32_t*>(out.data_ptr());
+    TORCH_CHECK(out.numel() >= grid * 4, "bstream: out too small");
+    const int smem = (int)std::max<int64_t>(smem_alloc, nst * sb);
+#define BS_CASE(NS_, SB_) \
+    if (nst == NS_ && sb == SB_) { \
+        if (bulk) { static bool a1 = false; if (!a1) { cudaFuncSetAttribute(bstream_kernel<NS_, SB_, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448); a1 = true; } \
+                    bstream_kernel<NS_, SB_, true><<<(unsigned)grid, 128, smem, stream>>>(p, nbytes, o); } \
+        else { static bool a0 = false; if (!a0) { cudaFuncSetAttribute(bstream_kernel<NS_, SB_, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448); a0 = true; } \
+               bstream_kernel<NS_, SB_, false><<<(unsigned)grid, 128, smem, stream>>>(p, nbytes, o); } \
+        return; }
+    BS_CASE(2, 4096) BS_CASE(4, 4096) BS_CASE(6, 4096) BS_CASE(8, 4096)
+    BS_CASE(2, 8192) BS_CASE(4, 8192) BS_CASE(6, 8192) BS_CASE(8, 8192)
+    BS_CASE(2, 16384) BS_CASE(4, 16384) BS_CASE(6, 16384) BS_CASE(8, 16384)
+    BS_CASE(2, 32768) BS_CASE(4, 32768) BS_CASE(6, 32768)
+    BS_CASE(12, 8192) BS_CASE(16, 4096)
+#undef BS_CASE
+    TORCH_CHECK(false, "bstream: unsupported (nst, sb)");
+}
+
+void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,
+         torch::Tensor out, torch::Tensor diag, int64_t n, int64_t k, int64_t r, int64_t ck, int64_t w, int64_t nsw, int64_t nsx, int64_t nt, bool diag_on)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    const int m = (int)X.size(0);
+    TORCH_CHECK(1 <= m && m <= 32 && m <= 8 * nt && n % r == 0 && k % (128 * ck) == 0 && nsx <= nsw, "t12: shape/config mismatch");
+    TORCH_CHECK(X.size(1) == k && X.stride(1) == 1 && (X.stride(0) * 2) % 16 == 0 && (reinterpret_cast<uintptr_t>(X.data_ptr()) & 15) == 0, "t12: x must be 16 B aligned rows");
+    TORCH_CHECK(Wt.is_contiguous() && (reinterpret_cast<uintptr_t>(Wt.data_ptr()) & 127) == 0 && Wt.numel() * Wt.element_size() >= n * k * 3 / 2, "t12: weight layout");
+    TORCH_CHECK(out.size(0) == m && out.size(1) == n && out.stride(1) == 1, "t12: output");
+    TORCH_CHECK(esc_roff.numel() >= n + 1 && esc_k.numel() >= 1 && esc_d.numel() >= 1, "t12: escapes");
+    TORCH_CHECK(diag.numel() >= 8, "t12: diag buffer");
+    const __nv_bfloat16* Xp = reinterpret_cast<const __nv_bfloat16*>(X.data_ptr());
+    const uint8_t* Wp = reinterpret_cast<const uint8_t*>(Wt.data_ptr());
+    __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+    const int* ero = esc_roff.data_ptr<int>(); const int* ek = esc_k.data_ptr<int>(); const float* ed = esc_d.data_ptr<float>();
+    unsigned long long* dg = reinterpret_cast<unsigned long long*>(diag.data_ptr());
+    const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
+#define T12_CASE(R_, C_, W_, SW_, SX_, NT_) \
+    if (r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && !diag_on) { \
+        launch_t12<R_, C_, W_, SW_, SX_, NT_, false>(Xp, ldx, m, Wp, (int)eb, ero, ek, ed, op, ldo, (int)n, (int)k, dg, stream); return; }
+#define T12_CASE_D(R_, C_, W_, SW_, SX_, NT_) \
+    if (r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && diag_on) { \
+        launch_t12<R_, C_, W_, SW_, SX_, NT_, true>(Xp, ldx, m, Wp, (int)eb, ero, ek, ed, op, ldo, (int)n, (int)k, dg, stream); return; }
+#define T12_NT(R_, C_, W_, SW_, SX_) T12_CASE(R_, C_, W_, SW_, SX_, 1) T12_CASE(R_, C_, W_, SW_, SX_, 2) T12_CASE(R_, C_, W_, SW_, SX_, 4)
+    T12_NT(32, 2, 8, 4, 3)
+    T12_NT(32, 2, 8, 6, 3)
+    T12_NT(32, 2, 8, 8, 3)
+    T12_NT(32, 2, 8, 8, 2)
+    T12_NT(16, 2, 4, 4, 3)
+    T12_NT(16, 2, 4, 8, 3)
+    T12_NT(16, 2, 4, 6, 2)
+    T12_NT(32, 4, 8, 4, 2)
+    T12_NT(32, 2, 4, 6, 3)
+    T12_CASE_D(32, 2, 8, 6, 3, 1) T12_CASE_D(32, 2, 8, 6, 3, 2) T12_CASE_D(32, 2, 8, 6, 3, 4)
+    T12_CASE_D(16, 2, 4, 8, 3, 1) T12_CASE_D(16, 2, 4, 8, 3, 2) T12_CASE_D(16, 2, 4, 8, 3, 4)
+#undef T12_NT
+#undef T12_CASE
+#undef T12_CASE_D
+    TORCH_CHECK(false, "t12: unsupported config (r, ck, w, nsw, nsx, nt, diag)");
+}
+// == END t12 host ==
