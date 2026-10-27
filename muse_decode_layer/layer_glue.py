@@ -73,10 +73,12 @@ TUNE_MARGIN = 0.95
 # qkv at T=128 cuBLAS 249.4 vs split-K 251.0 (16x8 sliding); qkv at T=256 cuBLAS 351.1 vs split-K 353.5 (32x8 sliding).
 # pr at T=32: separate bfp 166.8 / 318.7 vs fused bfpf 167.9 / 320.2 us (32x1 sliding / full). T=256 pr/un: 4-way tie.
 # un at T=1/8 (the 1024-row slice): bfp 80.7 / 80.1 / 116.7 / 138.2 vs split-K 81.9 / 81.2 / 118.8 / 140.1 us (1x1 s/f, 1x8 s/f).
-PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp",
+PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (1, "o"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp",
+            (1, "pr"): ("bfpf", "bfp"), (8, "pr"): ("bfpf", "bfp"), (16, "pr"): ("bfpf", "bfp"), (32, "pr"): ("bfpf", "bfp"),
             (128, "qkv"): (True, "mm16"), (256, "qkv"): (True, "mm16")}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
-# ((32, "pr"): "bfp" was pinned over the fused launch (1.1 us in-chain); with the routing fused into that launch the
-# tuner's own timing, which includes the routing kernel / tail, decides)
+# pr at T <= 32: the bf16_proj kernels (fused launch incl. the fused routing tail, or separate + _route_split), by the
+# tuner's times; never the Triton split-K / cuBLAS cat GEMM (check 19ea8e60: Triton pr picked by a biased timing cost
+# 6-8 us per decode shape)
 # a tuple pins the choice to the faster of those picks by the tuner's own times (here: cuBLAS fp32 out vs bf16 out,
 # never the Triton split-K the isolated tuner prefers)
 FORCE_MM = None
@@ -90,6 +92,10 @@ FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boun
 # {{COMPONENT moe}}
 
 # {{COMPONENT proj}}
+
+
+if "bfp_CUTLASS_LAYERS" in globals():   # standalone proj composition: no CUTLASS build inside this layer's 300 s prepare
+    bfp_CUTLASS_LAYERS = set()
 
 
 def _bfp_prepare(weights, st):
@@ -124,11 +130,31 @@ FUSE_ROUTE = True   # the fused pooler + router launch (sk2f) also does the rout
 
 
 def _fused_route(state, data, ids, lids, wts, xm):
-    """The route tuple for bfp_fused_pooler_router, or None when the separate _route_split kernel must run."""
+    """The route tuple for bfp_fused_pooler_router, or None when the separate _route_split kernel must run (also
+    when the composed proj module's fused launch has no routing tail: the standalone muse_bf16_proj)."""
     ls = data["local_start"]
-    if not FUSE_ROUTE or ls.dtype != torch.int32 or state["g_preexp"].dtype != torch.bfloat16:
+    if (not FUSE_ROUTE or ls.dtype != torch.int32 or state["g_preexp"].dtype != torch.bfloat16
+            or "route" not in bfp_fused_pooler_router.__code__.co_varnames):
         return None
     return (state["bias"], state["g_preexp"], ids, lids, wts, xm, ls)
+
+
+FUSE_BOUNDARY = False   # T <= 8: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
+                        # (proj_fork's sk2b); off until judged
+
+
+def _gate_coeffs(g):
+    """alpha, beta of a residual gate from its BF16 weight, exactly as _gate_ab forms them (prepare-time, fp32)."""
+    w = g.float() / 0.3
+    beta = torch.sigmoid(w)
+    alpha = torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1.0 + beta), min=1e-3))
+    return alpha.contiguous(), beta.contiguous()
+
+
+def _bfp_tail_ok(state, T):
+    return (FUSE_BOUNDARY and T <= 8 and state.get("bfp") is not None and "bfp_run_sk2_tail" in globals()
+            and "ab1" in state and state["g_preffn"].dtype == torch.bfloat16 and state["g_postffn"].dtype == torch.bfloat16
+            and state["g_next"].dtype == torch.bfloat16)
 
 
 SCRATCH_GUARD = 1 << 16   # sentinel words after each buffer my glue allocates: wide enough for far overruns (v154m-style state ~4K words out)
@@ -1211,7 +1237,18 @@ def _tune(st, log=False):
                 _route_split[(T,)](pooled, logits, st["bias"], st["g_preexp"], r_ids, r_wts, r_xm, data["local_start"],
                                    r_lids, PERMUTED=False, num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
 
-            if st.get("bfp") is not None:
+            def _pr_route(PS):   # the combined pooler+router GEMM output -> the routing kernel that consumes it
+                P_, S_ = PS
+                _route[(T,)](P_, S_, T, st["bias"], st["g_preexp"], r_ids, r_wts, r_xm, data["local_start"], r_lids,
+                             PERMUTED=False, num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+
+            def _dense_t(pick):   # time what dense() runs for this pick (+ the routing kernel for "pr")
+                st["mm_pick"][(T, name)] = pick
+                if name == "pr":
+                    return _graph_time(lambda: _pr_route(dense(xd, w, T, st, name)), flush, reps=5)
+                return _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+
+            if st.get("bfp") is not None and T <= BFP_MAX_T:   # above BFP_MAX_T a "bfp" pick runs as cuBLAS: not a candidate
                 st["mm_pick"][(T, name)] = "bfp"
                 try:
                     if name == "pr":
@@ -1225,14 +1262,12 @@ def _tune(st, log=False):
                     t_bfp = 1e30
             else:
                 t_bfp = 1e30
-            st["mm_pick"][(T, name)] = False
             try:
-                t_tri = _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+                t_tri = _dense_t(False)
             except Exception:  # noqa: BLE001
                 t_tri = 1e30
-            st["mm_pick"][(T, name)] = True
             try:
-                t_mm = _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+                t_mm = _dense_t(True)
             except Exception:  # noqa: BLE001
                 t_mm = 1e30
             t_bfpf = 1e30
@@ -1349,6 +1384,8 @@ def prepare(weights):
     # precomputes (the post-expert effective weight) is stored exactly as SGLang stores it, in BF16.
     st["gate1"] = weights["attn_residual_gate"].contiguous()
     st["gate2"] = weights["ffn_residual_gate"].contiguous()
+    st["ab1"] = _gate_coeffs(st["gate1"])   # (alpha, beta) fp32 for the fused boundary tails (FUSE_BOUNDARY)
+    st["ab2"] = _gate_coeffs(st["gate2"])
     st["g_preffn"] = weights["pre_ffn_norm"].contiguous()
     st["g_preexp"] = weights["pre_expert_norm"].contiguous()
     st["g_postexp"] = weights["post_expert_norm"].contiguous()   # BF16 as given; _pexp_norm_sum forms 1 + w
@@ -1630,6 +1667,12 @@ def _after_attention(data, state, o_in, gate, T):
         BC1 = 2048
         _bnd1_apply[(T, HIDDEN // BC1)](a_out, sums, data["stream"], state["gate1"], state["gate1"], state["g_preffn"],
                                         s1, h, N=HIDDEN, BC=BC1, num_warps=8)
+    elif (gate is None and _bfp_tail_ok(state, T) and state.get("mm_pick", {}).get((T, "o")) == "bfp"
+          and data["stream"].dtype == torch.float32 and data["stream"].is_contiguous()):
+        # o projection whose last CTA also computes the post-attention boundary (s1, h): no _boundary1 launch
+        _bfp_pdl(T)
+        globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, state["bfp"],
+                         (state["ab1"][0], state["ab1"][1], data["stream"], None, state["g_preffn"], s1, h))
     else:
         if gate is None:
             P, S = dense(o_in, state["o"], T, state, "o")
@@ -1691,10 +1734,16 @@ def _after_attention(data, state, o_in, gate, T):
         m = _marlin_experts(xm, wts, lids, state)
     # 6. unpooler + post-FFN boundary + next layer's norm
     wu = state["unpool_slice"] if T <= 8 else state["unpool"]
-    P, S = dense(m, wu, T, state, "un")
     nu = wu.shape[0]
     s2 = torch.empty((T, HIDDEN), **f32)
     out = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+    if not v2 and _bfp_tail_ok(state, T) and state.get("mm_pick", {}).get((T, "un")) == "bfp":
+        # unpooler slice whose last CTA also computes the post-FFN boundary (s2, out): no _boundary2 launch
+        _bfp_pdl(T)
+        globals()["bfp_run_sk2_tail"](m, "unpooler", T, nu, D_EXPERT, state["bfp"],
+                         (state["ab2"][0], state["ab2"][1], s1, state["g_postffn"], state["g_next"], s2, out))
+        return out, s2, ids
+    P, S = dense(m, wu, T, state, "un")
     if v2:
         fbuf = torch.zeros((T, HIDDEN), **f32)
         sums2 = torch.zeros((T, 4), **f32)
