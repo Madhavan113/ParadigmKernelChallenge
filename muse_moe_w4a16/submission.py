@@ -4428,7 +4428,7 @@ TINY2_MAX_M = 8
 # TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
-DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
+DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
 DIAG_SET = "F"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
@@ -4733,7 +4733,17 @@ EMAX = MMAX * 8
 JMAX = 32 + EMAX // 64 + 8
 
 
-WGS_FIXF = 2 * (JMAX * 32) * 4 * 4096 + 2 * (JMAX * 32) * 4 + 136 * 16   # moe WGS_FIXF with unit-indexed fixup slots (OKC_WGSDYN; the 160-slot builds need less): stream-K fixups + doneAs after ybuf (zero between calls)
+def _wgs_fixf():
+    """moe WGS_FIXF: stream-K fixups + doneAs after ybuf (zero between calls); unit-indexed fixup slots (JMAX * 32) only
+    when a selected build uses OKC_WGSDYN, else the 160 CTA-indexed slots."""
+    sets = [MAIN_DEFINES, TINY_DEFINES, TINY2_DEFINES, MID_DEFINES]
+    if DIAG:
+        sets += [v["defines"] if isinstance(v, dict) else v for v in DIAG_VARIANTS.values()]
+    slots = JMAX * 32 if any("-DOKC_WGSDYN=1" in tuple(d) for d in sets) else 160
+    return 2 * slots * 4 * 4096 + 2 * slots * 4 + 136 * 16
+
+
+WGS_FIXF = _wgs_fixf()
 WGS_XROWS = EMAX + 8 * (32 + EMAX // 32 + 8)  # >= moe WGS_XROWS for FT_T >= 32
 
 
