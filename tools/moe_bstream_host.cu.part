@@ -8,7 +8,7 @@ void bstream_ranges(torch::Tensor b0, torch::Tensor b1, torch::Tensor ranges, to
     TORCH_CHECK(out.numel() >= 4 * n, "bstream: out");
     const uint8_t* p0 = reinterpret_cast<const uint8_t*>(b0.data_ptr());
     const uint8_t* p1 = reinterpret_cast<const uint8_t*>(b1.data_ptr());
-    const long long* r = ranges.data_ptr<long long>();
+    const long long* r = reinterpret_cast<const long long*>(ranges.data_ptr<int64_t>());
     uint32_t* o = reinterpret_cast<uint32_t*>(out.data_ptr());
     const int smem = (int)std::max<int64_t>(smem_alloc, nst * sb);
 #define BSR_CASE(NS_, SB_) \
