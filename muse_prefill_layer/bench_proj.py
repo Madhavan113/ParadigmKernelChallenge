@@ -9481,23 +9481,24 @@ void gqx(at::Tensor W, at::Tensor x, at::Tensor out, int64_t M, int64_t N, int64
 # Bytes each SM ingests = W (BM x K/cl x 2) + x (BN x K/cl x 2): at BM = 64 the x re-reads are 2x the weights (m = 128),
 # so wider row blocks with deeper K splits (DSMEM reduce) cut the per-SM traffic; cl <= 8 (portable cluster size).
 bfp_GQX_CONFIGS = {
-    ("qkv_gate", 128): [(1, 3, 8),    # v141: 36 row blocks x 3 K-thirds = 108 CTAs (cuBLAS 16.4 -> 14.0 us at m=128)
-                        (2, 6, 6),    # 18 x 6 = 108 CTAs, 0.70 MB per SM
-                        (3, 8, 5)],   # 12 x 8 = 96 CTAs, 0.64 MB per SM
-    ("qkv_gate", 256): [(1, 3, 5),    # 108 CTAs, 1.6 MB per SM
-                        (2, 6, 4),    # 108 CTAs, 0.9 MB per SM
-                        (2, 4, 4)],   # 72 CTAs
-    ("pooler", 128): [(2, 4, 6),      # 32 x 4 = 128 CTAs, 1 MB per SM (gq: 1.5 MB)
-                      (4, 8, 4)],     # 16 x 8 = 128 CTAs, 0.75 MB per SM
-    ("pooler", 256): [(2, 4, 4),      # 128 CTAs, 1.5 MB per SM
-                      (2, 2, 4)],     # 64 CTAs
-    ("unpooler", 128): [(2, 2, 6),    # 64 x 2 = 128 CTAs, 1 MB per SM
-                        (4, 4, 4)],   # 32 x 4 = 128 CTAs, 0.75 MB per SM
-    ("unpooler", 256): [(2, 2, 4)],   # 128 CTAs, 1.5 MB per SM (NWG 4 at BN 256: 128 acc regs x 544 threads spill)
-    ("o", 128): [(2, 2, 6),           # 128 CTAs, 8 stages of K each
-                 (1, 1, 8)],          # 128 CTAs, no cluster
-    ("o", 256): [(2, 2, 4),
-                 (1, 1, 5)],
+    # judged (run f3e50d8b, raw graph replay us): qkv m128 (1,3,8) 17.9 | (2,6,6) 29.0 (18 clusters of 6 > 17 active: second
+    # wave) | (3,8,5) 21.8; pooler m128 gq(1,2,8) 24.5 | (2,4,6) 37.3 (32 > 30: wave) | (4,8,4) 43.6 (16 > 15: wave);
+    # unpooler m128 torchT 22.6 | (2,2,6) 24.6 | (4,4,4) 42.1 (wave); o m128 torchT 10.4 | (2,2,6) 10.5 | (1,1,8) 12.8;
+    # m256: qkv (1,3,5) 24.2 vs torch 22.8; pooler (2,4,4) 49 / (2,2,4) 56 vs cutlass 31; unpooler (2,2,4) 32 vs 27.3;
+    # o (2,2,4) 13.3 / (1,1,5) 16.6 vs 12.4. Max active clusters (smem ~200 KB): cl2 66, cl3 39, cl4 30, cl6 17, cl8 15.
+    ("qkv_gate", 128): [(1, 3, 8),    # v141: 36 row blocks x 3 = 108 CTAs
+                        (2, 5, 6),    # 18 x 5 = 90 CTAs (cl 5 capacity unknown: printed)
+                        (2, 4, 6)],   # 18 x 4 = 72 CTAs
+    ("qkv_gate", 256): [(1, 3, 5)],
+    ("pooler", 128): [(2, 3, 6),      # 32 x 3 = 96 CTAs, 32 clusters <= 39
+                      (1, 2, 8)],     # gq's geometry through the gqx epilogue (fragments via DSMEM vs gq's st.async)
+    ("pooler", 256): [(1, 2, 5)],     # 64 x 2 = 128 CTAs, NWG 1 (NWG 2 at BN 256 ran at 35% of peak)
+    ("unpooler", 128): [(1, 1, 8),    # 128 CTAs, no cluster
+                        (2, 2, 6),    # 128 CTAs (24.6 vs torchT 22.6)
+                        (4, 3, 4)],   # 32 x 3 = 96 CTAs
+    ("unpooler", 256): [(1, 1, 5)],   # 128 CTAs, no cluster
+    ("o", 128): [(2, 2, 6)],          # tie with torchT
+    ("o", 256): [(2, 2, 4)],
 }
 bfp_USE_GQX = True
 bfp_TORCHT_LAYERS = ("unpooler", "o")   # layers that also get a K-major BF16 copy for the "torchT" (mm(x, W^T)) route
@@ -10367,10 +10368,8 @@ bfp_SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC
 ]
 bfp_SK2_FUSED_CONFIG = 'pooler'   # the config sk2f runs (NT 4, WSK 8, UPW 1: 8 consumer warps = the router piece's 8 K-units)
 bfp_SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's
-    ('qkv_gate', 32): ['qkv32c2a', 'qkv32c2b'],
-    ('pooler', 32): ['pooler32c2'],
-    ('pooler', 16): ['pooler16c2'],
-    ('unpooler', 32): ['unpooler32c2'],
+    # judged (run f3e50d8b, raw us): qkv32c2a 17.7 / qkv32c2b 16.7 vs qkv32_r208 14.4; pooler32c2 22.1 vs 19.1;
+    # pooler16c2 20.5 vs 18.0; unpooler32c2 21.8 vs 18.5: halving the x bytes per SM never paid for the cluster epilogue
 }
 bfp_SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
@@ -10429,6 +10428,13 @@ def bfp__sk2_geom(cfg, tokr):
     return hl, nstage
 
 
+bfp_DIAG_SK2 = True   # measurement runs: compile the sk2 diagnostics in and time the dg modes from prepare (see _diag_sk2)
+bfp_DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 32), ("unpooler", 16),
+                   ("unpooler", 32), ("o", 16)]
+bfp_DIAG_SK2_MODES = [(0, "full"), (1, "no-epilogue"), (2, "no-compute"), (4, "no-x"), (6, "loads-only"), (8, "alu-not-mma"),
+                  (16, "no-ldmatrix")]
+
+
 def bfp__sk2_src(sm90):
     if not sm90:
         return ('void sk2(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, '
@@ -10460,8 +10466,53 @@ def bfp__sk2_src(sm90):
                           f"{nacc}, 1, __nv_bfloat16, true>(Ws, x, out, ptab, pmax, base4, M, 4096, 8192, 0, nullptr, "
                           f"reinterpret_cast<const uint8_t*>(Wsr.data_ptr()), outr.data_ptr<float>(), part.data_ptr<float>(), "
                           f"rcnt.data_ptr<int>()); return; }}")
-    return (bfp_SK2_SRC.replace("@@SK2_DISPATCH@@", "\n  ".join(lines))
-            .replace("@@SK2F_DISPATCH@@", "\n  ".join(flines)))
+    src = bfp_SK2_SRC.replace("@@SK2_DISPATCH@@", "\n  ".join(lines)).replace("@@SK2F_DISPATCH@@", "\n  ".join(flines))
+    if bfp_DIAG_SK2:
+        src = "#define SK2_DIAG 1\n" + src
+    return src
+
+
+def bfp__diag_sk2(weights, state):
+    """Attribution of the sk2 kernels on this GPU: graph replays from a cold L2 (as the autotuner) of each dg mode."""
+    if not (bfp_DIAG_SK2 and state.get("sm90")):
+        return
+    dev = weights["o"].device
+    flush = torch.ones(64 * 1024 * 1024 // 1024, 1024, dtype=torch.float32, device=dev)
+    sink = torch.empty(1024, dtype=torch.float32, device=dev)
+    g = torch.Generator(device=dev)
+    g.manual_seed(999)
+    for layer, m in bfp_DIAG_SK2_SHAPES:
+        w = weights[layer]
+        n = 1024 if (layer == "unpooler" and m <= 8) else w.shape[0]
+        k = w.shape[1]
+        if bfp__sk2_name(layer, m) not in state.get("sk2", {}):
+            continue
+        x = torch.randn(m, k, device=dev, generator=g).to(torch.bfloat16)
+        res = []
+        for dg, name in bfp_DIAG_SK2_MODES:
+            try:
+                bfp__run_sk2(x, layer, m, n, k, state, dg=dg)
+                torch.cuda.synchronize()
+                gr = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(gr):
+                    bfp__run_sk2(x, layer, m, n, k, state, dg=dg)
+                ts = []
+                for _ in range(12):
+                    torch.sum(flush, dim=0, out=sink)
+                    e0 = torch.cuda.Event(enable_timing=True)
+                    e1 = torch.cuda.Event(enable_timing=True)
+                    e0.record()
+                    gr.replay()
+                    e1.record()
+                    torch.cuda.synchronize()
+                    ts.append(e0.elapsed_time(e1) * 1000)
+                res.append(f"{name}={sorted(ts)[len(ts) // 2]:.1f}")
+                del gr
+            except RuntimeError as e:   # noqa: BLE001
+                res.append(f"{name}=ERR({str(e)[:40]})")
+        print(f"[okc] diag sk2 {layer} m={m} ({bfp__sk2_name(layer, m)}): " + " ".join(res), file=sys.stderr)
+    del flush
+    torch.cuda.synchronize()
 
 
 def bfp_sk2_tileunits(w):
@@ -10851,6 +10902,7 @@ def bfp_prepare(weights):
         print(f"[okc] CUTLASS route off: {bfp__cut_err}", file=sys.stderr)
     bfp__selftest(weights, state)
     bfp__autotune(weights, state)
+    bfp__diag_sk2(weights, state)
     torch.cuda.empty_cache()
     return state
 
