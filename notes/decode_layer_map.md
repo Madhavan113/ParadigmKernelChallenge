@@ -165,4 +165,16 @@ Validation runs: job 3e87d0e5862f4f29 = regenerated layer with the SAME componen
 attention; standalone MoE with the layer's TINY_DEFINES, i.e. no FINPF; proj fork); job c8b5aab94fd34546 = the
 regenerated layer with the standalone MoE as is (TINY FINPF=1). Results: see section 5 (filled in when they land).
 
-## 5. Results
+## 5. Results (all 13/13; the judge's CI is +-1.5%)
+
+| run | layer | speedup (CI) | d1 s/f | d16 s/f | d32 s/f | v1 s/f | v16 s/f | v32 s/f |
+|---|---|---|---|---|---|---|---|---|
+| f662ee18 | hand-built file (commit 5c08f5b) | 2.092 (2.061-2.123) | 77.1/83.1 | 136.0/214.8 | 161.7/291.8 | 109.1/122.2 | 259.9/345.4 | 331.2/497.6 |
+| 3e87d0e5 | regenerated, same component versions | 2.0885 (2.057-2.120) | 76.5/81.9 | 130.3/209.8 | 155.0/312.4 | 115.2/121.6 | 263.6/352.8 | 331.6/- |
+| c8b5aab9 | regenerated, standalone MoE as is (TINY FINPF=1) | 2.0911 (2.060-2.122) | 75.0/81.5 | 133.0/207.0 | 147.7/302.7 | 115.8/119.5 | 267.7/353.7 | 339.0/- |
+
+The composition round-trips (all three within one CI). The MoE kernel's time on the SAME code moves by 10-20 us
+between runs on half the shapes (profiles: d1 full 22.6 vs 28.8 vs 29.0; v16 sliding 146.7 vs 165.7 vs 162.6;
+v32 sliding 236.0 vs 231.7 vs 198.3), i.e. the judge's fresh inputs route differently each run; a component change
+below ~3% on the MoE cannot be resolved by one layer check. Profiles: `muse_decode_layer/profiles/
+submission_samever.3e87d0e5862f4f29.txt` and `submission.c8b5aab94fd34546.txt`. Current `submission.py` = c8b5aab9.
