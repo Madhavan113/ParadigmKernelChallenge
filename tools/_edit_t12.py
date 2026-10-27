@@ -23,7 +23,7 @@ s = put_region(s, "// == BEGIN t12 host ==", "// == END t12 host ==", host, '\n"
 # CPP declarations + functions list
 decl = ("void bstream(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t nst, int64_t sb, bool bulk, int64_t smem_alloc);\n"
         "void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,\n"
-        "         torch::Tensor out, torch::Tensor diag, int64_t n, int64_t k, int64_t r, int64_t ck, int64_t w, int64_t nsw, int64_t nsx, int64_t nt, bool diag_on, int64_t variant);\n")
+        "         torch::Tensor out, torch::Tensor diag, int64_t n, int64_t k, int64_t r, int64_t ck, int64_t w, int64_t nsw, int64_t nsx, int64_t nt, bool diag_on, int64_t variant, torch::Tensor etab);\n")
 if "void bstream(" not in s.split('CPP_SRC = """')[1]:
     s = s.replace('int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl, int64_t mode);\n"""', 'int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl, int64_t mode);\n' + decl + '"""')
 if '"w12m", "bstream", "t12"' not in s:
@@ -46,6 +46,33 @@ def _repack_t12(w12: torch.Tensor, n: int, k: int, r: int, ck: int) -> torch.Ten
     uint8 [n/r, k/(128 ck), r/16, ck, 3072] (same bytes; tile 16-row index = T*(r/16) + rt, 128-chunk = c*ck + j)."""
     t16 = w12.view(n // 64, k // 128, 4, 3072).permute(0, 2, 1, 3).reshape(n // 16, k // 128, 3072)
     return t16.view(n // r, r // 16, k // (128 * ck), ck, 3072).permute(0, 2, 1, 3, 4).contiguous()
+
+
+T12_ESC_CAP = 64
+
+
+def _esc_tab(pk, n: int, k: int, r: int):
+    """Per r-row tile escape table for the t12c kernel: int32 [n/r, 64, 2] = (k | local_row << 16, delta bits), entries
+    sorted by k within the tile, sentinel k = 0xFFFF; None if any tile has more than 64 entries."""
+    dev = pk["esc_roff"].device
+    nt = n // r
+    tab = torch.full((nt, T12_ESC_CAP, 2), 0xFFFF, dtype=torch.int32, device=dev)
+    tab[:, :, 1] = 0
+    if pk["n_esc"] > 0:
+        roff = pk["esc_roff"][: n + 1].long()
+        rows = torch.repeat_interleave(torch.arange(n, device=dev), roff[1:] - roff[:-1])
+        ek = pk["esc_k"][: rows.numel()].long(); ed = pk["esc_delta"][: rows.numel()]
+        tile = rows // r
+        counts = torch.bincount(tile, minlength=nt)
+        if int(counts.max()) > T12_ESC_CAP:
+            return None
+        order = torch.argsort(tile * k + ek, stable=True)
+        tile_s, ek_s, ed_s, rows_s = tile[order], ek[order], ed[order], rows[order]
+        start = torch.cumsum(counts, 0) - counts
+        pos = torch.arange(rows.numel(), device=dev) - start[tile_s]
+        tab[tile_s, pos, 0] = (ek_s | ((rows_s % r) << 16)).to(torch.int32)
+        tab[tile_s, pos, 1] = ed_s.view(torch.int32)
+    return tab.contiguous()
 # == END t12 python ==
 '''
 if "# == BEGIN t12 python ==" in s:
