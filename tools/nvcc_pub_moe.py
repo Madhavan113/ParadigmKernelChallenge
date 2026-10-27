@@ -44,8 +44,8 @@ def run(name, defs):
     lines = []
     ent = None
     for l in txt.splitlines():
-        if "error" in l.lower():
-            lines.append(l)
+        if "error" in l.lower() or "C75" in l or "serializ" in l.lower():
+            lines.append(l[:300])
         m = re.search(r"Compiling entry function '(\S+)'", l)
         if m:
             ent = m.group(1)
