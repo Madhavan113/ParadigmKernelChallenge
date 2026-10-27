@@ -107,6 +107,10 @@ namespace {
 #ifndef OKC_CPHINT
 #define OKC_CPHINT 0    // flat producer: K/V copies with an L2 evict_first cache hint (the rows are read once)
 #endif
+#ifndef OKC_PIPE8
+#define OKC_PIPE8 0     // flat q8: the next tile's stage wait + QK^T wgmma issued right after this tile's PV wgmma (both in
+                        // flight across the loop edge: the QK^T latency and the PV end-of-tile wait leave the chain)
+#endif
 #ifndef OKC_FLATONLY
 #define OKC_FLATONLY 0  // bench builds: only the flat kernels carry code (the per-request instances return at once)
 #endif
@@ -2895,6 +2899,37 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     i_cur = S.nxt[wgi][0];
   }
   const int nit = S2 ? ((ntiles + 1) >> 1) : (F2 ? 0x7fffffff : ntiles);
+  // OKC_PIPE8 (flat producer mode, FP8 PV, loop-carried addressing): tile i+1's stage wait and QK^T go out right after
+  // tile i's PV; the scores live across the loop edge, so they are declared outside the loop in that build only
+  constexpr bool PIPE8 = OKC_PIPE8 && WS && FLAT && ADDR && PV8 && OKC_QSS && OKC_RARE && PVSPLIT && OKC_PVSPLIT == 1 &&
+                         LSYNC && !PTR && !F2 && !S2 && !OKC_PROF && !OKC_TURN && !OKC_NOCOMPUTE && !OKC_XNOWAITF && OKC_WGDEC;
+  float s_outer[PIPE8 ? 32 : 1];
+  auto issue_qk = [&](int st_) {   // (PIPE8) the QK^T wgmmas of the tile in stage st_ into s_outer
+    if constexpr (PIPE8) {
+      wgmma_fence();
+#if OKC_DSHFL
+      const uint32_t kl = klo0 + (uint32_t)(st_ * (STAGE_BYTES >> 4));
+      const uint64_t kd = ((uint64_t)((1024 >> 4) | (1u << 30)) << 32) | kl;
+      const uint64_t kd2 = ((uint64_t)((1024 >> 4) | (1u << 30)) << 32) | (kl + 2u);
+      const uint64_t qd2 = ((uint64_t)((512 >> 4) | (2u << 30)) << 32) | (qlo0 + 2u);
+      wgmma_m64n64k32_e4m3_ss(s_outer, qdesc0, kd, 0);
+      wgmma_m64n64k32_e4m3_ss(s_outer, qd2, kd2, 1);
+#else
+      const uint64_t kd = kdesc0 + (uint64_t)(st_ * (STAGE_BYTES >> 4));
+      wgmma_m64n64k32_e4m3_ss(s_outer, qdesc0, kd, 0);
+      wgmma_m64n64k32_e4m3_ss(s_outer, qdesc0 + 2, kd + 2, 1);
+#endif
+      wgmma_commit();
+    }
+  };
+  if constexpr (PIPE8) {
+    if (ntiles > 0) {   // tile 0: landed (+ new rows), both warpgroups meet (the q staging), its QK^T issued ahead
+      mbar_wait_full(&S.full[st_c], ph_c);
+      if (((uint32_t)0 - r_lo > r_span) && (0 >= i_new)) ws_patch_ni<L, NT, PTR>(&S, 0, st_c, start, seq, end, tid);
+      csync<WS, NT>();
+      issue_qk(st_c);
+    }
+  }
   constexpr int UNR8 = WS ? OKC_UNR8 : ((MODE & 3) == 1 ? OKC_UNRN : 1);   // (pragma arguments are not macro-expanded;
   // plain split-KV with many tiles per CTA (b32 q8 sliding: 9) gains from the unroll, 1-tile coop grids lose)
 #pragma unroll (UNR8)
@@ -2923,7 +2958,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       // tile i landed (+ new rows); previous tile's PV of this warpgroup done (its V16 half is free). The two
       // warpgroups (one per KV head) only meet when both must: tile 0 (q staging) and tiles with new rows.
       bool patched;
-      if constexpr (ADDR) {
+      if constexpr (PIPE8) {
+        patched = false;   // (waited for, patched and its QK^T issued when the previous tile's PV went out)
+      } else if constexpr (ADDR) {
         if constexpr (!OKC_XNOWAITF) mbar_wait_full(&S.full[st_c], ph_c);   // (probe: no wait)
         if constexpr (OKC_RARE) patched = ((uint32_t)i - r_lo > r_span) && (i >= i_new) && ws_patch_ni<L, NT, PTR>(&S, i, st_c, start, seq, end, tid);
         else if constexpr (OKC_PATCHNI && WS) patched = (i >= i_new) && ws_patch_ni<L, NT, PTR>(&S, i, st_c, start, seq, end, tid);
@@ -2934,8 +2971,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       } else {
         patched = ws_acquire(i, (tb + i) % STAGES);
       }
-      if (patched || i == 0 || !OKC_WGDEC) csync<WS, NT>();
-      else if (!(PV8ON && OKC_PV8FLAT && OKC_NOSYNC0)) wgsync(hk);
+      if constexpr (!PIPE8) {
+        if (patched || i == 0 || !OKC_WGDEC) csync<WS, NT>();
+        else if (!(PV8ON && OKC_PV8FLAT && OKC_NOSYNC0)) wgsync(hk);
+      }
       // (FP8 PV: V^T is double-buffered and each warp's wgmma wait already covers the PV that read this tile's
       // buffer, so the tile needs no warpgroup barrier before its transpose)
       PROF_MARK(0);
@@ -2991,7 +3030,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
       for (int e = 0; e < 8; ++e) asm volatile("" : "+r"(pa[e >> 2][e & 3]));
     }
-    float s[32];
+    float s_inner[PIPE8 ? 1 : 32];
+    float* s_sel = PIPE8 ? s_outer : s_inner;
+    float (&s)[32] = *reinterpret_cast<float(*)[32]>(s_sel);
+    if constexpr (!PIPE8) {
     wgmma_fence();
     if constexpr (PV8 && OKC_QSS && ADDR) {
 #if OKC_DSHFL
@@ -3018,12 +3060,13 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       wgmma_m64n64k32_e4m3(s, qa8[1][0], qa8[1][1], qa8[1][2], qa8[1][3], desc_sw128(kaddr + 32), 1);
     }
     wgmma_commit();
+    }   // (!PIPE8)
     if constexpr (OKC_QKFIRST && !WS && !Cfg<L, FLAT>::S2) {   // (OKC_QKFIRST) the copies for tile i + STAGES - 1
       if (i + STAGES - 1 < ntiles) issue_kv(i + STAGES - 1, true);
       issue_idx(i + 2 * STAGES - 2);
       cp_commit();
     }
-    if constexpr (PV8 && FLAT && OKC_PVW1) {
+    if constexpr (PV8 && FLAT && OKC_PVW1 && !PIPE8) {
       // the previous tile's PV (committed before this QK^T) is done: its P registers are free for the transpose
       // below (the flat kernel's 104-register consumers spilled there) and o / lacc are settled
       wgmma_wait<1>();
@@ -3392,7 +3435,20 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       }
       float* od = &o[0][0][0];
       if constexpr (PVSPLIT) {
-        if constexpr (OKC_PVSPLIT == 1) {   // done before the next tile (no wgmma in flight across the loop edge)
+        if constexpr (PIPE8) {
+          // next tile: stage advance, its wait (+ new rows: both warpgroups meet) and its QK^T, across this tile's PV
+          // (the wgmma wait after the next transpose covers both; o / lacc / pa are fenced there)
+          if (++st_c == STAGES) { st_c = 0; ph_c ^= 1u; }
+          vtb_c = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(vtb_c) ^ vtb_x);
+          vdesc_c ^= vdesc_x;
+          if (i + 1 < ntiles) {
+            mbar_wait_full(&S.full[st_c], ph_c);
+            const bool patched_n = ((uint32_t)(i + 1) - r_lo > r_span) && (i + 1 >= i_new) &&
+                                   ws_patch_ni<L, NT, PTR>(&S, i + 1, st_c, start, seq, end, tid);
+            if (patched_n) csync<WS, NT>();
+            issue_qk(st_c);
+          }
+        } else if constexpr (OKC_PVSPLIT == 1) {   // done before the next tile (no wgmma in flight across the loop edge)
           wgmma_wait<0>();
 #pragma unroll
           for (int e = 0; e < 32; ++e) reg_fence(od[e]);
@@ -3487,7 +3543,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       if (blockIdx.x * 2 < gridDim.x) __nanosleep(OKC_YIELD);
     }
 #endif
-    if constexpr (ADDR) {
+    if constexpr (ADDR && !PIPE8) {
       if (++st_c == STAGES) { st_c = 0; ph_c ^= 1u; }
       vtb_c = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(vtb_c) ^ vtb_x);
       vdesc_c ^= vdesc_x;
