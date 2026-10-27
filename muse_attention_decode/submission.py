@@ -5316,7 +5316,7 @@ def _fits(data):
     return (data["qkv"].numel() < (1 << 31) and data["page_table"].numel() < (1 << 31) and out_elems < (1 << 31))
 
 
-OKC_BENCH = 1      # 1: one on-device sweep of flat-kernel builds in the first eager call (never under graph capture); prints to the log
+OKC_BENCH = 0      # 1: one on-device sweep of flat-kernel builds in the first eager call (never under graph capture); prints to the log
 _BENCH_DONE = False
 # (name, extra nvcc flags) of the builds the sweep times on synthetic inputs shaped like the scored full-context cases
 BENCH_VARIANTS = [
