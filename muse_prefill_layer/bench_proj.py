@@ -7928,6 +7928,8 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   const int nstt = nst + NSTR;
   // stages issued by the prologue: 1, or under PDL up to pdl (CL == 1 only; never past this CTA's own stages)
   const int P = (CL == 1 && pdl > 0) ? min(pdl, min(NSTAGE, nst)) : 1;
+  // DIAG bit 256: copy 11/12 of each stage's weight bytes (what an 11-bit stream would move; loads-only ceiling)
+  const uint32_t wbyc = (dgv & 256) ? (uint32_t)((WBY * 11 / 12) & ~15) : (uint32_t)WBY;
 
   if (tid == 0) {
     // stage 0 first of all (the first bytes' latency is the ramp of the whole kernel): the weight copy needs only
@@ -7951,8 +7953,8 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     // weights never depend on the previous kernel: under PDL (pdl > 0) they stream while it finishes; x (its output)
     // only after griddepcontrol.wait (a no-op when the launch has no programmatic dependency)
     for (int st = 0; st < P; ++st) {
-      mbar_expect_tx(full0 + 8 * st, ((dgv & 4) ? 0 : XBYr) + WBY);
-      bulk_g2s(sbase + st * SST + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * st);
+      mbar_expect_tx(full0 + 8 * st, ((dgv & 4) ? 0 : XBYr) + wbyc);
+      bulk_g2s(sbase + st * SST + XBY, wsrc + (size_t)(gs0 + st) * wstride, wbyc, full0 + 8 * st);
     }
     if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
     if (!(dgv & 4))
@@ -7996,8 +7998,8 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
         if (trace) tr[16 + 3 * st] = gtime();
         const uint32_t s0 = sbase + slot * SST;
         if (!FUSE || st < nst) {
-          mbar_expect_tx(full0 + 8 * slot, ((dgv & 4) ? 0 : XBYr) + WBY);
-          bulk_g2s(s0 + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * slot);
+          mbar_expect_tx(full0 + 8 * slot, ((dgv & 4) ? 0 : XBYr) + wbyc);
+          bulk_g2s(s0 + XBY, wsrc + (size_t)(gs0 + st) * wstride, wbyc, full0 + 8 * slot);
           if (!(dgv & 4)) tma_load_3d(s0, &xmap, full0 + 8 * slot, 0, 0, (gs0 + st) * UPS);
         } else {   // router piece: global router stage rq * 4 + j of tile rt
           const int gsr = rq * NSTR + (st - nst);
@@ -10362,17 +10364,10 @@ bfp_SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC
     # round trips per byte): pooler32w 23.0 vs 26.2, qkv8w 15.1 vs 16.1, unpooler32h 19.5 vs 20.4. Retired: pooler8h_r100
     # 21.9 vs 20.4, pooler8t_r192 21.3, pooler32_r216 25.9, pooler32h_r100 28.3, qkv8t_r216 16.1, qkv16t_r216 15.7 vs 15.6,
     # unpooler16t_r100 19.3 vs 18.5, unpooler32_r216 20.6 vs 20.4.
-    ('pooler16h_r100', 'pooler', 4096, 16, 2, 1, 2, 4, 1, 1),       # 256 CTAs, 2/SM, 3 x 28 KB (12 KB copies)
-    ('pooler16t_r220', 'pooler', 4096, 32, 2, 2, 2, 4, 1, 1),       # pooler16t_r192 with 5 stages
-    ('pooler32w_r216', 'pooler', 4096, 32, 2, 2, 2, 4, 1, 1),       # 56 KB stages (24 KB copies), 3 stages
-    ('qkv32_r220', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 1, 1),         # qkv32_r208 (4 x 50 KB stays 4)
-    ('qkv8w_r216', 'qkv_gate', 2304, 24, 3, 1, 4, 4, 2, 1),         # 36 KB weight copies (1024 k per stage)
-    ('unpooler32h_r100', 'unpooler', 8192, 32, 2, 2, 2, 2, 1, 1),   # 256 CTAs, 2/SM (28 KB x 3)
-    # round 5: more bigger-copy variants
-    ('pooler8w_r216', 'pooler', 4096, 32, 2, 2, 2, 8, 1, 1),        # 48 KB copies (1024 k per stage), 3 x 64 KB, 128 CTAs
-    ('qkv16w_r216', 'qkv_gate', 2304, 24, 3, 1, 4, 4, 1, 1),        # 36 KB copies, 68 KB stages x 3
-    ('unpooler16w_r216', 'unpooler', 8192, 32, 2, 2, 2, 4, 1, 1),   # 24 KB copies, 40 KB stages x 5, 128 CTAs
-    ('o16w_r100', 'o', 8192, 32, 2, 2, 2, 4, 1, 1),                 # 24 KB copies, 40 KB x 2 (K = 1024), 256 CTAs
+    # round 5 (prefill-slot 175e7007, clean build, raw us vs the pick): pooler16h_r100 18.46 / pooler16t_r220 18.59 vs
+    # 18.40; pooler32w_r216 19.26 vs 19.14; qkv32_r220 14.56 vs 14.53; qkv8w_r216 13.54 vs 13.47; unpooler32h_r100 18.40
+    # vs 18.56; pooler8w_r216 18.59 vs 18.18; qkv16w_r216 14.18 vs 13.25; unpooler16w_r216 19.78 vs 17.66; o16w_r100
+    # 9.31 vs 9.12: the DIAG-build gains were the diagnostics' per-stage cost; nothing within 1 us of a win -> retired
     # the decode layer's fused pooler + router launch (sk2f, FUSE): pooler rows then one router piece per CTA through the
     # same ring; its stream is built like any other config, the kernel is instantiated only with FUSE
     ('pooler', 'pooler', 4096, 32, 4, 1, 8, 1, 2, 1),
@@ -10394,16 +10389,7 @@ bfp_SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC
     ('slice8q_r48', 'unpooler', 1024, 8, 1, 1, 4, 1, 2, 1),         # the m <= 8 slice: 128 CTAs, 256 k/stage
 ]
 bfp_SK2_FUSED_CONFIG = 'pooler'   # the config sk2f runs (NT 4, WSK 8, UPW 1: 8 consumer warps = the router piece's 8 K-units)
-bfp_SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's (see the retired list)
-    ('pooler', 8): ['pooler8w_r216'],
-    ('pooler', 16): ['pooler16h_r100', 'pooler16t_r220'],
-    ('pooler', 32): ['pooler32w_r216'],
-    ('qkv_gate', 8): ['qkv8w_r216'],
-    ('qkv_gate', 16): ['qkv16w_r216'],
-    ('qkv_gate', 32): ['qkv32_r220'],
-    ('unpooler', 16): ['unpooler16w_r216'],
-    ('unpooler', 32): ['unpooler32h_r100'],
-    ('o', 16): ['o16w_r100'],
+bfp_SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's (see the retired lists)
 }
 bfp_SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
@@ -10465,7 +10451,7 @@ def bfp__sk2_geom(cfg, tokr):
 bfp_DIAG_SK2 = False   # measurement runs: compile the sk2 diagnostics in and time the dg modes from prepare (see _diag_sk2)
 bfp_DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 16), ("qkv_gate", 32),
                    ("unpooler", 16), ("unpooler", 32), ("o", 16), ("unpooler", 8)]
-bfp_DIAG_SK2_MODES = [(0, "full"), (6, "loads"), (70, "loads+spin"), (134, "loads+ctac"), (128, "full+ctac")]
+bfp_DIAG_SK2_MODES = [(0, "full"), (6, "loads"), (262, "loads-11/12")]
 
 
 def bfp__sk2_src(sm90):
@@ -10747,10 +10733,37 @@ def bfp_sk2_table(comp, n_cfg, R):
     return tab.contiguous(), pmax
 
 
+def bfp__window_stats(layer, w):
+    """What an 11-bit format (3-bit code = sign + 2-bit e71 offset, i.e. an 8-exponent window with the low byte raw)
+    would cost on this matrix: best window coverage, escapes, bytes vs the 12-bit stream."""
+    n, k = w.shape
+    bits = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    e = (bits >> 7) & 0xFF
+    hist = torch.bincount(e.flatten(), minlength=256).to(torch.float64)
+    win8 = torch.stack([hist[b:b + 8].sum() for b in range(249)])
+    b8 = int(win8.argmax())
+    cov8 = float(win8[b8]) / (n * k)
+    win16 = torch.stack([hist[b:b + 16].sum() for b in range(241)])
+    b16 = int(win16.argmax())
+    cov16 = float(win16[b16]) / (n * k)
+    esc8 = int(round((1 - cov8) * n * k))
+    mb12 = n * k * 1.5 / 1e6
+    mb11 = n * k * 11 / 8 / 1e6
+    print(f"[okc] 11-bit window {layer}: best 8-exponent window e[{b8},{b8 + 8}) covers {100 * cov8:.3f}% "
+          f"(escapes {esc8}, {100 * (1 - cov8):.3f}%); 16-exponent window covers {100 * cov16:.4f}%; "
+          f"bytes 12-bit {mb12:.1f} MB vs 11-bit {mb11:.1f} + escapes {esc8 * 4 / 1e6:.1f} MB (4 B) / "
+          f"{esc8 * 6 / 1e6:.1f} MB (6 B) = {mb11 + esc8 * 4 / 1e6:.1f} / {mb11 + esc8 * 6 / 1e6:.1f} MB "
+          f"({100 * (1 - (mb11 + esc8 * 4 / 1e6) / mb12):.1f}% / {100 * (1 - (mb11 + esc8 * 6 / 1e6) / mb12):.1f}% fewer)",
+          file=sys.stderr)
+
+
 def bfp_sk2_prepare(weights, state):
     state["sk2"] = {}
     if not (bfp_USE_SK2 and state["sm90"]):
         return
+    if bfp_DIAG_SK2:
+        for layer in ("pooler", "qkv_gate", "unpooler", "o"):
+            bfp__window_stats(layer, weights[layer])
     dev = weights["o"].device
     shared = {}
     for ci, cfg in enumerate(bfp_SK2_CONFIGS):
@@ -11393,7 +11406,7 @@ def _proj_bench(weights, budget):
         return
     global bfp_CUTLASS_LAYERS, bfp_DIAG_SK2
     bfp_CUTLASS_LAYERS = set()   # no CUTLASS build in the bench slot (170 s join); the proj check measures it
-    bfp_DIAG_SK2 = False      # sk2 diagnostics (dg modes) compiled in and timed from prepare
+    bfp_DIAG_SK2 = True      # sk2 diagnostics (dg modes) compiled in and timed from prepare
     w5 = {k: weights[k].contiguous() for k in ("qkv_gate", "o", "pooler", "unpooler")}
     w5["router"] = weights["router"].float().contiguous()
     t1 = _bench_time.time()
