@@ -5298,37 +5298,19 @@ def _fits(data):
     return (data["qkv"].numel() < (1 << 31) and data["page_table"].numel() < (1 << 31) and out_elems < (1 << 31))
 
 
-OKC_BENCH = 0      # 1: one on-device sweep of flat-kernel builds in the first eager call (never under graph capture); prints to the log
+OKC_BENCH = 1      # 1: one on-device sweep of flat-kernel builds in the first eager call (never under graph capture); prints to the log
 _BENCH_DONE = False
 # (name, extra nvcc flags) of the builds the sweep times on synthetic inputs shaped like the scored full-context cases
 BENCH_VARIANTS = [
     ("base", ()),
-    ("st1f4", ("-DOKC_ST1F=4",)),
-    ("st1f5", ("-DOKC_ST1F=5",)),
-    ("st8f3", ("-DOKC_ST8F=3",)),
-    ("segk_lo", ("-DOKC_SEGK1=200", "-DOKC_SEGK8=300")),
-    ("segk_hi", ("-DOKC_SEGK1=800", "-DOKC_SEGK8=1000")),
-    ("np256", ("-DOKC_NP=256",)),
-    ("np64", ("-DOKC_NP=64",)),
-    ("minb3", ("-DOKC_WSMINB1=3",), {1: dict(n_splits=396)}),
     ("pvsplit2", ("-DOKC_PVSPLIT=2",)),
-    ("nocompute", ("-DOKC_NOCOMPUTE=1",)),      # (probe: wrong results) the load-bound tile time
-    ("xnowaitf", ("-DOKC_XNOWAITF=1",)),        # (probe: wrong results) the consumer-bound tile time
+    ("pvsplit2_pipe8", ("-DOKC_PVSPLIT=2", "-DOKC_PIPE8=1")),
 ]
-BENCH_SHAPES = [(16, 1), (32, 1), (16, 8), (32, 8)]   # (batch, q_len), full layer, ctx 80000 agentic
+BENCH_SHAPES = [(16, 8), (32, 8)]   # (batch, q_len), full layer, ctx 80000 agentic
 # launch-plan sweeps on the base build: ((batch, q_len, window), [override dicts]) ({} = today's plan)
 W2K = 2048
-BENCH_PLANS = [
-    ((16, 1, W2K), [{}, dict(n_splits=8), dict(n_splits=12), dict(n_splits=24), dict(n_splits=33)]),
-    ((32, 1, W2K), [{}, dict(n_splits=4), dict(n_splits=6), dict(n_splits=12), dict(n_splits=16)]),
-    ((16, 8, W2K), [{}, dict(n_splits=4, coop=1), dict(n_splits=6, coop=1), dict(n_splits=12, coop=1), dict(n_splits=8, coop=0)]),
-    ((32, 8, W2K), [{}, dict(n_splits=4, coop=0), dict(n_splits=6, coop=1), dict(n_splits=8, coop=1)]),
-    ((1, 1, W2K), [{}, dict(n_splits=16), dict(n_splits=17), dict(n_splits=33, coop=1)]),
-    ((1, 8, W2K), [{}, dict(n_splits=17, coop=1), dict(n_splits=33, coop=0)]),
-    ((1, 1, 0), [{}, dict(n_splits=264, nc=8, coop=1), dict(n_splits=252, nc=4, coop=1), dict(n_splits=252, nc=8, coop=0)]),
-    ((1, 8, 0), [{}, dict(n_splits=264, nc=8, coop=1), dict(n_splits=252, nc=4, coop=1), dict(n_splits=132, nc=8, coop=1)]),
-]
-BENCH_BUDGET_S = 420
+BENCH_PLANS = []
+BENCH_BUDGET_S = 100
 import os as _os
 BENCH_WORKERS = max(1, min(6, (_os.cpu_count() or 1)))
 
