@@ -2904,7 +2904,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   // OKC_PIPE8 (flat producer mode, FP8 PV, loop-carried addressing): tile i+1's stage wait and QK^T go out right after
   // tile i's PV; the scores live across the loop edge, so they are declared outside the loop in that build only
   constexpr bool PIPE8 = OKC_PIPE8 && WS && FLAT && ADDR && PV8 && OKC_QSS && OKC_RARE && PVSPLIT && OKC_PVSPLIT == 1 &&
-                         LSYNC && !PTR && !F2 && !S2 && !OKC_PROF && !OKC_TURN && !OKC_NOCOMPUTE && !OKC_XNOWAITF && OKC_WGDEC;
+                         LSYNC && !PTR && !F2 && !S2 && !OKC_PROF && !OKC_TURN && !OKC_NOCOMPUTE && OKC_WGDEC;
   float s_outer[PIPE8 ? 32 : 1];
   auto issue_qk = [&](int st_) {   // (PIPE8) the QK^T wgmmas of the tile in stage st_ into s_outer
     if constexpr (PIPE8) {
