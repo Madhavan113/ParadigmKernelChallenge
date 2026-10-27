@@ -80,6 +80,9 @@ namespace {
 #ifndef OKC_WSMINB
 #define OKC_WSMINB 2
 #endif
+#ifndef OKC_WSMINB1
+#define OKC_WSMINB1 OKC_WSMINB   // q_len 1 flat kernel: CTAs per SM the registers must allow (3: 396-CTA grids)
+#endif
 #ifndef OKC_SETMAXNREG
 #define OKC_SETMAXNREG 1
 #endif
@@ -534,7 +537,7 @@ struct Cfg {
   static constexpr bool WS = F && OKC_SM90 && OKC_WS && (L == 1 || OKC_WS8);
   static constexpr int NP = WS ? ((L == 1) ? OKC_NP : OKC_NP8) : 0;   // producer threads
   static constexpr int NTX = NT + NP;                     // threads per CTA
-  static constexpr int MINB = WS ? (F2 ? 1 : OKC_WSMINB) : (S2 ? 1 : 2);   // CTAs per SM the registers must allow
+  static constexpr int MINB = WS ? (F2 ? 1 : (L == 1 ? OKC_WSMINB1 : OKC_WSMINB)) : (S2 ? 1 : 2);   // CTAs per SM the registers must allow
   // setmaxnreg split of the CTA's registers (launch: 65536 / (MINB * NTX), rounded down to 8)
   static constexpr int BASEREGS = (65536 / (MINB * NTX)) / 8 * 8 > 255 ? 248 : (65536 / (MINB * NTX)) / 8 * 8;
   static constexpr int PREGS = OKC_PREGS > 0 ? OKC_PREGS : ((L == 1 && NP <= 128) ? 56 : 32);
@@ -5232,24 +5235,39 @@ _BENCH_DONE = False
 # (name, extra nvcc flags) of the builds the sweep times on synthetic inputs shaped like the scored full-context cases
 BENCH_VARIANTS = [
     ("base", ()),
-    ("cphint", ("-DOKC_CPHINT=1",)),
     ("st1f4", ("-DOKC_ST1F=4",)),
     ("st1f5", ("-DOKC_ST1F=5",)),
     ("st8f3", ("-DOKC_ST8F=3",)),
-    ("pvsplit2", ("-DOKC_PVSPLIT=2",)),
     ("segk_lo", ("-DOKC_SEGK1=200", "-DOKC_SEGK8=300")),
     ("segk_hi", ("-DOKC_SEGK1=800", "-DOKC_SEGK8=1000")),
+    ("np256", ("-DOKC_NP=256",)),
+    ("np64", ("-DOKC_NP=64",)),
+    ("minb3", ("-DOKC_WSMINB1=3",), {1: dict(n_splits=396)}),
+    ("pvsplit2", ("-DOKC_PVSPLIT=2",)),
+    ("cphint", ("-DOKC_CPHINT=1",)),
     ("nocompute", ("-DOKC_NOCOMPUTE=1",)),      # (probe: wrong results) the load-bound tile time
     ("xnowaitf", ("-DOKC_XNOWAITF=1",)),        # (probe: wrong results) the consumer-bound tile time
 ]
 BENCH_SHAPES = [(16, 1), (32, 1), (16, 8), (32, 8)]   # (batch, q_len), full layer, ctx 80000 agentic
+# launch-plan sweeps on the base build: ((batch, q_len, window), [override dicts]) ({} = today's plan)
+W2K = 2048
+BENCH_PLANS = [
+    ((16, 1, W2K), [{}, dict(n_splits=8), dict(n_splits=12), dict(n_splits=24), dict(n_splits=33)]),
+    ((32, 1, W2K), [{}, dict(n_splits=4), dict(n_splits=6), dict(n_splits=12), dict(n_splits=16)]),
+    ((16, 8, W2K), [{}, dict(n_splits=4, coop=1), dict(n_splits=6, coop=1), dict(n_splits=12, coop=1), dict(n_splits=8, coop=0)]),
+    ((32, 8, W2K), [{}, dict(n_splits=4, coop=0), dict(n_splits=6, coop=1), dict(n_splits=8, coop=1)]),
+    ((1, 1, W2K), [{}, dict(n_splits=16), dict(n_splits=17), dict(n_splits=33, coop=1)]),
+    ((1, 8, W2K), [{}, dict(n_splits=17, coop=1), dict(n_splits=33, coop=0)]),
+    ((1, 1, 0), [{}, dict(n_splits=264, nc=8, coop=1), dict(n_splits=252, nc=4, coop=1), dict(n_splits=252, nc=8, coop=0)]),
+    ((1, 8, 0), [{}, dict(n_splits=264, nc=8, coop=1), dict(n_splits=252, nc=4, coop=1), dict(n_splits=132, nc=8, coop=1)]),
+]
 BENCH_BUDGET_S = 420
 import os as _os
 BENCH_WORKERS = max(1, min(6, (_os.cpu_count() or 1)))
 
 
-def _bench_inputs(data, B, L, ctx=80000, seed=0):
-    """Synthetic full-layer inputs like the judge's generator: scattered pages, agentic lengths."""
+def _bench_inputs(data, B, L, ctx=80000, seed=0, window=0):
+    """Synthetic inputs like the judge's generator: scattered pages, agentic lengths (fixed at batch 1)."""
     dev = data["qkv"].device
     cfg0 = dict(data["config"])
     HQ, HKV, D = cfg0["num_q_heads"], cfg0["num_kv_heads"], cfg0["head_dim"]
@@ -5258,6 +5276,10 @@ def _bench_inputs(data, B, L, ctx=80000, seed=0):
     max_pages = longest + L
     u = torch.rand((B,), generator=g, device=dev)
     seq = (ctx * (1 + 0.075 * (2 * u - 1))).long().clamp(1, longest)
+    if B == 1:
+        longest = ctx
+        max_pages = ctx + L
+        seq = torch.full((1,), ctx, dtype=torch.long, device=dev)
     total = B * max_pages
     perm = torch.randperm(total, generator=g, device=dev).to(torch.int32)
     page_table = torch.full((B, max_pages), -1, dtype=torch.int32, device=dev)
@@ -5271,88 +5293,178 @@ def _bench_inputs(data, B, L, ctx=80000, seed=0):
     pos = (seq[:, None] + torch.arange(L, device=dev)).reshape(-1)
     loc = torch.gather(page_table.long(), 1, pos.view(B, L)).reshape(-1)
     qkv = (2 * torch.randn((B * L, (2 * HQ + 2 * HKV) * D), generator=g, device=dev)).to(torch.bfloat16)
-    c = dict(cfg0, batch=B, q_len=L, page_size=1, window=0, rope_theta=0.0)
+    c = dict(cfg0, batch=B, q_len=L, page_size=1, window=window, rope_theta=500000.0 if window else 0.0)
     return {"qkv": qkv, "positions": pos, "cache_loc": loc, "cache_seqlens": seq.int(), "cu_seqlens_q": None,
             "scheduler_metadata": None, "k_cache": k_cache, "v_cache": v_cache, "k_scale": data["k_scale"],
             "v_scale": data["v_scale"], "page_table": page_table, "seq_lens": seq.int(), "config": c}
 
 
-def _bench(data):
+def _bench_timeit(fn, flush, sink, reps=9):
+    """us per CUDA-graph replay after an L2 flush (median, best), as the judge times."""
+    fn(); fn()
+    torch.cuda.synchronize()
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        gph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gph, stream=st):
+            fn()
+    torch.cuda.current_stream().wait_stream(st)
+    torch.cuda.synchronize()
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    ts = []
+    for _ in range(reps):
+        sink.copy_(flush.view(-1, 1 << 16).sum(1, dtype=torch.int32))   # cold L2 by reading, as the judge does
+        e0.record()
+        gph.replay()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) * 1000.0)
+    ts.sort()
+    return ts[len(ts) // 2], ts[0]
+
+
+def _bench_child(start, cfg, out_path, prog_path, t_end):
+    """The sweep itself (child process): variants [start:] over BENCH_SHAPES, then (index len) the plan sweeps.
+    Appends result lines to out_path and the index of each finished stage to prog_path."""
     import time, hashlib
     from concurrent.futures import ThreadPoolExecutor
-    t0 = time.time()
-    dev = data["qkv"].device
+    dev = torch.device("cuda")
+    out = open(out_path, "a")
+
+    def say(line):
+        out.write(line + "\n"); out.flush()
+
+    def done(k):
+        with open(prog_path, "w") as f:
+            f.write(str(k))
+
+    data = {"qkv": torch.zeros((1, 1), device=dev), "k_scale": torch.ones((1,), device=dev),
+            "v_scale": torch.ones((1,), device=dev), "config": cfg}
     flush = torch.zeros((160 << 20,), dtype=torch.uint8, device=dev)
     sink = torch.empty(((160 << 20) >> 16,), dtype=torch.int32, device=dev)
+    nv = len(BENCH_VARIANTS)
+    todo = [v for k, v in enumerate(BENCH_VARIANTS) if k >= start and v[1]]
 
     def build(item):
-        name, flags = item
-        if not flags:
-            return name, _module(), None
+        name, flags = item[0], item[1]
         tag = "_b" + hashlib.md5(" ".join(flags).encode()).hexdigest()[:8]
         try:
             return name, _build(tag=tag, flags=("-DOKC_FLATONLY=1", *flags)), None
         except Exception as e:   # noqa: BLE001
-            return name, None, str(e)[-600:]
+            return name, None, str(e)[-500:]
 
-    def timeit(fn, reps=9):
-        fn(); fn()
-        torch.cuda.synchronize()
-        st = torch.cuda.Stream()
-        st.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(st):
-            gph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(gph, stream=st):
-                fn()
-        torch.cuda.current_stream().wait_stream(st)
-        torch.cuda.synchronize()
-        e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
-        ts = []
-        for _ in range(reps):
-            sink.copy_(flush.view(-1, 1 << 16).sum(1, dtype=torch.int32))   # cold L2 by reading, as the judge does
-            e0.record()
-            gph.replay()
-            e1.record()
-            torch.cuda.synchronize()
-            ts.append(e0.elapsed_time(e1) * 1000.0)
-        ts.sort()
-        return ts[len(ts) // 2], ts[0]
-
-    print(f"BENCH attention flat builds: {len(BENCH_VARIANTS)} builds x {BENCH_SHAPES} (us per graph replay after an L2 flush: median / best)")
+    t0 = time.time()
+    base_mod = _module()
     with ThreadPoolExecutor(max_workers=BENCH_WORKERS) as ex:
-        mods = list(ex.map(build, BENCH_VARIANTS))
-    print(f"BENCH builds done in {time.time() - t0:.0f}s: " + ", ".join(f"{n}:{'ok' if m else 'FAIL'}" for n, m, _ in mods))
-    for n, m, err in mods:
-        if err:
-            print(f"BENCH build {n} failed: {err[-300:]}")
-    flags_of = dict(BENCH_VARIANTS)
-    for (B, L) in BENCH_SHAPES:
-        if time.time() - t0 > BENCH_BUDGET_S:
-            print("BENCH budget reached"); break
-        d = _bench_inputs(data, B, L)
-        ref = None
-        for name, mod, _ in mods:
-            if mod is None:
-                continue
-            if time.time() - t0 > BENCH_BUDGET_S:
-                print("BENCH budget reached"); break
+        built = {n: (m, err) for n, m, err in ex.map(build, todo)}
+    say(f"BENCH builds ({len(todo)}) done in {time.time() - t0:.0f}s: " +
+        ", ".join(f"{n}:{'ok' if m else 'FAIL ' + (err or '')[-200:]}" for n, (m, err) in built.items()))
+    inputs = {(B, L): _bench_inputs(data, B, L) for (B, L) in BENCH_SHAPES}
+    refs = {}
+    for k, v in enumerate(BENCH_VARIANTS):
+        if k < start:
+            continue
+        name, flags = v[0], v[1]
+        ov_by_L = v[2] if len(v) > 2 else {}
+        mod = base_mod if not flags else built.get(name, (None, None))[0]
+        if mod is None:
+            done(k); continue
+        for (B, L) in BENCH_SHAPES:
+            if time.time() > t_end:
+                say("BENCH budget reached"); done(nv); return
+            d = inputs[(B, L)]
+            ov = ov_by_L.get(L, {})
             try:
-                out = _launch(d, _mod=mod)
+                o = _launch(d, _mod=mod, **ov)
                 torch.cuda.synchronize()
-                if ref is None:
-                    ref = out.float()
-                    err = 0.0
-                else:
-                    err = float((out.float() - ref).norm() / (ref.norm() + 1e-20))
-                us, best = timeit(lambda: _launch(d, _mod=mod))
-                print(f"BENCH B{B} L{L} full {name:14s} {str(flags_of[name]):60s} {us:8.1f} / {best:8.1f} us  relerr {err:.2e}")
+                if (B, L) not in refs:
+                    refs[(B, L)] = _launch(d, _mod=base_mod).float()
+                    torch.cuda.synchronize()
+                ref = refs[(B, L)]
+                err = float((o.float() - ref).norm() / (ref.norm() + 1e-20))
+                us, best = _bench_timeit(lambda: _launch(d, _mod=mod, **ov), flush, sink)
+                say(f"BENCH B{B} L{L} full {name:12s} {str(flags) + (str(ov) if ov else ''):58s} {us:8.1f} / {best:8.1f} us  relerr {err:.2e}")
             except Exception as e:   # noqa: BLE001
-                print(f"BENCH B{B} L{L} full {name:14s} failed: {str(e)[-200:]}")
-        del d
-    # probe builds may leave garbage in the shared workspace: back to the all-zero state
-    for t in _WS.get(str(dev), ()):
-        t.zero_()
-    torch.cuda.synchronize()
+                say(f"BENCH B{B} L{L} full {name:12s} failed: {str(e)[-200:]}")
+                if "CUDA" in str(e) or "illegal" in str(e):   # sticky: this context is dead, the parent restarts past this build
+                    say(f"BENCH {name}: sticky CUDA error, child exits")
+                    done(k - 1); out.flush(); _os._exit(3)
+        done(k)
+    if start <= nv:
+        for (B, L, window), plans in BENCH_PLANS:
+            if time.time() > t_end:
+                say("BENCH budget reached"); break
+            d = _bench_inputs(data, B, L, window=window)
+            ref = None
+            for ov in plans:
+                try:
+                    o = _launch(d, _mod=base_mod, **ov)
+                    torch.cuda.synchronize()
+                    if ref is None:
+                        ref, err = o.float(), 0.0
+                    else:
+                        err = float((o.float() - ref).norm() / (ref.norm() + 1e-20))
+                    us, best = _bench_timeit(lambda: _launch(d, _mod=base_mod, **ov), flush, sink)
+                    say(f"BENCH B{B} L{L} {'sliding' if window else 'full':7s} plan {str(ov):50s} {us:8.1f} / {best:8.1f} us  relerr {err:.2e}")
+                except Exception as e:   # noqa: BLE001
+                    say(f"BENCH B{B} L{L} plan {ov} failed: {str(e)[-200:]}")
+                    if "CUDA" in str(e) or "illegal" in str(e):
+                        say("BENCH plan sweeps: sticky CUDA error, child exits")
+                        done(nv); out.flush(); _os._exit(3)
+            del d
+        done(nv + 1)
+    say(f"BENCH child done in {time.time() - t0:.0f}s")
+
+
+def _bench(data):
+    """Parent side: the base build, then the sweep in child processes (restarted past a crashing variant)."""
+    import time, json, subprocess, sys, os, tempfile
+    t0 = time.time()
+    _module()   # the base build (shared through the extension cache)
+    cfg = {k: v for k, v in data["config"].items()}
+    tmp = tempfile.mkdtemp(prefix="okc_attn_bench_")
+    out_path, prog_path, log_path = os.path.join(tmp, "out.txt"), os.path.join(tmp, "prog.txt"), os.path.join(tmp, "log.txt")
+    nv = len(BENCH_VARIANTS)
+    t_end = t0 + BENCH_BUDGET_S
+    print(f"BENCH attention: {nv} flat builds x {BENCH_SHAPES} + {len(BENCH_PLANS)} plan sweeps (us per graph replay after an L2 flush: median / best)")
+    start = 0
+    while start <= nv and time.time() < t_end:
+        code = ("import importlib.util, sys\n"
+                f"spec = importlib.util.spec_from_file_location('okc_attn_sub', {__file__!r})\n"
+                "S = importlib.util.module_from_spec(spec); spec.loader.exec_module(S)\n"
+                f"S._bench_child({start}, {json.dumps(cfg)}, {out_path!r}, {prog_path!r}, {t_end!r})\n")
+        with open(log_path, "a") as lf:
+            try:
+                r = subprocess.run([sys.executable, "-c", code], stdout=lf, stderr=subprocess.STDOUT,
+                                   timeout=max(10.0, t_end - time.time() + 30.0), env=dict(os.environ))
+                rc = r.returncode
+            except subprocess.TimeoutExpired:
+                rc = "timeout"
+        prog = -1
+        try:
+            prog = int(open(prog_path).read().strip() or -1)
+        except Exception:   # noqa: BLE001
+            pass
+        if rc == 0 and prog >= nv + 1:
+            break
+        nxt = max(prog + 1, start)
+        if nxt <= nv:
+            crashed = BENCH_VARIANTS[nxt][0] if nxt < nv else "plan sweeps"
+            print(f"BENCH child exit {rc} at stage {nxt} ({crashed}): skipped")
+        if rc == "timeout" or nxt > nv:
+            break
+        start = nxt + 1
+    try:
+        print(open(out_path).read())
+    except Exception:   # noqa: BLE001
+        pass
+    try:
+        tail = open(log_path).read()[-2500:]
+        if tail.strip():
+            print("BENCH child log tail:\n" + tail)
+    except Exception:   # noqa: BLE001
+        pass
     print(f"BENCH done in {time.time() - t0:.0f}s")
 
 
