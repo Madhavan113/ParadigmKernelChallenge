@@ -1147,7 +1147,9 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       // streaming; the x boxes are issued after the fence below. NC threads x 32 columns = the 8192-wide row.
       static_assert(NC * 32 == 8192, "sk2 boundary prologue: 256 consumer threads x 32 columns");
       __shared__ float s_bred[16][4];
-      const int c0 = tid * 32;
+      // staggered column mapping: CTA c starts c threads later, so the 128 CTAs sweep different L2 lines of the
+      // (shared) alpha / beta / stream / gain rows at any moment instead of all hitting the same lines together
+      const int c0 = ((tid + cta) & (NC - 1)) * 32;
       for (int tt = 0; tt < M; ++tt) {
         float a[32], s[32], al[32], be[32];
         if (tid < NC) {
@@ -1600,14 +1602,28 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     if constexpr (sizeof(OutT) == 4) {
       *reinterpret_cast<float4*>(o) = v;
     } else {
+      if constexpr (FUSE) {
+        if (gpre != nullptr && dcnt == nullptr) {
+          // mode 3 (routing + the per-token RMS scale in the MoE kernel): the output is pooled * (1 + w) in bf16 (column
+          // gain only); the fp32 partials of sum(pooled^2) per token (this CTA's 32 columns) go to part2[tok][cta], the
+          // MoE kernel forms rs_t = rsqrt(mean + 1e-5) and applies it in its GEMM1 epilogue. No grid barrier.
+          ssq += v.x * v.x + v.y * v.y + v.z * v.z + v.w * v.w;
+          const uint2 gq = __ldg(reinterpret_cast<const uint2*>(gpre + cta * R + row));
+          const float2 g0 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gq.x));
+          const float2 g1 = __bfloat1622float2(*reinterpret_cast<const __nv_bfloat162*>(&gq.y));
+          v.x *= 1.f + g0.x; v.y *= 1.f + g0.y; v.z *= 1.f + g1.x; v.w *= 1.f + g1.y;
+        }
+      }
       __nv_bfloat162 lo = __floats2bfloat162_rn(v.x, v.y), hi = __floats2bfloat162_rn(v.z, v.w);
       uint2 pk;
       pk.x = *reinterpret_cast<uint32_t*>(&lo);
       pk.y = *reinterpret_cast<uint32_t*>(&hi);
       *reinterpret_cast<uint2*>(o) = pk;
       if constexpr (FUSE) {
-        const float2 l2 = __bfloat1622float2(lo), h2 = __bfloat1622float2(hi);
-        ssq += l2.x * l2.x + l2.y * l2.y + h2.x * h2.x + h2.y * h2.y;
+        if (!(gpre != nullptr && dcnt == nullptr)) {   // modes 1/2: the bf16-rounded pooled values, as _route_split
+          const float2 l2 = __bfloat1622float2(lo), h2 = __bfloat1622float2(hi);
+          ssq += l2.x * l2.x + l2.y * l2.y + h2.x * h2.x + h2.y * h2.y;
+        }
         keep_lo = lo; keep_hi = hi; keep_tt = tt; keep_row = row;
       }
       if constexpr (BT) {   // boundary tail: sum of squares of (a * (1 + gp)) over this CTA's columns, bf16-rounded a
@@ -1727,8 +1743,14 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     }
   }
   if constexpr (FUSE) {
-    if (dcnt != nullptr && rids == nullptr) {
-      // ---- fused pre-expert norm (decode layer, routing done by the MoE kernel from the router logits): every CTA
+    if (dcnt == nullptr && part2 != nullptr) {   // mode 3: the partials only (token-major [32][128 CTAs]); no barrier
+      ssq += __shfl_xor_sync(0xffffffffu, ssq, 1);
+      ssq += __shfl_xor_sync(0xffffffffu, ssq, 2);
+      ssq += __shfl_xor_sync(0xffffffffu, ssq, 4);
+      if ((tid & 7) == 0 && (tid >> 3) < M) __stcg(part2 + (tid >> 3) * 128 + cta, ssq);
+    }
+    if (dcnt != nullptr) {
+      // ---- fused pre-expert norm (decode layer; routing by the MoE kernel from the logits, or by CTA t below): every CTA
       // leaves its per-token partial sum of squares of its 32 bf16 pooled columns in part2[tok][cta], arrives on the
       // grid ticket and WAITS for the whole launch (128 CTAs = one wave, co-resident: nothing in this launch can be
       // scheduled after a dependent), then every CTA sums the 128 partials in the same order (identical bits) and
@@ -1774,41 +1796,14 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
           *reinterpret_cast<uint2*>(xm + (size_t)keep_tt * 4096 + col) = ov;
         }
       }
-    }
-    if (dcnt != nullptr && rids != nullptr) {
-      // ---- fused routing tail (decode layer): per-token sum of squares of this CTA's 32 bf16 pooled columns ->
-      // part2[cta][tok]; a grid ticket; the LAST CTA computes the top-8 routing from the router logits and the
-      // pre-expert RMSNorm of the pooled rows: what the layer's _route_split kernel did as a separate launch.
-      // (Measured latency-bound: 29/35/43/64 us at T 1/8/16/32; kept for reference, off in the layer.)
-      static_assert(R == 32 && NC >= 256, "sk2 fused route: pooler config (R = 32, 8 consumer warps)");
-      // lanes 8 tt .. 8 tt + 7 hold token tt's 8 column groups (idx = tid, R4 = 8, one pass for M <= 32)
-      ssq += __shfl_xor_sync(0xffffffffu, ssq, 1);
-      ssq += __shfl_xor_sync(0xffffffffu, ssq, 2);
-      ssq += __shfl_xor_sync(0xffffffffu, ssq, 4);
-      if ((tid & 7) == 0 && (tid >> 3) < M) __stcg(part2 + (tid >> 3) * 128 + cta, ssq);   // token-major [32][128 CTAs]
-      __shared__ int s_rlast2;
-      named_bar(1, NC);
-      if (tid == 0) {   // release: this CTA's pooled rows, router rows and partial are visible before its count
-        int old;
-        asm volatile("atom.add.release.gpu.global.s32 %0, [%1], 1;" : "=r"(old) : "l"(dcnt) : "memory");
-        s_rlast2 = (old % (int)gridDim.x) == (int)gridDim.x - 1;   // the counter only ever grows by gridDim.x per launch
-        if (s_rlast2) asm volatile("fence.acq_rel.gpu;" ::: "memory");
-      }
-      named_bar(1, NC);
-      if (!s_rlast2) return;
-      const float NEG_INF = __int_as_float(0xff800000u);
-      const int ls = __ldcg(rls);
-      float* ssm = red;   // [TOKS]: per-token sum of squares, the CTA partials added in a fixed (tree) order
-      for (int tt = warp; tt < M; tt += NW) {   // one warp per token: 4 independent loads per lane, then a shuffle tree
-        float s = 0.f;
-        for (int c = lane; c < (int)gridDim.x; c += 32) s += __ldcg(part2 + tt * 128 + c);
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) s += __shfl_xor_sync(0xffffffffu, s, off);
-        if (lane == 0) ssm[tt] = s;
-      }
-      // top-8 of sigmoid(0.1768 logit) + bias per token, one warp per token (lane holds 8 experts); weights = the
-      // selected sigmoid scores over their sum; ties -> the smallest index (as the Triton argmax)
-      for (int tt = warp; tt < M; tt += NW) {
+      if (rids != nullptr && cta < M && warp == 0) {
+        // routing of token `cta` by this CTA's warp 0 (tokens in parallel across CTAs; every router tile's logits
+        // are complete after the barrier): the layer's _route_split selection -- top-8 of sigmoid(0.1768 logit) +
+        // bias, ties to the lower id, weights = the selected sigmoid scores over their sum, local id = (id - start)
+        // mod 256 if < 32 else -1
+        const float NEG_INF = __int_as_float(0xff800000u);
+        const int ls = __ldcg(rls);
+        const int tt = cta;
         float sc[8], sel[8];
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
@@ -1832,7 +1827,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
             if (om > bm || (om == bm && oi < bi)) { bm = om; bi = oi; }
           }
           float mine = 0.f;
-          if ((bi >> 3) == lane) {   // static indexing (no local memory): select by an unrolled compare
+          if ((bi >> 3) == lane) {
 #pragma unroll
             for (int j = 0; j < 8; ++j)
               if ((bi & 7) == j) { mine = sc[j]; sel[j] = NEG_INF; }
@@ -1847,24 +1842,6 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
           const int lid = (myid - ls + 256) % 256;
           rlids[tt * 8 + lane] = lid < 32 ? lid : -1;
         }
-      }
-      named_bar(1, NC);
-      // pre-expert RMSNorm: xm = pooled * rsqrt(mean(pooled^2) + 1e-5) * (1 + w); 8 bf16 columns per thread step
-      for (int i = tid; i < M * 512; i += NC) {
-        const int tt = i >> 9, c8 = (i & 511) * 8;
-        const float rs = rsqrtf(ssm[tt] * (1.f / 4096.f) + 1e-5f);
-        const uint4 pv = __ldcg(reinterpret_cast<const uint4*>(out + (size_t)tt * N + c8));
-        const uint4 gv = __ldg(reinterpret_cast<const uint4*>(gpre + c8));
-        const __nv_bfloat162* p2 = reinterpret_cast<const __nv_bfloat162*>(&pv);
-        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gv);
-        uint4 ov;
-        __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(&ov);
-#pragma unroll
-        for (int j = 0; j < 4; ++j) {
-          const float2 p = __bfloat1622float2(p2[j]), gg = __bfloat1622float2(g2[j]);
-          o2[j] = __floats2bfloat162_rn(p.x * rs * (1.f + gg.x), p.y * rs * (1.f + gg.y));
-        }
-        *reinterpret_cast<uint4*>(xm + (size_t)tt * 4096 + c8) = ov;
       }
     }
   }
@@ -3100,9 +3077,9 @@ def _sk2_src(sm90):
                           f"fuse_route ? reinterpret_cast<const __nv_bfloat16*>(gpre.data_ptr()) : nullptr, "
                           f"fuse_route == 1 ? rids.data_ptr<int>() : nullptr, fuse_route == 1 ? rlids.data_ptr<int>() : nullptr, "
                           f"fuse_route == 1 ? rwts.data_ptr<float>() : nullptr, "
-                          f"fuse_route ? reinterpret_cast<__nv_bfloat16*>(xm.data_ptr()) : nullptr, "
+                          f"(fuse_route == 1 || fuse_route == 2) ? reinterpret_cast<__nv_bfloat16*>(xm.data_ptr()) : nullptr, "
                           f"fuse_route == 1 ? rls.data_ptr<int>() : nullptr, fuse_route ? part2.data_ptr<float>() : nullptr, "
-                          f"fuse_route ? dcnt.data_ptr<int>() : nullptr, "
+                          f"(fuse_route == 1 || fuse_route == 2) ? dcnt.data_ptr<int>() : nullptr, "
                           # boundary-1 prologue through the b_* slots: alpha, beta, stream (b_sin), a (b_gp), 1+gw source (b_gn),
                           # s1 out (b_sout), h = this launch's x buffer (b_hout); no b_part / b_cnt
                           f"fuse_bnd1 ? b1a.data_ptr<float>() : nullptr, fuse_bnd1 ? b1b.data_ptr<float>() : nullptr, "
@@ -3278,7 +3255,7 @@ def run_sk2_tail(x, layer, m, n, k, state, tail):
     return out
 
 
-def fused_pooler_router(x, state, route=None, bnd1=None, norm=None):
+def fused_pooler_router(x, state, route=None, bnd1=None, norm=None, gain=None):
     """Pooler and router of one decode step in ONE launch (m <= 32, sm_90): x [m, 8192] bf16 ->
     (pooler [m, 4096] bf16, router [m, 256] fp32). Same numerics as the separate sk2 kernels: 12-bit lossless pooler
     weights with exact escape corrections, router as BF16 hi + lo with FP32 accumulation (quarter-K partials added in
@@ -3311,6 +3288,13 @@ def fused_pooler_router(x, state, route=None, bnd1=None, norm=None):
         gpre, xm = norm
         rbias = rids = rlids = rwts = rls = d
         fuse_route = 2
+    elif gain is not None:
+        # gain = gpre bf16 [4096]: the pooler output is pooled * (1 + gpre) in bf16 and state["fused_part2"] ([32][128]
+        # fp32, token-major) holds the partial sums of pooled^2; the MoE kernel forms the per-token RMS scale itself
+        # (its pre_norm_partials key) and routes from the logits. No grid barrier.
+        gpre = gain
+        rbias = rids = rlids = rwts = rls = xm = d
+        fuse_route = 3
     else:
         rbias = gpre = rids = rlids = rwts = xm = rls = d
     # bnd1 = (a bf16 [m, 8192]: the o-projection output, s fp32 [m, 8192]: the input stream, alpha fp32 [8192],
