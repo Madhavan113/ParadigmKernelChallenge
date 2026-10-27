@@ -3339,6 +3339,7 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
     acc_fence(acc);
     unsigned long long t2 = 0;
     if constexpr (DIAG) t2 = gtimer();
+    pdl_wait();                                                         // launched under PDL behind g12_esc_kernel: it must have completed before this grid does
     pdl_trigger();
     // partials: part[z][n][tok], n = tile*R + rb*64 + wq*16 + g (+8), tok = tb*128 + 8j + 2t (+1)
     float* pz = part + ((size_t)z * N + (size_t)tile * R + rb * 64 + wq * 16 + g) * m + tb * 128 + 2 * t;
@@ -3381,28 +3382,30 @@ g12_reduce1_kernel(const float* __restrict__ part, int KS, int m, int N,
     for (int zz = 0; zz < KS; ++zz) sum += __ldcg(part + ((size_t)zz * N + n) * m + tok);
     out[(size_t)tok * ldo + n] = __float2bfloat16(sum);
 }
-// v3: v2's tile, but the partial reads are float4 with up to 8 loads in flight per thread (4 splits x 2 float4)
+// escape term as an extra split slab part[KS][n][tok] = sum_e delta_e * x[tok][k_e] (thread = (n, tok)): launched
+// BEFORE the GEMM, which runs under PDL from its start (this kernel triggers its dependents at entry), so the serial
+// per-row entry loop hides under the GEMM; the GEMM's griddepcontrol.wait before its epilogue orders it before the reduce.
 __global__ void __launch_bounds__(256)
-g12_reduce3_kernel(const float* __restrict__ part, int KS, int m, int N,
-                   const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
-                   const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
+g12_esc_kernel(const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+               const __nv_bfloat16* __restrict__ X, int ldx, int m, float* __restrict__ slab)
 {
-    __shared__ __align__(16) float acc[G12_RNL * 256];                  // [nl][tok] with row stride m (dense)
-    __shared__ int s_off[G12_RNL + 1];
+    pdl_trigger();
+    const int n = blockIdx.x, tok = threadIdx.x;
+    if (tok >= m) return;
+    const int e0 = esc_roff[n], e1 = esc_roff[n + 1];
+    float ev = 0.f;
+    for (int e = e0; e < e1; ++e) ev += esc_d[e] * __bfloat162float(X[(size_t)tok * ldx + esc_k[e]]);
+    slab[(size_t)n * m + tok] = ev;
+}
+// v4: partials only (KS splits + the escape slab), 16 columns x m tokens per block through a transposed smem tile,
+// float4 reads with up to 8 loads in flight per thread (4 splits x 2 float4), bf16x2 row stores out[tok][n0 .. n0+16)
+__global__ void __launch_bounds__(256)
+g12_reduce4_kernel(const float* __restrict__ part, int KS, int m, int N, __nv_bfloat16* __restrict__ out, int ldo)
+{
+    __shared__ __align__(16) float acc[G12_RNL * 256];                  // [nl][tok], row stride m (dense)
     const int n0 = blockIdx.x * G12_RNL, tid = threadIdx.x;
-    if (tid <= G12_RNL) s_off[tid] = esc_roff[n0 + tid];
     for (int i = tid; i < G12_RNL * m; i += 256) acc[i] = 0.f;
     __syncthreads();
-    {
-        const int nl = tid >> 4, tg = tid & 15;
-        for (int tg2 = tg; tg2 * 8 < m; tg2 += 16)
-            for (int e = s_off[nl]; e < s_off[nl + 1]; ++e) {
-                const int kk = esc_k[e];
-                const float d = esc_d[e];
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[nl * m + 8 * tg2 + i] += d * __bfloat162float(X[(size_t)(8 * tg2 + i) * ldx + kk]);
-            }
-    }
     pdl_wait();
     const int F4 = G12_RNL * m / 4;                                       // float4 per split tile (512 at m = 128)
     for (int z0 = 0; z0 < KS; z0 += 4) {
@@ -3432,48 +3435,6 @@ g12_reduce3_kernel(const float* __restrict__ part, int KS, int m, int N,
         *reinterpret_cast<__nv_bfloat162*>(out + (size_t)tok * ldo + n0 + 2 * p) = __floats2bfloat162_rn(acc[(2 * p) * m + tok], acc[(2 * p + 1) * m + tok]);
     }
 }
-__global__ void __launch_bounds__(256)
-g12_reduce_kernel(const float* __restrict__ part, int KS, int m, int N,
-                  const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
-                  const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
-{
-    __shared__ float acc[G12_RNL][257];
-    __shared__ int s_off[G12_RNL + 1];
-    const int n0 = blockIdx.x * G12_RNL, tid = threadIdx.x;
-    if (tid <= G12_RNL) s_off[tid] = esc_roff[n0 + tid];
-    for (int i = tid; i < G12_RNL * 256; i += 256) acc[i >> 8][i & 255] = 0.f;
-    __syncthreads();
-    {
-        const int nl = tid >> 4, tg = tid & 15;                          // row, 8-token group (tokens 8*tg .. +7, tg < m/8)
-        for (int e = s_off[nl]; e < s_off[nl + 1]; ++e) {
-            const int kk = esc_k[e];
-            const float d = esc_d[e];
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int tok = 8 * tg + i;
-                if (tok < m) acc[nl][tok] += d * __bfloat162float(X[(size_t)tok * ldx + kk]);
-            }
-        }
-        for (int tg2 = tg + 16; tg2 * 8 < m; tg2 += 16)                   // m = 256: the second half of the tokens
-            for (int e = s_off[nl]; e < s_off[nl + 1]; ++e) {
-                const int kk = esc_k[e];
-                const float d = esc_d[e];
-                #pragma unroll
-                for (int i = 0; i < 8; ++i) acc[nl][8 * tg2 + i] += d * __bfloat162float(X[(size_t)(8 * tg2 + i) * ldx + kk]);
-            }
-    }
-    pdl_wait();
-    for (int zz = 0; zz < KS; ++zz) {
-        const float* pz = part + ((size_t)zz * N + n0) * m;
-        for (int i = tid; i < G12_RNL * m; i += 256) acc[i / m][i % m] += __ldcg(pz + i);   // part[z][n0 + nl][tok], nl = i / m
-    }
-    __syncthreads();
-    for (int i = tid; i < m * (G12_RNL / 2); i += 256) {
-        const int tok = i / (G12_RNL / 2), p = i % (G12_RNL / 2);
-        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)tok * ldo + n0 + 2 * p) = __floats2bfloat162_rn(acc[2 * p][tok], acc[2 * p + 1][tok]);
-    }
-}
-
 __host__ constexpr int g12_smem_bytes(int rb, int tb, int ck, int nsw, int nsx) { return 1024 + nsw * rb * 4 * ck * 3072 + nsx * (2 * ck) * (128 * tb) * 128; }
 
 template <int RB, int TB, int CK, int NSW, int NSX, bool DIAG, bool DRAIN>
@@ -3483,7 +3444,18 @@ void launch_g12(const CUtensorMap& xmap, int m, const uint8_t* Wt, int eb, float
     constexpr int smem = g12_smem_bytes(RB, TB, CK, NSW, NSX);
     static bool attr = false;
     if (!attr) { cudaFuncSetAttribute(g12_kernel<RB, TB, CK, NSW, NSX, DIAG, DRAIN>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
-    g12_kernel<RB, TB, CK, NSW, NSX, DIAG, DRAIN><<<dim3(N / (64 * RB), ks), 128 * RB * TB, smem, stream>>>(xmap, m, Wt, eb, part, N, K, diag);
+    cudaLaunchConfig_t cfg = {};
+    cfg.gridDim = dim3((unsigned)(N / (64 * RB)), (unsigned)ks);
+    cfg.blockDim = dim3(128 * RB * TB);
+    cfg.dynamicSmemBytes = smem;
+    cfg.stream = stream;
+    cudaLaunchAttribute lattr[1];
+    lattr[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    lattr[0].val.programmaticStreamSerializationAllowed = 1;
+    cfg.attrs = lattr;
+    cfg.numAttrs = 1;                                                    // starts while g12_esc_kernel runs (it triggers at entry)
+    const cudaError_t err = cudaLaunchKernelEx(&cfg, g12_kernel<RB, TB, CK, NSW, NSX, DIAG, DRAIN>, xmap, m, Wt, eb, part, N, K, diag);
+    TORCH_CHECK(err == cudaSuccess, "g12 launch failed: ", cudaGetErrorString(err));
 }
 // == END g12 device ==
 
@@ -3991,6 +3963,12 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
     unsigned long long* dg = reinterpret_cast<unsigned long long*>(diag.data_ptr());
     const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
     const CUtensorMap xmap = okc_x_map3(X.data_ptr(), m, (int)k, ldx, 128 * (int)tb, 2 * (int)ck);
+    TORCH_CHECK(rv == 1 || rv == 4, "g12: reduce version");
+    TORCH_CHECK(part.numel() >= (ks + 1) * m * n, "g12: partials workspace (ks + 1 slabs)");
+    if (rv == 4 && mode != 2) {                                          // the escape slab (split ks), before the GEMM
+        g12_esc_kernel<<<(unsigned)n, (unsigned)m, 0, stream>>>(esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()), ldx, m, pp + (size_t)ks * m * n);
+    }
     bool launched = false;
 #define G12_CASE(RB_, TB_, CK_, SW_, SX_) \
     if (!launched && rb == RB_ && tb == TB_ && ck == CK_ && nsw == SW_ && nsx == SX_) { \
@@ -4017,10 +3995,14 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
-    auto rk = rv == 1 ? g12_reduce1_kernel : (rv == 2 ? g12_reduce_kernel : g12_reduce3_kernel);
-    const cudaError_t err = cudaLaunchKernelEx(&cfg, rk, (const float*)pp, (int)ks, m, (int)n,
-        esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
-        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()), ldx, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
+    cudaError_t err;
+    if (rv == 1)
+        err = cudaLaunchKernelEx(&cfg, g12_reduce1_kernel, (const float*)pp, (int)ks, m, (int)n,
+            esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()), ldx, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
+    else
+        err = cudaLaunchKernelEx(&cfg, g12_reduce4_kernel, (const float*)pp, (int)ks + 1, m, (int)n,
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
     TORCH_CHECK(err == cudaSuccess, "g12 reduce launch failed: ", cudaGetErrorString(err));
 }
 // == END g12 host ==
@@ -4213,7 +4195,7 @@ def _esc_tab(pk, n: int, k: int, r: int):
 
 # == BEGIN g12 python ==
 def g12_usable(m: int, n: int, k: int, rb: int, tb: int, ck: int, ks: int) -> bool:
-    return 2 <= m <= 128 * tb and m % 2 == 0 and n % (64 * rb) == 0 and k % (128 * ck * ks) == 0 and ks * m * n <= 16 << 20
+    return 2 <= m <= 128 * tb and m % 2 == 0 and n % (64 * rb) == 0 and k % (128 * ck * ks) == 0 and (ks + 1) * m * n <= 16 << 20
 # == END g12 python ==
 
 
@@ -4324,9 +4306,9 @@ TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 3, 3), ("pooler", 4096, 16): (16,
 _TB12_ON = False   # set by prepare() after the tb12 self-test (table output + probe rows) passes
 # g12: the wgmma 12-bit GEMM for m = 128 / 256 (RB x TB warpgroups of 64 rows x 128 tokens, K split ks, PDL reduce + escapes):
 # (layer, n, m) -> (rb, tb, ck, nsw, nsx, ks); dispatched only after the prepare self-test (_WG12_ON)
-WG12_SHAPES = {}
+WG12_SHAPES = {("pooler", 4096, 128): (2, 1, 1, 4, 4, 4)}   # judged in phase-2 check 5 (self-tested in prepare): GEMM-only 19.6 vs cuBLAS 23.3
 _WG12_ON = False
-G12_LAYOUTS = {(128, 1), (64, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)
+G12_LAYOUTS = {(128, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)
 T12_LAYOUTS = {(16, 4)}   # (r, ck) weight layouts kept in state (the bench sweeps them)
 T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
 T12_INTERP = False   # CPU-interpreter mode (fp32 dot over widened bit patterns); never on the GPU
@@ -4644,7 +4626,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
         if pk is None or wt is None:
             return torch.matmul(x, w.t(), out=out)
         build().g12(x, wt, pk["eb"], pk["esc_roff"], pk["esc_k"], pk["esc_delta"], out, state["partials"], state["diag"], n, k,
-                    cfg["rb"], cfg["tb"], cfg["ck"], cfg["nsw"], cfg["nsx"], cfg["ks"], bool(cfg.get("diag")), True, int(cfg.get("mode", 0)), int(cfg.get("drain", 0)), int(cfg.get("rv", 3)))
+                    cfg["rb"], cfg["tb"], cfg["ck"], cfg["nsw"], cfg["nsx"], cfg["ks"], bool(cfg.get("diag")), True, int(cfg.get("mode", 0)), int(cfg.get("drain", 0)), int(cfg.get("rv", 4)))
         return out
     if cfg.get("tb12"):
         pk = state.get(layer + "_p12")
@@ -5006,13 +4988,13 @@ def _bench(state):
 
         # check d3d8a686: the delayed release (drain=0) was wrong (rel err ~ 1.8e-2 * sqrt(chunks)) with the v2 reduce,
         # and both reduces cost ~20 us: separate the two with a drain x reduce-version matrix on pooler m=128
+        # check 20755f41: delayed release correct (d0 rv1 exact); v2/v3 reduces raced (missing barrier) and the serial
+        # escape loop cost 10-20 us -> rv4 = escape slab kernel before the GEMM (PDL) + partials-only float4 reduce
         c0_ = (2, 1, 1, 4, 4, 4)
-        parts = [row("current", "pooler", 128, 4096, None)]
-        for drain in (1, 0):
-            parts.append(row(f"g d{drain}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 2, drain)))
-            for rv in (1, 2, 3):
-                parts.append(row(f"d{drain} rv{rv}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 0, drain, rv)))
-        print("  m=128 pooler 2/1/1/4/4/ks4 drain x reduce: " + " | ".join(parts))
+        parts = [row("current", "pooler", 128, 4096, None), row("g", "pooler", 128, 4096, g12cfg(c0_, "pooler", 2))]
+        for rv in (1, 4):
+            parts.append(row(f"rv{rv}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 0, 0, rv)))
+        print("  m=128 pooler 2/1/1/4/4/ks4 reduce: " + " | ".join(parts))
         for m in (128, 256):
             for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 8192), ("o", 8192)):
                 if not budget() or not g12_cfgs[m]:
@@ -5021,9 +5003,8 @@ def _bench(state):
                 for c in g12_cfgs[m]:
                     if layer == "qkv_gate" and n % (64 * c[0]) != 0:
                         continue
-                    for drain in (1, 0):
-                        cc = g12cfg(c, layer, 0, drain)
-                        parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}/d{drain}", layer, m, n, cc))
+                    cc = g12cfg(c, layer, 0, 0, 4)
+                    parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}", layer, m, n, cc))
                 print(f"  m={m} {layer:9s} n={n}: " + " | ".join(parts))
         dg = state["diag"]
         for layer, n, m, c in (("pooler", 4096, 128, (2, 1, 1, 4, 4, 4)), ("pooler", 4096, 128, (2, 1, 1, 3, 3, 4)), ("qkv_gate", 2304, 128, (2, 1, 1, 4, 4, 4)),

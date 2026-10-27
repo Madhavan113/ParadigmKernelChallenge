@@ -17,13 +17,13 @@ BODY = r'''    # == BEGIN g12 bench ==
 
         # check d3d8a686: the delayed release (drain=0) was wrong (rel err ~ 1.8e-2 * sqrt(chunks)) with the v2 reduce,
         # and both reduces cost ~20 us: separate the two with a drain x reduce-version matrix on pooler m=128
+        # check 20755f41: delayed release correct (d0 rv1 exact); v2/v3 reduces raced (missing barrier) and the serial
+        # escape loop cost 10-20 us -> rv4 = escape slab kernel before the GEMM (PDL) + partials-only float4 reduce
         c0_ = (2, 1, 1, 4, 4, 4)
-        parts = [row("current", "pooler", 128, 4096, None)]
-        for drain in (1, 0):
-            parts.append(row(f"g d{drain}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 2, drain)))
-            for rv in (1, 2, 3):
-                parts.append(row(f"d{drain} rv{rv}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 0, drain, rv)))
-        print("  m=128 pooler 2/1/1/4/4/ks4 drain x reduce: " + " | ".join(parts))
+        parts = [row("current", "pooler", 128, 4096, None), row("g", "pooler", 128, 4096, g12cfg(c0_, "pooler", 2))]
+        for rv in (1, 4):
+            parts.append(row(f"rv{rv}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 0, 0, rv)))
+        print("  m=128 pooler 2/1/1/4/4/ks4 reduce: " + " | ".join(parts))
         for m in (128, 256):
             for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 8192), ("o", 8192)):
                 if not budget() or not g12_cfgs[m]:
@@ -32,9 +32,8 @@ BODY = r'''    # == BEGIN g12 bench ==
                 for c in g12_cfgs[m]:
                     if layer == "qkv_gate" and n % (64 * c[0]) != 0:
                         continue
-                    for drain in (1, 0):
-                        cc = g12cfg(c, layer, 0, drain)
-                        parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}/d{drain}", layer, m, n, cc))
+                    cc = g12cfg(c, layer, 0, 0, 4)
+                    parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}", layer, m, n, cc))
                 print(f"  m={m} {layer:9s} n={n}: " + " | ".join(parts))
         dg = state["diag"]
         for layer, n, m, c in (("pooler", 4096, 128, (2, 1, 1, 4, 4, 4)), ("pooler", 4096, 128, (2, 1, 1, 3, 3, 4)), ("qkv_gate", 2304, 128, (2, 1, 1, 4, 4, 4)),

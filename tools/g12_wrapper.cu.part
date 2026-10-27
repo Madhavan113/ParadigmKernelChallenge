@@ -16,6 +16,12 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
     unsigned long long* dg = reinterpret_cast<unsigned long long*>(diag.data_ptr());
     const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
     const CUtensorMap xmap = okc_x_map3(X.data_ptr(), m, (int)k, ldx, 128 * (int)tb, 2 * (int)ck);
+    TORCH_CHECK(rv == 1 || rv == 4, "g12: reduce version");
+    TORCH_CHECK(part.numel() >= (ks + 1) * m * n, "g12: partials workspace (ks + 1 slabs)");
+    if (rv == 4 && mode != 2) {                                          // the escape slab (split ks), before the GEMM
+        g12_esc_kernel<<<(unsigned)n, (unsigned)m, 0, stream>>>(esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()), ldx, m, pp + (size_t)ks * m * n);
+    }
     bool launched = false;
 #define G12_CASE(RB_, TB_, CK_, SW_, SX_) \
     if (!launched && rb == RB_ && tb == TB_ && ck == CK_ && nsw == SW_ && nsx == SX_) { \
@@ -42,10 +48,14 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
-    auto rk = rv == 1 ? g12_reduce1_kernel : (rv == 2 ? g12_reduce_kernel : g12_reduce3_kernel);
-    const cudaError_t err = cudaLaunchKernelEx(&cfg, rk, (const float*)pp, (int)ks, m, (int)n,
-        esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
-        reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()), ldx, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
+    cudaError_t err;
+    if (rv == 1)
+        err = cudaLaunchKernelEx(&cfg, g12_reduce1_kernel, (const float*)pp, (int)ks, m, (int)n,
+            esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
+            reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()), ldx, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
+    else
+        err = cudaLaunchKernelEx(&cfg, g12_reduce4_kernel, (const float*)pp, (int)ks + 1, m, (int)n,
+            reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
     TORCH_CHECK(err == cudaSuccess, "g12 reduce launch failed: ", cudaGetErrorString(err));
 }
 // == END g12 host ==
