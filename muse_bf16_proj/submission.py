@@ -1073,9 +1073,10 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   const int tst = K / (UPS * 64);                      // stages over all of K
   const int gs0 = (crank * tst) / CL;                  // this CTA's first stage (uneven split for CL = 3)
   const int nst = ((crank + 1) * tst) / CL - gs0;      // and its stage count
-  // stage-major weight stream: [stage][row block][...] (at any moment all CTAs read one contiguous region)
-  const uint8_t* wsrc = Ws + (size_t)cta * WBY;
-  const size_t wstride = (size_t)(gridDim.x / CL) * WBY;
+  // stage-major weight stream: [stage][row block][...] (at any moment all CTAs read one contiguous region); DIAG bit
+  // 128: a CTA-contiguous stream [row block][stage][...] (DRAM page locality per CTA instead of across CTAs)
+  const uint8_t* wsrc = (dgv & 128) ? Ws + (size_t)cta * (size_t)tst * WBY : Ws + (size_t)cta * WBY;
+  const size_t wstride = (dgv & 128) ? (size_t)WBY : (size_t)(gridDim.x / CL) * WBY;
   // FUSE (pooler + router in one launch): after its pooler stages every CTA streams one router piece: 8 router rows
   // (tile rt = cta / 4) over one quarter of K (rq = cta % 4), from the router's own stage-major hi|lo stream
   // ([16 stages][32 tiles][8 warps][2048 B]); 4 more stages through the same ring
@@ -1148,7 +1149,10 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     if (lane == 0) {
       for (int st = P; st < nstt; ++st) {
         const int slot = st % NSTAGE;
-        if (st >= NSTAGE) SK2_WAIT(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);
+        if (st >= NSTAGE) {
+          if (dgv & 64) mbar_wait(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);   // DIAG: busy spin (no suspend hint)
+          else SK2_WAIT(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);
+        }
         if (trace) tr[16 + 3 * st] = gtime();
         const uint32_t s0 = sbase + slot * SST;
         if (!FUSE || st < nst) {
@@ -3510,6 +3514,18 @@ SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC, CL
     # 36.2/22.4 vs 19.6, qkv8/16/32 R8 14.4/15.3/21.0 vs 13.6/13.3/14.4, unpooler16/32 R16 22.8/25.4 vs 17.8/18.8,
     # o8/16/32 R16 11.2/11.5/12.8 vs 9.4/9.3/9.5, slice8 R8 9.4 vs 8.1): neither halving the x bytes per SM nor more
     # bytes in flight per SM beats the picks above; per-CTA fixed costs and x re-reads dominate at small R.
+    # round 4 (stream rate: 3.5 TB/s loads-only vs 4.4 for a pure bulk stream): deeper rings up to the smem cap for the
+    # 96-128-CTA configs, 2 CTAs per SM with >= 12 KB weight copies, bigger copies per stage
+    # round 4 (prefill-slot 69f30550, DIAG build, raw us): loads-only is 17.8-18.5 for EVERY pooler-class config (ring
+    # 3-7 stages, 12-24 KB copies, 1-2 CTAs/SM, producer spin vs suspend-hint +-0.1, CTA-contiguous layout +0.3-0.5):
+    # the stream rate is not in the ring mechanics; what moves the full time is bigger per-stage work (fewer barrier
+    # round trips per byte): pooler32w 23.0 vs 26.2, qkv8w 15.1 vs 16.1, unpooler32h 19.5 vs 20.4. Retired: pooler8h_r100
+    # 21.9 vs 20.4, pooler8t_r192 21.3, pooler32_r216 25.9, pooler32h_r100 28.3, qkv8t_r216 16.1, qkv16t_r216 15.7 vs 15.6,
+    # unpooler16t_r100 19.3 vs 18.5, unpooler32_r216 20.6 vs 20.4.
+    # round 5 (prefill-slot 175e7007, clean build, raw us vs the pick): pooler16h_r100 18.46 / pooler16t_r220 18.59 vs
+    # 18.40; pooler32w_r216 19.26 vs 19.14; qkv32_r220 14.56 vs 14.53; qkv8w_r216 13.54 vs 13.47; unpooler32h_r100 18.40
+    # vs 18.56; pooler8w_r216 18.59 vs 18.18; qkv16w_r216 14.18 vs 13.25; unpooler16w_r216 19.78 vs 17.66; o16w_r100
+    # 9.31 vs 9.12: the DIAG-build gains were the diagnostics' per-stage cost; nothing within 1 us of a win -> retired
     # the decode layer's fused pooler + router launch (sk2f, FUSE): pooler rows then one router piece per CTA through the
     # same ring; its stream is built like any other config, the kernel is instantiated only with FUSE
     ('pooler', 'pooler', 4096, 32, 4, 1, 8, 1, 2, 1),
@@ -3531,7 +3547,7 @@ SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC, CL
     ('slice8q_r48', 'unpooler', 1024, 8, 1, 1, 4, 1, 2, 1),         # the m <= 8 slice: 128 CTAs, 256 k/stage
 ]
 SK2_FUSED_CONFIG = 'pooler'   # the config sk2f runs (NT 4, WSK 8, UPW 1: 8 consumer warps = the router piece's 8 K-units)
-SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's (see the retired list)
+SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's (see the retired lists)
 }
 SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
@@ -3591,10 +3607,9 @@ def _sk2_geom(cfg, tokr):
 
 
 DIAG_SK2 = False   # measurement runs: compile the sk2 diagnostics in and time the dg modes from prepare (see _diag_sk2)
-DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 32), ("unpooler", 16),
-                   ("unpooler", 32), ("o", 16)]
-DIAG_SK2_MODES = [(0, "full"), (1, "no-epilogue"), (2, "no-compute"), (4, "no-x"), (6, "loads-only"), (8, "alu-not-mma"),
-                  (16, "no-ldmatrix")]
+DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 16), ("qkv_gate", 32),
+                   ("unpooler", 16), ("unpooler", 32), ("o", 16), ("unpooler", 8)]
+DIAG_SK2_MODES = [(0, "full"), (6, "loads"), (70, "loads+spin"), (134, "loads+ctac"), (128, "full+ctac")]
 
 
 def _sk2_src(sm90):
@@ -3635,7 +3650,8 @@ def _sk2_src(sm90):
 
 
 def _diag_sk2(weights, state):
-    """Attribution of the sk2 kernels on this GPU: graph replays from a cold L2 (as the autotuner) of each dg mode."""
+    """Attribution of the sk2 kernels on this GPU: graph replays from a cold L2 (as the autotuner) of each candidate
+    config of each shape in each dg mode (DIAG builds only; the dg bits are runtime branches there)."""
     if not (DIAG_SK2 and state.get("sm90")):
         return
     dev = weights["o"].device
@@ -3643,36 +3659,48 @@ def _diag_sk2(weights, state):
     sink = torch.empty(1024, dtype=torch.float32, device=dev)
     g = torch.Generator(device=dev)
     g.manual_seed(999)
+    cfg_by_name = {cfg[0]: cfg for cfg in SK2_CONFIGS}
     for layer, m in DIAG_SK2_SHAPES:
         w = weights[layer]
         n = 1024 if (layer == "unpooler" and m <= 8) else w.shape[0]
         k = w.shape[1]
-        if _sk2_name(layer, m) not in state.get("sk2", {}):
-            continue
+        names = [_sk2_name(layer, m)] + list(SK2_ALT.get((layer, _sk2_tokr(m)), ()))
         x = torch.randn(m, k, device=dev, generator=g).to(torch.bfloat16)
-        res = []
-        for dg, name in DIAG_SK2_MODES:
-            try:
-                _run_sk2(x, layer, m, n, k, state, dg=dg)
-                torch.cuda.synchronize()
-                gr = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(gr):
-                    _run_sk2(x, layer, m, n, k, state, dg=dg)
-                ts = []
-                for _ in range(12):
-                    torch.sum(flush, dim=0, out=sink)
-                    e0 = torch.cuda.Event(enable_timing=True)
-                    e1 = torch.cuda.Event(enable_timing=True)
-                    e0.record()
-                    gr.replay()
-                    e1.record()
+        for name in names:
+            if name not in state.get("sk2", {}):
+                continue
+            ci, stream, tab, pmax, b4, n_rows = state["sk2"][name]
+            _, _, _, R, NT, NWR, WSK, UPW, _, CL = cfg_by_name[name]
+            wby = NWR * WSK * UPW * NT * 768
+            tst = k // (WSK * UPW * 64)
+            ctac = stream.view(tst, n_rows // R, wby).permute(1, 0, 2).contiguous()   # [cta][stage][...]
+            res = []
+            for dg, mode in DIAG_SK2_MODES:
+                so = ctac if (dg & 128) else None
+                try:
+                    _run_sk2(x, layer, m, n, k, state, dg=dg, name=name, stream_override=so)
                     torch.cuda.synchronize()
-                    ts.append(e0.elapsed_time(e1) * 1000)
-                res.append(f"{name}={sorted(ts)[len(ts) // 2]:.1f}")
-                del gr
-            except RuntimeError as e:   # noqa: BLE001
-                res.append(f"{name}=ERR({str(e)[:40]})")
-        print(f"[okc] diag sk2 {layer} m={m} ({_sk2_name(layer, m)}): " + " ".join(res), file=sys.stderr)
+                    gr = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(gr):
+                        _run_sk2(x, layer, m, n, k, state, dg=dg, name=name, stream_override=so)
+                    ts = []
+                    for _ in range(12):
+                        torch.sum(flush, dim=0, out=sink)
+                        e0 = torch.cuda.Event(enable_timing=True)
+                        e1 = torch.cuda.Event(enable_timing=True)
+                        e0.record()
+                        gr.replay()
+                        e1.record()
+                        torch.cuda.synchronize()
+                        ts.append(e0.elapsed_time(e1) * 1000)
+                    res.append(f"{mode}={sorted(ts)[len(ts) // 2]:.1f}")
+                    del gr
+                except RuntimeError as e:   # noqa: BLE001
+                    res.append(f"{mode}=ERR({str(e)[:40]})")
+            hl, nstage = _sk2_geom(cfg_by_name[name], _sk2_tokr(m))
+            print(f"[okc] diag sk2 {layer} m={m} {name} (R{R} {wby // 1024}KB-copies x{nstage} stages, {n_rows // R * CL} CTAs): "
+                  + " ".join(res), file=sys.stderr)
+            del ctac
     del flush
     torch.cuda.synchronize()
 
@@ -3911,9 +3939,11 @@ def sk2_prepare(weights, state):
     state.pop("sk2_bal", None)
 
 
-def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None, name=None):
+def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None, name=None, stream_override=None):
     name = name or _sk2_name(layer, m)
     ci, stream, tab, pmax, b4, n_rows = state["sk2"][name]
+    if stream_override is not None:
+        stream = stream_override
     out = torch.empty((m, n), dtype=torch.float32 if layer == "router" else torch.bfloat16, device=x.device)
     ext = _get_ext()
     ext.sk2_set_pdl(SK2_PDL)

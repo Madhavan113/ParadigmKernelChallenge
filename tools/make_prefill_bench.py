@@ -47,8 +47,9 @@ def _proj_bench(weights, budget):
     if budget < PROJ_BENCH_MIN_BUDGET:
         print("[okc] proj bench: skipped (budget)", file=sys.stderr, flush=True)
         return
-    global bfp_CUTLASS_LAYERS
+    global bfp_CUTLASS_LAYERS, bfp_DIAG_SK2
     bfp_CUTLASS_LAYERS = set()   # no CUTLASS build in the bench slot (170 s join); the proj check measures it
+    bfp_DIAG_SK2 = @@DIAG@@      # sk2 diagnostics (dg modes) compiled in and timed from prepare
     w5 = {k: weights[k].contiguous() for k in ("qkv_gate", "o", "pooler", "unpooler")}
     w5["router"] = weights["router"].float().contiguous()
     t1 = _bench_time.time()
@@ -59,6 +60,7 @@ def _proj_bench(weights, budget):
           file=sys.stderr, flush=True)
     del state
 '''
+bench = bench.replace("@@DIAG@@", "True" if "--diag" in sys.argv else "False")
 src = pre.rstrip("\n") + "\n\n# ---- component: proj (muse_bf16_proj/submission.py, names prefixed bfp_) ----\n" + body.rstrip("\n") + "\n" + bench
 out.write_text(src)
 compile(src, str(out), "exec")

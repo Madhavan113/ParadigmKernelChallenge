@@ -7913,9 +7913,10 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   const int tst = K / (UPS * 64);                      // stages over all of K
   const int gs0 = (crank * tst) / CL;                  // this CTA's first stage (uneven split for CL = 3)
   const int nst = ((crank + 1) * tst) / CL - gs0;      // and its stage count
-  // stage-major weight stream: [stage][row block][...] (at any moment all CTAs read one contiguous region)
-  const uint8_t* wsrc = Ws + (size_t)cta * WBY;
-  const size_t wstride = (size_t)(gridDim.x / CL) * WBY;
+  // stage-major weight stream: [stage][row block][...] (at any moment all CTAs read one contiguous region); DIAG bit
+  // 128: a CTA-contiguous stream [row block][stage][...] (DRAM page locality per CTA instead of across CTAs)
+  const uint8_t* wsrc = (dgv & 128) ? Ws + (size_t)cta * (size_t)tst * WBY : Ws + (size_t)cta * WBY;
+  const size_t wstride = (dgv & 128) ? (size_t)WBY : (size_t)(gridDim.x / CL) * WBY;
   // FUSE (pooler + router in one launch): after its pooler stages every CTA streams one router piece: 8 router rows
   // (tile rt = cta / 4) over one quarter of K (rq = cta % 4), from the router's own stage-major hi|lo stream
   // ([16 stages][32 tiles][8 warps][2048 B]); 4 more stages through the same ring
@@ -7988,7 +7989,10 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     if (lane == 0) {
       for (int st = P; st < nstt; ++st) {
         const int slot = st % NSTAGE;
-        if (st >= NSTAGE) SK2_WAIT(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);
+        if (st >= NSTAGE) {
+          if (dgv & 64) mbar_wait(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);   // DIAG: busy spin (no suspend hint)
+          else SK2_WAIT(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);
+        }
         if (trace) tr[16 + 3 * st] = gtime();
         const uint32_t s0 = sbase + slot * SST;
         if (!FUSE || st < nst) {
@@ -10344,12 +10348,31 @@ bfp_SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC
     ('qkv8t_r144', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),         # tokr8 [0.969 vs 0.979]
     ('qkv16t_r200', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),        # tokr16 [0.985 vs 0.994]
     ('o16t_r68', 'o', 8192, 32, 2, 2, 1, 4, 2, 1),                  # tokr16 [0.937 vs 0.957]
-    # cluster-of-2 variants (autotuned against the picks above; x bytes per SM halve, weight bytes unchanged)
-    ('qkv32c2a', 'qkv_gate', 2304, 48, 3, 2, 4, 1, 1, 2),           # 48 x 2 = 96 CTAs, 8 consumer warps, 256 k/stage
-    ('qkv32c2b', 'qkv_gate', 2304, 48, 3, 2, 2, 2, 1, 2),           # 96 CTAs, 4 consumer warps, 256 k/stage
-    ('pooler32c2', 'pooler', 4096, 64, 4, 2, 2, 2, 1, 2),           # 64 x 2 = 128 CTAs
-    ('pooler16c2', 'pooler', 4096, 64, 4, 2, 2, 4, 1, 2),           # tokr16: 128 CTAs, 512 k/stage
-    ('unpooler32c2', 'unpooler', 8192, 128, 4, 4, 1, 4, 1, 2),      # 64 x 2 = 128 CTAs, 4 consumer warps (no K split inside)
+    # retired after judging (prefill-slot runs f3e50d8b / ba7affa0, raw graph-replay us vs the pick): cluster-of-2 K splits
+    # at R 48-128 (qkv32 16.7-17.7 vs 14.4, pooler32 22.1 vs 19.1, pooler16 20.5 vs 18.0, unpooler32 21.8 vs 18.5) and
+    # small-R rings at 3-4 CTAs per SM (pooler8 R8 23.2 vs 18.1, pooler16 R8/R16 24.3/19.3 vs 18.5, pooler32 R8/R16
+    # 36.2/22.4 vs 19.6, qkv8/16/32 R8 14.4/15.3/21.0 vs 13.6/13.3/14.4, unpooler16/32 R16 22.8/25.4 vs 17.8/18.8,
+    # o8/16/32 R16 11.2/11.5/12.8 vs 9.4/9.3/9.5, slice8 R8 9.4 vs 8.1): neither halving the x bytes per SM nor more
+    # bytes in flight per SM beats the picks above; per-CTA fixed costs and x re-reads dominate at small R.
+    # round 4 (stream rate: 3.5 TB/s loads-only vs 4.4 for a pure bulk stream): deeper rings up to the smem cap for the
+    # 96-128-CTA configs, 2 CTAs per SM with >= 12 KB weight copies, bigger copies per stage
+    # round 4 (prefill-slot 69f30550, DIAG build, raw us): loads-only is 17.8-18.5 for EVERY pooler-class config (ring
+    # 3-7 stages, 12-24 KB copies, 1-2 CTAs/SM, producer spin vs suspend-hint +-0.1, CTA-contiguous layout +0.3-0.5):
+    # the stream rate is not in the ring mechanics; what moves the full time is bigger per-stage work (fewer barrier
+    # round trips per byte): pooler32w 23.0 vs 26.2, qkv8w 15.1 vs 16.1, unpooler32h 19.5 vs 20.4. Retired: pooler8h_r100
+    # 21.9 vs 20.4, pooler8t_r192 21.3, pooler32_r216 25.9, pooler32h_r100 28.3, qkv8t_r216 16.1, qkv16t_r216 15.7 vs 15.6,
+    # unpooler16t_r100 19.3 vs 18.5, unpooler32_r216 20.6 vs 20.4.
+    ('pooler16h_r100', 'pooler', 4096, 16, 2, 1, 2, 4, 1, 1),       # 256 CTAs, 2/SM, 3 x 28 KB (12 KB copies)
+    ('pooler16t_r220', 'pooler', 4096, 32, 2, 2, 2, 4, 1, 1),       # pooler16t_r192 with 5 stages
+    ('pooler32w_r216', 'pooler', 4096, 32, 2, 2, 2, 4, 1, 1),       # 56 KB stages (24 KB copies), 3 stages
+    ('qkv32_r220', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 1, 1),         # qkv32_r208 (4 x 50 KB stays 4)
+    ('qkv8w_r216', 'qkv_gate', 2304, 24, 3, 1, 4, 4, 2, 1),         # 36 KB weight copies (1024 k per stage)
+    ('unpooler32h_r100', 'unpooler', 8192, 32, 2, 2, 2, 2, 1, 1),   # 256 CTAs, 2/SM (28 KB x 3)
+    # round 5: more bigger-copy variants
+    ('pooler8w_r216', 'pooler', 4096, 32, 2, 2, 2, 8, 1, 1),        # 48 KB copies (1024 k per stage), 3 x 64 KB, 128 CTAs
+    ('qkv16w_r216', 'qkv_gate', 2304, 24, 3, 1, 4, 4, 1, 1),        # 36 KB copies, 68 KB stages x 3
+    ('unpooler16w_r216', 'unpooler', 8192, 32, 2, 2, 2, 4, 1, 1),   # 24 KB copies, 40 KB stages x 5, 128 CTAs
+    ('o16w_r100', 'o', 8192, 32, 2, 2, 2, 4, 1, 1),                 # 24 KB copies, 40 KB x 2 (K = 1024), 256 CTAs
     # the decode layer's fused pooler + router launch (sk2f, FUSE): pooler rows then one router piece per CTA through the
     # same ring; its stream is built like any other config, the kernel is instantiated only with FUSE
     ('pooler', 'pooler', 4096, 32, 4, 1, 8, 1, 2, 1),
@@ -10371,21 +10394,16 @@ bfp_SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC
     ('slice8q_r48', 'unpooler', 1024, 8, 1, 1, 4, 1, 2, 1),         # the m <= 8 slice: 128 CTAs, 256 k/stage
 ]
 bfp_SK2_FUSED_CONFIG = 'pooler'   # the config sk2f runs (NT 4, WSK 8, UPW 1: 8 consumer warps = the router piece's 8 K-units)
-bfp_SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's
-    # judged (run f3e50d8b, raw us): qkv32c2a 17.7 / qkv32c2b 16.7 vs qkv32_r208 14.4; pooler32c2 22.1 vs 19.1;
-    # pooler16c2 20.5 vs 18.0; unpooler32c2 21.8 vs 18.5: halving the x bytes per SM never paid for the cluster epilogue
-    ('pooler', 8): ['pooler8q_r48'],
-    ('pooler', 16): ['pooler16q_r72', 'pooler16h_r60'],
-    ('pooler', 32): ['pooler32q_r60', 'pooler32h_r72'],
-    ('qkv_gate', 8): ['qkv8q_r48'],
-    ('qkv_gate', 16): ['qkv16q_r72'],
-    ('qkv_gate', 32): ['qkv32q_r60'],
-    ('unpooler', 8): ['slice8q_r48'],
-    ('unpooler', 16): ['unpooler16q_r48'],
-    ('unpooler', 32): ['unpooler32q_r72'],
-    ('o', 8): ['o8q_r48'],
-    ('o', 16): ['o16q_r48'],
-    ('o', 32): ['o32q_r72'],
+bfp_SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's (see the retired list)
+    ('pooler', 8): ['pooler8w_r216'],
+    ('pooler', 16): ['pooler16h_r100', 'pooler16t_r220'],
+    ('pooler', 32): ['pooler32w_r216'],
+    ('qkv_gate', 8): ['qkv8w_r216'],
+    ('qkv_gate', 16): ['qkv16w_r216'],
+    ('qkv_gate', 32): ['qkv32_r220'],
+    ('unpooler', 16): ['unpooler16w_r216'],
+    ('unpooler', 32): ['unpooler32h_r100'],
+    ('o', 16): ['o16w_r100'],
 }
 bfp_SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
@@ -10445,10 +10463,9 @@ def bfp__sk2_geom(cfg, tokr):
 
 
 bfp_DIAG_SK2 = False   # measurement runs: compile the sk2 diagnostics in and time the dg modes from prepare (see _diag_sk2)
-bfp_DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 32), ("unpooler", 16),
-                   ("unpooler", 32), ("o", 16)]
-bfp_DIAG_SK2_MODES = [(0, "full"), (1, "no-epilogue"), (2, "no-compute"), (4, "no-x"), (6, "loads-only"), (8, "alu-not-mma"),
-                  (16, "no-ldmatrix")]
+bfp_DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 16), ("qkv_gate", 32),
+                   ("unpooler", 16), ("unpooler", 32), ("o", 16), ("unpooler", 8)]
+bfp_DIAG_SK2_MODES = [(0, "full"), (6, "loads"), (70, "loads+spin"), (134, "loads+ctac"), (128, "full+ctac")]
 
 
 def bfp__sk2_src(sm90):
@@ -10489,7 +10506,8 @@ def bfp__sk2_src(sm90):
 
 
 def bfp__diag_sk2(weights, state):
-    """Attribution of the sk2 kernels on this GPU: graph replays from a cold L2 (as the autotuner) of each dg mode."""
+    """Attribution of the sk2 kernels on this GPU: graph replays from a cold L2 (as the autotuner) of each candidate
+    config of each shape in each dg mode (DIAG builds only; the dg bits are runtime branches there)."""
     if not (bfp_DIAG_SK2 and state.get("sm90")):
         return
     dev = weights["o"].device
@@ -10497,36 +10515,48 @@ def bfp__diag_sk2(weights, state):
     sink = torch.empty(1024, dtype=torch.float32, device=dev)
     g = torch.Generator(device=dev)
     g.manual_seed(999)
+    cfg_by_name = {cfg[0]: cfg for cfg in bfp_SK2_CONFIGS}
     for layer, m in bfp_DIAG_SK2_SHAPES:
         w = weights[layer]
         n = 1024 if (layer == "unpooler" and m <= 8) else w.shape[0]
         k = w.shape[1]
-        if bfp__sk2_name(layer, m) not in state.get("sk2", {}):
-            continue
+        names = [bfp__sk2_name(layer, m)] + list(bfp_SK2_ALT.get((layer, bfp__sk2_tokr(m)), ()))
         x = torch.randn(m, k, device=dev, generator=g).to(torch.bfloat16)
-        res = []
-        for dg, name in bfp_DIAG_SK2_MODES:
-            try:
-                bfp__run_sk2(x, layer, m, n, k, state, dg=dg)
-                torch.cuda.synchronize()
-                gr = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(gr):
-                    bfp__run_sk2(x, layer, m, n, k, state, dg=dg)
-                ts = []
-                for _ in range(12):
-                    torch.sum(flush, dim=0, out=sink)
-                    e0 = torch.cuda.Event(enable_timing=True)
-                    e1 = torch.cuda.Event(enable_timing=True)
-                    e0.record()
-                    gr.replay()
-                    e1.record()
+        for name in names:
+            if name not in state.get("sk2", {}):
+                continue
+            ci, stream, tab, pmax, b4, n_rows = state["sk2"][name]
+            _, _, _, R, NT, NWR, WSK, UPW, _, CL = cfg_by_name[name]
+            wby = NWR * WSK * UPW * NT * 768
+            tst = k // (WSK * UPW * 64)
+            ctac = stream.view(tst, n_rows // R, wby).permute(1, 0, 2).contiguous()   # [cta][stage][...]
+            res = []
+            for dg, mode in bfp_DIAG_SK2_MODES:
+                so = ctac if (dg & 128) else None
+                try:
+                    bfp__run_sk2(x, layer, m, n, k, state, dg=dg, name=name, stream_override=so)
                     torch.cuda.synchronize()
-                    ts.append(e0.elapsed_time(e1) * 1000)
-                res.append(f"{name}={sorted(ts)[len(ts) // 2]:.1f}")
-                del gr
-            except RuntimeError as e:   # noqa: BLE001
-                res.append(f"{name}=ERR({str(e)[:40]})")
-        print(f"[okc] diag sk2 {layer} m={m} ({bfp__sk2_name(layer, m)}): " + " ".join(res), file=sys.stderr)
+                    gr = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(gr):
+                        bfp__run_sk2(x, layer, m, n, k, state, dg=dg, name=name, stream_override=so)
+                    ts = []
+                    for _ in range(12):
+                        torch.sum(flush, dim=0, out=sink)
+                        e0 = torch.cuda.Event(enable_timing=True)
+                        e1 = torch.cuda.Event(enable_timing=True)
+                        e0.record()
+                        gr.replay()
+                        e1.record()
+                        torch.cuda.synchronize()
+                        ts.append(e0.elapsed_time(e1) * 1000)
+                    res.append(f"{mode}={sorted(ts)[len(ts) // 2]:.1f}")
+                    del gr
+                except RuntimeError as e:   # noqa: BLE001
+                    res.append(f"{mode}=ERR({str(e)[:40]})")
+            hl, nstage = bfp__sk2_geom(cfg_by_name[name], bfp__sk2_tokr(m))
+            print(f"[okc] diag sk2 {layer} m={m} {name} (R{R} {wby // 1024}KB-copies x{nstage} stages, {n_rows // R * CL} CTAs): "
+                  + " ".join(res), file=sys.stderr)
+            del ctac
     del flush
     torch.cuda.synchronize()
 
@@ -10581,8 +10611,9 @@ bfp_CG_CONFIGS = {"qkv_gate": (2, 256), "o": (2, 64), "unpooler": (2, 128), "poo
 # (v137: pooler m=1 cgemv 2x512 measured -0.34 us vs sk2; 2x256 ties sk2, 4/8 rows or 1 row lose)
 # alternatives the autotuner times against CG_CONFIGS (m = 1): more rows per CTA = fewer CTAs and fewer x re-reads (o at
 # 2 x 64: 4096 CTAs of 3 KB each re-reading 2 KB of x: as many x bytes as weight bytes); K >= 16 threads per CTA
-bfp_CG_ALT = {"o": [(4, 64), (8, 64), (4, 32), (2, 32)], "unpooler": [(4, 128), (8, 128), (4, 256), (2, 256)],
-          "qkv_gate": [(4, 256), (2, 128), (4, 128)]}
+# judged (ba7affa0, raw us): o 2x64 8.6 beats 4x64 8.8, 8x64 9.1, 4x32 9.4, 2x32 9.7; unpooler 2x128 7.04 beats 2x256
+# 7.07, 4x128 / 4x256 7.2, 8x128 8.1; qkv 2x256 12.4 beats 4x128 12.9, 2x128 13.6, 4x256 13.8 -> no alternatives kept
+bfp_CG_ALT = {}
 bfp_CG_K = {"qkv_gate": 8192, "o": 1024, "unpooler": 4096, "pooler": 8192}
 
 
@@ -10764,9 +10795,11 @@ def bfp_sk2_prepare(weights, state):
     state.pop("sk2_bal", None)
 
 
-def bfp__run_sk2(x, layer, m, n, k, state, dg=0, dbg=None, name=None):
+def bfp__run_sk2(x, layer, m, n, k, state, dg=0, dbg=None, name=None, stream_override=None):
     name = name or bfp__sk2_name(layer, m)
     ci, stream, tab, pmax, b4, n_rows = state["sk2"][name]
+    if stream_override is not None:
+        stream = stream_override
     out = torch.empty((m, n), dtype=torch.float32 if layer == "router" else torch.bfloat16, device=x.device)
     ext = bfp__get_ext()
     ext.sk2_set_pdl(bfp_SK2_PDL)
@@ -11358,8 +11391,9 @@ def _proj_bench(weights, budget):
     if budget < PROJ_BENCH_MIN_BUDGET:
         print("[okc] proj bench: skipped (budget)", file=sys.stderr, flush=True)
         return
-    global bfp_CUTLASS_LAYERS
+    global bfp_CUTLASS_LAYERS, bfp_DIAG_SK2
     bfp_CUTLASS_LAYERS = set()   # no CUTLASS build in the bench slot (170 s join); the proj check measures it
+    bfp_DIAG_SK2 = False      # sk2 diagnostics (dg modes) compiled in and timed from prepare
     w5 = {k: weights[k].contiguous() for k in ("qkv_gate", "o", "pooler", "unpooler")}
     w5["router"] = weights["router"].float().contiguous()
     t1 = _bench_time.time()
