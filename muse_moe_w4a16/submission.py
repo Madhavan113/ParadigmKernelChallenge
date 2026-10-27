@@ -2187,7 +2187,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
@@ -2658,7 +2658,7 @@ def _bench_stream(state):
 
 
 # == BEGIN diag bench ==
-BENCH_DIAG = True   # phase 3b: DIAG stamps + ablations of the bulk wt path at bs 1 / 8 / 16
+BENCH_DIAG = False  # phase 3b: DIAG stamps + ablations of the bulk wt path at bs 1 / 8 / 16
 
 
 def _bench_diag(state):
