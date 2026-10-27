@@ -2028,6 +2028,11 @@ static_assert(!OKC_WS || !OKC_WSBL || OKC_WSBLK <= OKC_WSNR, "OKC_WSBLK must not
 #ifndef OKC_WSRF
 #define OKC_WSRF 0
 #endif
+#ifndef OKC_WSER
+#define OKC_WSER 0  // WSB: release the ring slot as soon as every warp holds the unit's codes and scales in registers
+                    // (warp 0 refills it before the compute), so OKC_NS units stream while a unit is computed, not NS-1
+#endif
+static_assert(!OKC_WSER || OKC_WSB, "OKC_WSER needs the WSB loop");
 __device__ __forceinline__ void ws_issue(const Params& p, Smem& S, int q, int nA, int a0, int b0, unsigned char* ring);
 template <bool PB>
 __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigned char* ring, uint64_t* bars, int& seq) {
@@ -2079,9 +2084,29 @@ __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigne
 #if OKC_NACC == 4
     float acc3[4] = {0.f, 0.f, 0.f, 0.f}, acc4[4] = {0.f, 0.f, 0.f, 0.f};
 #endif
+#if OKC_WSER
+    // the unit's codes into registers first, then the slot is released (mbarrier arrive: release semantics order the
+    // loads before it) and warp 0 refills it with unit q + NS while every warp computes
+    uint4 wq[NCH];
+#pragma unroll
+    for (int c = 0; c < NCH; ++c) wq[c] = *reinterpret_cast<const uint4*>(slot + (warp * NCH + c) * 512 + lane * 16);
+    __syncwarp();
+    if (lane == 0) mbar_arrive1(S.wse + sl);
+    if (warp == 0 && lane == 0) {
+      const int nA = S.wsr[1] - S.wsr[0], N = nA + (S.wsr[3] - S.wsr[2]);
+      if (q + OKC_NS < N) {
+        mbar_wait(S.wse + sl, (uint32_t)((q / OKC_NS) & 1));  // every warp holds its codes and scales
+        ws_issue(p, S, q + OKC_NS, nA, S.wsr[0], S.wsr[2], ring);
+      }
+    }
+#endif
 #pragma unroll
     for (int c = 0; c < NCH; ++c) {
+#if OKC_WSER
+      const uint4 w = wq[c];
+#else
       const uint4 w = *reinterpret_cast<const uint4*>(slot + (warp * NCH + c) * 512 + lane * 16);
+#endif
 #if OKC_PRMTSC
       const uint32_t swd = c < 4 ? (c < 2 ? sc.x : sc.y) : (c < 6 ? sc.z : sc.w);
       const uint32_t sg = SCDK(swd, (c & 1) * 2, k16), sg8 = SCDK(swd, (c & 1) * 2 + 1, k16);
@@ -2123,14 +2148,17 @@ __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigne
 #endif
 #if OKC_WSB
     // WSB: the compute warps keep the base loop's CTA barrier per unit (slot consumed + partials visible), thread 0
-    // refills the slot and hands the partial buffer to the helper warp, which runs every epilogue off this loop
+    // refills the slot (unless OKC_WSER refilled it before the compute) and hands the partial buffer to the helper
+    // warp, which runs every epilogue off this loop
     const int bb = q % NRB;
     mbar_wait(S.wsre + bb, (uint32_t)(((q / NRB) & 1) ^ 1));  // the helper has consumed this buffer's previous unit
     *reinterpret_cast<float4*>(&S.red[bb][warp][lane][0]) = make_float4(acc[0], acc[1], acc[2], acc[3]);
     CTA_SYNC();
     if (tid == 0) {
+#if !OKC_WSER
       const int nA = S.wsr[1] - S.wsr[0], N = nA + (S.wsr[3] - S.wsr[2]);
       if (q + OKC_NS < N) ws_issue(p, S, q + OKC_NS, nA, S.wsr[0], S.wsr[2], ring);
+#endif
       if (!(OKC_WSBL && PB && i >= nU - OKC_WSBLK)) mbar_arrive1(S.wsrf + bb);   // WSBL: the last units stay with warps 0..K-1
     }
 #else
@@ -2523,6 +2551,7 @@ __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
   if ((threadIdx.x & 31) != 0) return;
   int ws = 0, n = 0;
   uint32_t wph = 0;
+  unsigned long long wring_wait = 0;
 #pragma unroll 1
   for (int pb = 0; pb < 2; ++pb) {
     const int g0 = S.wgr[2 * pb], g1 = S.wgr[2 * pb + 1], sp = wgs_split(pb, g0, g1);
@@ -2533,15 +2562,26 @@ __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
       if (gs == g1) gs = g0;  // [sp, g1) done: then [g0, sp)
       const int u = gs >> 4, st = gs & 15;
       const int j = u >> ubl, ub = u & ((1 << ubl) - 1);
-      if (n >= WGS_NS) wgs_wait(S.bars + BW_E + ws, wph ^ 1, 1000 + gs);
+      if (n >= WGS_NS) {
+        unsigned long long tr0 = 0;
+        if (OKC_DEBUG) tr0 = gtimer();
+        wgs_wait(S.bars + BW_E + ws, wph ^ 1, 1000 + gs);
+        if (OKC_DEBUG) wring_wait += gtimer() - tr0;
+      }
       uint64_t* bar = S.bars + BW_F + ws;
       const unsigned char* src = base + ((size_t)(((S.jE[j] << ubl) + ub) * 16 + st)) * (size_t)UNIT_BYTES;
+#if OKC_WGSX & 32
+      (void)src;
+      mbar_arrive1(bar);  // dev: no weight copy (the consumers decode whatever the slot holds)
+#else
       asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(UNIT_BYTES) : "memory");
       asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" L2H_SUFFIX " [%0], [%1], %2, [%3]" L2H_OPERAND ";\n"
                    ::"r"(smem_u32(ring + ws * UNIT_BYTES)), "l"(src), "r"(UNIT_BYTES), "r"(smem_u32(bar)) L2H_ARG : "memory");
+#endif
       if (++ws == WGS_NS) { ws = 0; wph ^= 1; }
     }
   }
+  if (OKC_DEBUG && p.dbg) p.dbg[(size_t)gridDim.x * 8 + (size_t)gridDim.x * 4 + blockIdx.x] = wring_wait;  // weight-ring empty waits (ns)
 }
 // x producer: one bulk copy per stage (lane 0): the job's x slice for the stage is contiguous in xA (phase A, written
 // by every CTA's gather pass at the start) or xB (phase B, written by the phase-A epilogues), N_pad x 512 B
@@ -2559,6 +2599,7 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
   unsigned char* xring = ring + WGS_NS * UNIT_BYTES;
   int xs = 0, n = 0;
   uint32_t xph = 0;
+  unsigned long long xwaitA = 0, xwaitB = 0, xstallB = 0, xring_wait = 0;
 #pragma unroll 1
   for (int pb = 0; pb < 2; ++pb) {
     const int g0 = S.wgr[2 * pb], g1 = S.wgr[2 * pb + 1], sp = wgs_split(pb, g0, g1);
@@ -2571,7 +2612,14 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
       if (gs == g1) gs = g0;  // [sp, g1) done: then [g0, sp)
       const int u = gs >> 4, st = gs & 15;
       const int j = u >> ubl;
-      if (n >= WGS_NX) wgs_wait(S.bars + BX_E + xs, xph ^ 1, 2000000 + gs);
+      if (n >= WGS_NX) {
+        unsigned long long tr0 = 0;
+        if (OKC_DEBUG) tr0 = gtimer();
+        wgs_wait(S.bars + BX_E + xs, xph ^ 1, 2000000 + gs);
+        if (OKC_DEBUG) xring_wait += gtimer() - tr0;
+      }
+      unsigned long long tw0 = 0;
+      if (OKC_DEBUG) tw0 = gtimer();
       if (j != curj) {
         curj = j;
         npad = ((S.jC[j] + 7) >> 3) << 3;
@@ -2580,13 +2628,23 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
       }
       // phase B stage st reads inter columns 256 st .. +255: the 2 phase-A units (x 4 warpgroups) that wrote them
       if (pb && !(OKC_WGSX & 8)) { while (ld_acquire(p.doneAs + j * 16 + st) < 8) __nanosleep(32); }
+      if (OKC_DEBUG) { const unsigned long long dt = gtimer() - tw0; if (pb) { xwaitB += dt; xstallB += dt > 500; } else xwaitA += dt; }
       uint64_t* bar = S.bars + BX_F + xs;
       const uint32_t bytes = (uint32_t)npad * 512u;
+#if OKC_WGSX & 16
+      (void)bytes; (void)jb;
+      mbar_arrive1(bar);  // dev: no x copy (the consumers read whatever the slot holds)
+#else
       asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(bytes) : "memory");
       asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
                    ::"r"(smem_u32(xring + xs * WGS_XS)), "l"(jb + (size_t)st * npad * 256), "r"(bytes), "r"(smem_u32(bar)) : "memory");
+#endif
       if (++xs == WGS_NX) { xs = 0; xph ^= 1; }
     }
+  }
+  if (OKC_DEBUG && p.dbg) {  // x producer stalls: dbg[G * 8 + cta * 4 + (0 phase-A gating ns, 1 phase-B gating ns, 2 phase-B stalls > 0.5 us, 3 x-ring empty waits ns)]
+    unsigned long long* d = p.dbg + (size_t)gridDim.x * 8 + (size_t)blockIdx.x * 4;
+    d[0] = xwaitA; d[1] = xwaitB; d[2] = xstallB; d[3] = xring_wait;
   }
 }
 // phase A's x gather (all consumer threads of every CTA, once, at the start): this CTA's share of the jobs' padded rows
@@ -2814,7 +2872,11 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
           const int js = h * GS + jj;      // k16 step within the 4-step load group
           const uint32_t q = js == 0 ? cwg.x : js == 1 ? cwg.y : js == 2 ? cwg.z : cwg.w;
           uint32_t r0, r1, r2, r3;
+#if OKC_XNODQ
+          r0 = q; r1 = q >> 1; r2 = q >> 2; r3 = q >> 3;  // dev: no decode
+#else
           dq4(q, r0, r1, r2, r3);
+#endif
 #if OKC_WGSSC2
           // scales stored [j][h] (rows g, g+8 of step j side by side): one PRMT + one IMAD build both rows' scales in
           // one bf16x2, and the multiplies broadcast its halves (HMUL2 .H0_H0 / .H1_H1): 2 instructions per k16 fewer
@@ -3919,10 +3981,36 @@ TINY2_MAX_M = 8
 # TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
-DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_VARIANTS = {}         # name -> defines, timed in diag mode
-DIAG_BW = False            # also run the bandwidth microbenchmarks
-DIAG_BW_MODES = (5, 8, 12, 16) + tuple(range(17, 25))
+DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
+DIAG_SET = "A"             # which variant set below (a copy of this file with another set runs as a second check)
+_WGS_SHAPES = [32, 128, 256]
+# name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
+DIAG_VARIANT_SETS = {
+    "A": {  # WGS attribution: weight stream / x stream / wgmma / decode, producer stall timers
+        "main": MAIN_DEFINES,
+        "wgs_dbg": {"defines": MAIN_DEFINES + ("-DOKC_DEBUG=1",), "shapes": _WGS_SHAPES},
+        "wgs_nox": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=16",), "shapes": _WGS_SHAPES},
+        "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
+        "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
+        "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "B": {  # tiny builds: early slot release (WSER), ring depth, timelines
+        "main": {"defines": MAIN_DEFINES, "shapes": [8, 16]},
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_wser": {"defines": TINY_DEFINES + ("-DOKC_WSER=1",), "shapes": [1]},
+        "tiny_dbg": {"defines": TINY_DEFINES + ("-DOKC_DEBUG=1",), "shapes": [1]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "mid": {"defines": MID_DEFINES, "shapes": [8, 16]},
+        "mid_wser": {"defines": MID_DEFINES + ("-DOKC_WSER=1",), "shapes": [8, 16]},
+        "mid_ns4": {"defines": MID_DEFINES + ("-DOKC_NS=4",), "shapes": [8, 16]},
+        "mid_dbg": {"defines": MID_DEFINES + ("-DOKC_DEBUG=1",), "shapes": [16]},
+    },
+}
+DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8, 16]
+DIAG_SEED = 1234
+DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
+DIAG_BW_MODES = (8, 16, 17, 19, 24)
 
 
 ALT_SRCS = {}
@@ -4133,8 +4221,24 @@ def prepare(weights):
     for d in (TINY_DEFINES, TINY2_DEFINES, MID_DEFINES):
         if d and (state["sfx"] or "-DOKC_WGS=1" not in tuple(d)):  # the WGS build needs the PRMT scale decode
             mods.append(tuple(d) + state["sfx"])
-    for d in mods:
-        _ext(d)
+    extra = []
+    if DIAG:  # the diagnostic variants compile alongside (one pool; nvcc runs in subprocesses); a variant that fails
+        for v in DIAG_VARIANTS.values():  # to build only loses its column
+            d = tuple(v["defines"] if isinstance(v, dict) else v) + state["sfx"]
+            if d not in mods and d not in extra:
+                extra.append(d)
+
+    def _build(d):
+        try:
+            _ext(d)
+        except Exception as ex:
+            if d in mods:
+                raise
+            print(f"[diag] variant {d} failed to build: {str(ex)[-300:]}", flush=True)
+
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(_build, mods + extra))
     torch.cuda.synchronize()
     if DIAG:
         _diag(state, weights)
@@ -4262,6 +4366,8 @@ def _diag_bw(state):
 
 
 def _diag(state, weights):
+    """Untimed development table (DIAG): every variant in DIAG_VARIANTS is compiled (concurrently), checked against the
+    shipped build on the same input (relative L2) and timed as a CUDA graph replay with a cold L2, per shape."""
     import time
     dev = weights["w13"].device
     t0 = time.time()
@@ -4270,43 +4376,62 @@ def _diag(state, weights):
             _diag_bw(state)
         except Exception as ex:  # diagnostics must never break the run
             print(f"[diag-bw] failed: {ex}", flush=True)
-    shapes = [1, 16, 32, 8, 128, 256]
-    variants = {"main": tuple(MAIN_DEFINES)}
-    variants.update(DIAG_VARIANTS)
+    sfx = state.get("sfx", ())
+    shapes = list(DIAG_SHAPES)
+    variants = {}  # name -> (defines, shapes)
+    for name, v in DIAG_VARIANTS.items():
+        if isinstance(v, dict):
+            variants[name] = (tuple(v["defines"]) + sfx, list(v.get("shapes") or shapes))
+        else:
+            variants[name] = (tuple(v) + sfx, shapes)
     # compile the variants concurrently (separate extension dirs; nvcc runs in subprocesses)
     import concurrent.futures
+    todo = []
+    for d, _ in variants.values():
+        if d not in todo and (d + (("-DOKC_DQ7=1",) if DQ7 and "-DOKC_DQ7=1" not in d else ())) not in _EXTS:
+            todo.append(d)
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(_ext, [d for d in variants.values() if tuple(d) not in _EXTS]))
-    print(f"[diag] compiled {len(variants)} variants in {time.time() - t0:.0f}s", flush=True)
-    lines = []
+        list(ex.map(_ext, todo))
+    print(f"[diag] compiled {len(todo)} extra variants in {time.time() - t0:.0f}s", flush=True)
     for bs in shapes:
-        d = _gen_input(bs, 1234 + bs, dev)
+        d = _gen_input(bs, DIAG_SEED + bs, dev)
         ids = d["topk_ids"]
         touched = int(torch.unique(ids[(ids >= 0) & (ids < 32)]).numel())
+        ref = kernel_fn(d, state)  # the shipped policy's output for this input
+        torch.cuda.synchronize()
         row = [f"bs={bs:3d} touched={touched:2d}"]
-        for name, defs in variants.items():
-            ext = _ext(defs)
-            x = d["hidden_states"]
-            idt = ids.to(torch.int32).contiguous()
-            tw = d["topk_weights"].float().contiguous()
-            out = torch.empty((bs, 4096), dtype=torch.bfloat16, device=dev)
+        for name, (defs, vshapes) in variants.items():
+            if bs not in vshapes:
+                continue
+            try:
+                ext = _ext(defs)
+                x = d["hidden_states"]
+                idt = ids.to(torch.int32).contiguous()
+                tw = d["topk_weights"].float().contiguous()
+                out = torch.empty((bs, 4096), dtype=torch.bfloat16, device=dev)
 
-            def fn():
-                ext.okc_run(state["w"], state["scratch"], x, idt, tw, out, 0, 32, state["grid"])
+                def fn():
+                    ext.okc_run(state["w"], state["scratch"], x, idt, tw, out, 0, 32, state["grid"])
 
-            med, mn = _time_graph(fn)
-            row.append(f"{name}: {med:7.1f}us ({touched * 28.31 / med:4.2f} TB/s)")
-        lines.append("  ".join(row))
-        print("[diag] " + lines[-1], flush=True)
-    # timeline of the main variant with debug timestamps
-    for dbgname in [k for k, v in variants.items() if "-DOKC_DEBUG=1" in v]:
-        ext = _ext(variants[dbgname])
+                fn()
+                torch.cuda.synchronize()
+                err = float((out.float() - ref.float()).norm() / ref.float().norm().clamp(min=1e-20))
+                med, mn = _time_graph(fn)
+                row.append(f"{name}: {med:7.1f}us ({touched * 28.31 / med:4.2f} TB/s, min {mn:6.1f}, err {err:.1e})")
+            except Exception as ex:
+                row.append(f"{name}: FAILED {str(ex)[:80]}")
+                torch.cuda.synchronize()
+        print("[diag] " + "  ".join(row), flush=True)
+    # timeline of the debug variants (-DOKC_DEBUG=1): per-CTA %globaltimer stamps, min-max over CTAs
+    for dbgname in [k for k, (v, _) in variants.items() if "-DOKC_DEBUG=1" in v]:
+        defs, vshapes = variants[dbgname]
+        ext = _ext(defs)
         G = state["grid"]
         dbg = torch.zeros(G * 8 + G * 8 * 4, dtype=torch.int64, device=dev)
         sc = list(state["scratch"]) + [dbg]
-        names = ["start", "routed", "A done", "B done", "barrier", "final"]
-        for bs in shapes:
-            d = _gen_input(bs, 1234 + bs, dev)
+        names = ["start", "routed", "A done", "B done", "barrier", "final", "ranges", "gathered"]
+        for bs in vshapes:
+            d = _gen_input(bs, DIAG_SEED + bs, dev)
             x = d["hidden_states"]
             idt = d["topk_ids"].to(torch.int32).contiguous()
             tw = d["topk_weights"].float().contiguous()
@@ -4325,5 +4450,10 @@ def _diag(state, weights):
                 col = tt[:, k][tt[:, k] > 0]
                 if col.numel():
                     parts.append(f"{n} {(col.min() - t00) / 1000:.1f}-{(col.max() - t00) / 1000:.1f}")
+            if "-DOKC_WGS=1" in defs:  # producer stall counters (us): x gating phase A / B, phase-B stalls > 0.5 us, x-ring empty, weight-ring empty
+                xs_ = dbg[G * 8:G * 12].view(G, 4).cpu().double() / 1000
+                ws_ = dbg[G * 12:G * 13].cpu().double() / 1000
+                parts.append(f"xgateA mean/max {xs_[:, 0].mean():.1f}/{xs_[:, 0].max():.1f}  xgateB {xs_[:, 1].mean():.1f}/{xs_[:, 1].max():.1f}"
+                             f" (stalls {xs_[:, 2].mean() * 1000:.0f}/{xs_[:, 2].max() * 1000:.0f})  xring {xs_[:, 3].mean():.1f}/{xs_[:, 3].max():.1f}  wring {ws_.mean():.1f}/{ws_.max():.1f}")
             print(f"[diag] timeline {dbgname} bs={bs}: " + "  ".join(parts), flush=True)
     print(f"[diag] total {time.time() - t0:.0f}s", flush=True)
