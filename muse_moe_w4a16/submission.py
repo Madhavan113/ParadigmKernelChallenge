@@ -2954,7 +2954,8 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
   __syncwarp();
 #endif
 #if OKC_WGSEARLY
-  asm volatile("bar.sync 8, 64;\n" ::: "memory");  // ranges ready: both producers go (the x stages wait on xready)
+  asm volatile("bar.arrive 9, %0;\n" ::"n"(NT + 32) : "memory");  // ranges ready for the consumers (they sync after the gather)
+  asm volatile("bar.sync 8, 64;\n" ::: "memory");                 // ranges ready: both producers go (the x stages wait on xready)
 #else
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
 #endif
@@ -3742,7 +3743,7 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   if (tid == 0) wgs_ranges(p, S);
 #endif
 #if OKC_WGSEARLY
-  CTA_SYNC();
+  asm volatile("bar.sync 9, %0;\n" ::"n"(NT + 32) : "memory");  // the x producer's stage ranges (S.wgr, cost prefix) are written
 #else
   WS_JOIN();
 #endif
@@ -4428,7 +4429,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "E"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "F"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 DIAG_VARIANT_SETS = {
@@ -4439,6 +4440,11 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "F": {  # WGS early producer start (fixed consumer/range sync), bs32/128/256
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "wgs_early_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSEARLY=1", "-DOKC_DEBUG=1", "-DOKC_WGSDBG=1"), "shapes": _WGS_SHAPES},
+        "wgs_early": {"defines": MAIN_DEFINES + ("-DOKC_WGSEARLY=1",), "shapes": _WGS_SHAPES},
     },
     "E": {  # WSDYN cause split (pool off / chunked claims / late slot release) + WGS early producer start
         "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
@@ -4483,7 +4489,7 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else _WGS_SHAPES if DIAG_SET == "D" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else _WGS_SHAPES if DIAG_SET in ("D", "F") else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
