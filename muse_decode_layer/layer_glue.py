@@ -275,12 +275,14 @@ def _bnd1_selftest(st):
         _boundary1[(T,)](a.view(1, T, HIDDEN), 1, T, s, st["gate1"], st["gate1"], st["g_preffn"], s1r, hr, num_warps=16)
         pooled_r, logits_r = bfp_fused_pooler_router(hr, st["bfp"])
         torch.cuda.synchronize()
+        # h itself lives only in the launch's shared memory (the global x buffer is not written): judged through the
+        # pooler / router outputs computed from it, against the plain launch on _boundary1's h
         errs = [float((x.float() - y.float()).norm() / max(1e-6, float(y.float().norm())))
-                for x, y in ((s1, s1r), (h, hr), (pooled, pooled_r), (logits, logits_r))]
+                for x, y in ((s1, s1r), (pooled, pooled_r), (logits, logits_r))]
         report.append((T, errs))
         if not all(e < 2e-3 for e in errs):
-            print(f"boundary-1 prologue T{T}: MISMATCH rel err s1 {errs[0]:.2e} h {errs[1]:.2e} pooled {errs[2]:.2e} "
-                  f"logits {errs[3]:.2e}", flush=True)
+            print(f"boundary-1 prologue T{T}: MISMATCH rel err s1 {errs[0]:.2e} pooled {errs[1]:.2e} "
+                  f"logits {errs[2]:.2e}", flush=True)
             return
     print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
     st["fuse_bnd1_ok"] = True
