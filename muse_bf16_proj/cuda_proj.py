@@ -3432,8 +3432,6 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
         else TORCH_CHECK(false, "g12: DIAG is instantiated for the delayed-release variant only"); \
         launched = true; }
     G12_CASE(2, 1, 1, 4, 4)
-    G12_CASE(2, 1, 1, 4, 3)
-    G12_CASE(2, 1, 1, 3, 3)
     G12_CASE(1, 1, 1, 4, 4)
 #undef G12_CASE
     TORCH_CHECK(launched, "g12: unsupported config (rb, tb, ck, nsw, nsx)");

@@ -3978,8 +3978,6 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
         else TORCH_CHECK(false, "g12: DIAG is instantiated for the delayed-release variant only"); \
         launched = true; }
     G12_CASE(2, 1, 1, 4, 4)
-    G12_CASE(2, 1, 1, 4, 3)
-    G12_CASE(2, 1, 1, 3, 3)
     G12_CASE(1, 1, 1, 4, 4)
 #undef G12_CASE
     TORCH_CHECK(launched, "g12: unsupported config (rb, tb, ck, nsw, nsx)");
@@ -4306,9 +4304,9 @@ TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 3, 3), ("pooler", 4096, 16): (16,
 _TB12_ON = False   # set by prepare() after the tb12 self-test (table output + probe rows) passes
 # g12: the wgmma 12-bit GEMM for m = 128 / 256 (RB x TB warpgroups of 64 rows x 128 tokens, K split ks, PDL reduce + escapes):
 # (layer, n, m) -> (rb, tb, ck, nsw, nsx, ks); dispatched only after the prepare self-test (_WG12_ON)
-WG12_SHAPES = {("pooler", 4096, 128): (2, 1, 1, 4, 4, 4)}   # judged in phase-2 check 5 (self-tested in prepare): GEMM-only 19.6 vs cuBLAS 23.3
+WG12_SHAPES = {}   # dormant: judged pooler m=128 29.0 us vs cuBLAS 24.6 (phase-2 check 9bd074da); best bench rows only tie cuBLAS (RB=1: pooler 24.6, unpooler 19.8, o 4.7, qkv 15.1 vs 14.1)
 _WG12_ON = False
-G12_LAYOUTS = {(128, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)
+G12_LAYOUTS = {(128, 1), (64, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)
 T12_LAYOUTS = {(16, 4)}   # (r, ck) weight layouts kept in state (the bench sweeps them)
 T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
 T12_INTERP = False   # CPU-interpreter mode (fp32 dot over widened bit patterns); never on the GPU
@@ -4755,7 +4753,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 200
 BENCH_STREAM = False  # STEP 1: bulk-copy stream sweep
 BENCH_T12 = False     # STEP 2: tb12 rows

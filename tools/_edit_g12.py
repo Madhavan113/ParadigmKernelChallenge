@@ -317,8 +317,6 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
         else TORCH_CHECK(false, "g12: DIAG is instantiated for the delayed-release variant only"); \
         launched = true; }
     G12_CASE(2, 1, 1, 4, 4)
-    G12_CASE(2, 1, 1, 4, 3)
-    G12_CASE(2, 1, 1, 3, 3)
     G12_CASE(1, 1, 1, 4, 4)
 #undef G12_CASE
     TORCH_CHECK(launched, "g12: unsupported config (rb, tb, ck, nsw, nsx)");
@@ -401,7 +399,7 @@ if "WG12_SHAPES" not in t:
         "# (layer, n, m) -> (rb, tb, ck, nsw, nsx, ks); dispatched only after the prepare self-test (_WG12_ON)\n"
         "WG12_SHAPES = {}\n"
         "_WG12_ON = False\n"
-        "G12_LAYOUTS = {(128, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)\n")
+        "G12_LAYOUTS = {(128, 1), (64, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)\n")
     rep("    if _TB12_ON and (layer, n, m) in TB12_SHAPES:\n",
         "    if _WG12_ON and (layer, n, m) in WG12_SHAPES:\n        rb, tb, ck, nsw, nsx, ks = WG12_SHAPES[(layer, n, m)]\n"
         "        return dict(wg12=True, rb=rb, tb=tb, ck=ck, nsw=nsw, nsx=nsx, ks=ks)\n"
