@@ -1,4 +1,33 @@
 // == BEGIN t12 host ==
+// x tensor map for the t12d kernel: 2D bf16 [m rows][K], box [8*nt rows][64 k], 128B swizzle, OOB rows zero-filled
+typedef CUresult (*okc_encode_fn)(CUtensorMap*, CUtensorMapDataType, cuuint32_t, void*, const cuuint64_t*, const cuuint64_t*,
+                                  const cuuint32_t*, const cuuint32_t*, CUtensorMapInterleave, CUtensorMapSwizzle,
+                                  CUtensorMapL2promotion, CUtensorMapFloatOOBfill);
+static okc_encode_fn okc_get_encode()
+{
+    static okc_encode_fn fn = nullptr;
+    if (!fn) {
+        void* ptr = nullptr;
+        cudaDriverEntryPointQueryResult q;
+        const cudaError_t e = cudaGetDriverEntryPointByVersion("cuTensorMapEncodeTiled", &ptr, 12000, cudaEnableDefault, &q);
+        TORCH_CHECK(e == cudaSuccess && ptr != nullptr && q == cudaDriverEntryPointSuccess, "t12d: cuTensorMapEncodeTiled unavailable");
+        fn = reinterpret_cast<okc_encode_fn>(ptr);
+    }
+    return fn;
+}
+static CUtensorMap okc_x_map(const void* x, int m, int K, int ldx, int box_rows)
+{
+    CUtensorMap map;
+    cuuint64_t dims[2] = {(cuuint64_t)K, (cuuint64_t)m};
+    cuuint64_t strides[1] = {(cuuint64_t)ldx * 2};
+    cuuint32_t box[2] = {64u, (cuuint32_t)box_rows};
+    cuuint32_t estr[2] = {1u, 1u};
+    const CUresult r = okc_get_encode()(&map, CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, 2, const_cast<void*>(x), dims, strides, box, estr,
+                                        CU_TENSOR_MAP_INTERLEAVE_NONE, CU_TENSOR_MAP_SWIZZLE_128B, CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+                                        CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
+    TORCH_CHECK(r == CUDA_SUCCESS, "t12d: cuTensorMapEncodeTiled failed: ", (int)r);
+    return map;
+}
 void bstream(torch::Tensor buf, torch::Tensor out, int64_t grid, int64_t nst, int64_t sb, bool bulk, int64_t smem_alloc)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
@@ -46,27 +75,37 @@ void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
 #define T12C_CASE(R_, C_, W_, SW_, SX_, NT_) \
     if (variant == 3 && r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && !diag_on) { \
         launch_t12c<R_, C_, W_, SW_, SX_, NT_, false>(Xp, ldx, m, Wp, (int)eb, etp, op, ldo, (int)n, (int)k, dg, stream); return; }
-#define T12C_CASE_D(R_, C_, W_, SW_, SX_, NT_) \
-    if (variant == 3 && r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && diag_on) { \
-        launch_t12c<R_, C_, W_, SW_, SX_, NT_, true>(Xp, ldx, m, Wp, (int)eb, etp, op, ldo, (int)n, (int)k, dg, stream); return; }
+#define T12D_CASE(R_, C_, W_, SW_, SX_, NT_) \
+    if (variant == 4 && r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && !diag_on) { \
+        launch_t12d<R_, C_, W_, SW_, SX_, NT_, false>(xmap, m, Wp, (int)eb, etp, op, ldo, (int)n, (int)k, dg, stream); return; }
+#define T12D_CASE_D(R_, C_, W_, SW_, SX_, NT_) \
+    if (variant == 4 && r == R_ && ck == C_ && w == W_ && nsw == SW_ && nsx == SX_ && nt == NT_ && diag_on) { \
+        launch_t12d<R_, C_, W_, SW_, SX_, NT_, true>(xmap, m, Wp, (int)eb, etp, op, ldo, (int)n, (int)k, dg, stream); return; }
 #define T12C_NT(R_, C_, W_, SW_, SX_) T12C_CASE(R_, C_, W_, SW_, SX_, 1) T12C_CASE(R_, C_, W_, SW_, SX_, 2) T12C_CASE(R_, C_, W_, SW_, SX_, 4)
-#define T12C_NTD(R_, C_, W_, SW_, SX_) T12C_CASE_D(R_, C_, W_, SW_, SX_, 1) T12C_CASE_D(R_, C_, W_, SW_, SX_, 2) T12C_CASE_D(R_, C_, W_, SW_, SX_, 4)
-    T12C_NT(32, 4, 8, 4, 2)
-    T12C_NT(32, 4, 8, 5, 2)
-    T12C_NT(32, 4, 8, 6, 2)
+#define T12D_NT(R_, C_, W_, SW_, SX_) T12D_CASE(R_, C_, W_, SW_, SX_, 1) T12D_CASE(R_, C_, W_, SW_, SX_, 2) T12D_CASE(R_, C_, W_, SW_, SX_, 4)
+#define T12D_NTD(R_, C_, W_, SW_, SX_) T12D_CASE_D(R_, C_, W_, SW_, SX_, 1) T12D_CASE_D(R_, C_, W_, SW_, SX_, 2) T12D_CASE_D(R_, C_, W_, SW_, SX_, 4)
+    CUtensorMap xmap;
+    if (variant == 4) xmap = okc_x_map(X.data_ptr(), m, (int)k, ldx, 8 * (int)nt);
     T12C_NT(32, 4, 8, 5, 3)
-    T12C_NT(32, 2, 8, 8, 3)
-    T12C_NT(32, 2, 8, 12, 3)
-    T12C_NT(16, 4, 8, 4, 2)
-    T12C_NT(16, 4, 4, 4, 2)
-    T12C_NT(16, 4, 4, 6, 2)
-    T12C_NT(16, 2, 4, 8, 3)
-    T12C_NTD(32, 4, 8, 5, 2)
-    T12C_NTD(16, 4, 8, 4, 2)
+    T12D_NT(32, 4, 8, 4, 3)
+    T12D_NT(32, 4, 8, 5, 3)
+    T12D_NT(32, 4, 8, 6, 3)
+    T12D_NT(32, 4, 8, 4, 4)
+    T12D_NT(32, 2, 8, 8, 4)
+    T12D_NT(32, 2, 8, 8, 6)
+    T12D_NT(32, 2, 8, 12, 4)
+    T12D_NT(16, 4, 8, 4, 3)
+    T12D_NT(16, 4, 4, 4, 3)
+    T12D_NT(16, 2, 4, 8, 4)
+    T12D_NT(16, 2, 4, 6, 6)
+    T12D_NTD(32, 4, 8, 5, 3)
+    T12D_NTD(16, 4, 8, 4, 3)
 #undef T12C_NT
-#undef T12C_NTD
+#undef T12D_NT
+#undef T12D_NTD
 #undef T12C_CASE
-#undef T12C_CASE_D
+#undef T12D_CASE
+#undef T12D_CASE_D
     TORCH_CHECK(false, "t12: unsupported config (r, ck, w, nsw, nsx, nt, diag)");
 }
 // == END t12 host ==
