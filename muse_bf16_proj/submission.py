@@ -60,6 +60,7 @@ CUDA_SRC = r"""
 #include <c10/cuda/CUDAException.h>
 #include <cuda_bf16.h>
 #include <stdint.h>
+#include <cstdio>
 
 __device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
   uint4 r;
@@ -1004,18 +1005,24 @@ __device__ __forceinline__ void sk2_wait_dbg(uint32_t bar, uint32_t parity) {
 #ifndef SK2_DIAG
 #define SK2_DIAG 0
 #endif
+// PDL (programmatic dependent launch) for the sk2 launches: 0 = off (plain launches); N > 0 = launch with programmatic
+// stream serialization and issue the first N weight stages before griddepcontrol.wait (set by sk2_set_pdl). Only the
+// decode layer sets it (there the previous kernel in the stream produces x); standalone scoring runs with 0.
+static int g_sk2_pdl = 0;
+void sk2_set_pdl(int64_t n) { g_sk2_pdl = (int)n; }
 // ============================================================================ sk2 (m <= 32): swapped operands
 // A = x tile (16 tokens x 16 k; ldmatrix from the TMA-loaded, 128B-swizzled tile), B = weights (8 rows x 16 k),
 // decoded to registers from the 12-bit stream (BF16 hi + lo for the router).  Each CTA owns R rows over the whole
 // K: no cross-CTA reduction.  Warps split the CTA's rows (NWR x NT n8 tiles) and, inside every stage, K (WSK).
 // A stage = UPS 64-k units: x tiles [UPS][TOKR rows x 128 B] (TMA, rows >= M zero-filled) + this CTA's weights.
 template <int MT, int TOKR, int NT, int NWR, int WSK, int UPW, int NSTAGE, bool COMP, bool HL, int NACC, int CL, typename OutT,
-          bool PK>
+          bool PK, bool FUSE>
 __global__ void __launch_bounds__((NWR * WSK + 1 + (COMP ? (NSTAGE >= 4 ? 4 : NSTAGE) : 1)) * 32, 1)
 sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__ Ws,
            const __nv_bfloat16* __restrict__ x, OutT* __restrict__ out,
            const int2* __restrict__ ptab, int pmax, uint32_t base4, int M, int N, int K, int dg,
-           unsigned long long* __restrict__ dbg) {
+           unsigned long long* __restrict__ dbg, const uint8_t* __restrict__ Wsr, float* __restrict__ outr,
+           float* __restrict__ part, int* __restrict__ rcnt, int pdl) {
 #if __CUDA_ARCH__ >= 900
   const int dgv = SK2_DIAG ? dg : 0;   // diagnostics (dg) compiled out of production builds
   auto gtime = []() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; };
@@ -1069,6 +1076,17 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   // stage-major weight stream: [stage][row block][...] (at any moment all CTAs read one contiguous region)
   const uint8_t* wsrc = Ws + (size_t)cta * WBY;
   const size_t wstride = (size_t)(gridDim.x / CL) * WBY;
+  // FUSE (pooler + router in one launch): after its pooler stages every CTA streams one router piece: 8 router rows
+  // (tile rt = cta / 4) over one quarter of K (rq = cta % 4), from the router's own stage-major hi|lo stream
+  // ([16 stages][32 tiles][8 warps][2048 B]); 4 more stages through the same ring
+  constexpr int NSTR = FUSE ? 4 : 0;
+  constexpr int WBYR = NW * 2048;
+  static_assert(!FUSE || (COMP && CL == 1 && UPW == 1 && UPS == 8 && WBYR <= WBY), "sk2 fused: pooler-like config only");
+  const int rt = cta >> 2, rq = cta & 3;
+  const uint8_t* wsr = FUSE ? Wsr + (size_t)rt * WBYR : nullptr;
+  const int nstt = nst + NSTR;
+  // stages issued by the prologue: 1, or under PDL up to pdl (CL == 1 only; never past this CTA's own stages)
+  const int P = (CL == 1 && pdl > 0) ? min(pdl, min(NSTAGE, nst)) : 1;
 
   if (tid == 0) {
     // stage 0 first of all (the first bytes' latency is the ramp of the whole kernel): the weight copy needs only
@@ -1078,6 +1096,8 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     asm volatile("prefetch.tensormap [%0];" :: "l"(&xmap) : "memory");
     SK2_DLY_SEED_SET();
     mbar_init(full0, 1);
+    if constexpr (CL == 1)   // PDL: the first P stages' weights go out before the wait; their barriers first
+      for (int i = 1; i < P; ++i) mbar_init(full0 + 8 * i, 1);
     if constexpr (CL > 1) {
       mbar_init(empty0, NW + (COMP ? NESC : 0));
       for (int i = 1; i < NSTAGE; ++i) { mbar_init(full0 + 8 * i, 1); mbar_init(empty0 + 8 * i, NW + (COMP ? NESC : 0)); }
@@ -1087,9 +1107,15 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       if (crank == 0) mbar_expect_tx(qbar, (CL - 1) * NC * MT * NT * 16);
     }
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
-    mbar_expect_tx(full0, ((dgv & 4) ? 0 : XBYr) + WBY);
-    bulk_g2s(sbase + XBY, wsrc + (size_t)gs0 * wstride, WBY, full0);
-    if (!(dgv & 4)) tma_load_3d(sbase, &xmap, full0, 0, 0, gs0 * UPS);
+    // weights never depend on the previous kernel: under PDL (pdl > 0) they stream while it finishes; x (its output)
+    // only after griddepcontrol.wait (a no-op when the launch has no programmatic dependency)
+    for (int st = 0; st < P; ++st) {
+      mbar_expect_tx(full0 + 8 * st, ((dgv & 4) ? 0 : XBYr) + WBY);
+      bulk_g2s(sbase + st * SST + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * st);
+    }
+    if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (!(dgv & 4))
+      for (int st = 0; st < P; ++st) tma_load_3d(sbase + st * SST, &xmap, full0 + 8 * st, 0, 0, (gs0 + st) * UPS);
     if (COMP) {   // this CTA's escape table
       if constexpr (CL == 1) {
         mbar_init(pbar, 1);
@@ -1100,7 +1126,10 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     }
     if constexpr (CL == 1) {
       mbar_init(empty0, NW + (COMP ? NESC : 0));
-      for (int i = 1; i < NSTAGE; ++i) { mbar_init(full0 + 8 * i, 1); mbar_init(empty0 + 8 * i, NW + (COMP ? NESC : 0)); }
+      for (int i = 1; i < NSTAGE; ++i) {
+        if (i >= P) mbar_init(full0 + 8 * i, 1);
+        mbar_init(empty0 + 8 * i, NW + (COMP ? NESC : 0));
+      }
       if (!COMP) mbar_init(pbar, 1);
       mbar_init(cbar, 32 * NESC);
       mbar_init(qbar, 1);
@@ -1111,19 +1140,27 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   // local barriers are all this CTA needs to start streaming; the cluster barrier (rank 0's qbar initialized before
   // ranks > 0 send into it) is only arrived at here and waited on right before the remote stores
   __syncthreads();
+  if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");   // every thread: x and the outputs are ours from here
   if constexpr (CL > 1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");   // inits fenced above
 
   if (warp == NW) {
     // producer warp: lane 0 refills the ring
     if (lane == 0) {
-      for (int st = 1; st < nst; ++st) {
+      for (int st = P; st < nstt; ++st) {
         const int slot = st % NSTAGE;
         if (st >= NSTAGE) SK2_WAIT(empty0 + 8 * slot, ((st / NSTAGE) - 1) & 1);
         if (trace) tr[16 + 3 * st] = gtime();
         const uint32_t s0 = sbase + slot * SST;
-        mbar_expect_tx(full0 + 8 * slot, ((dgv & 4) ? 0 : XBYr) + WBY);
-        bulk_g2s(s0 + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * slot);
-        if (!(dgv & 4)) tma_load_3d(s0, &xmap, full0 + 8 * slot, 0, 0, (gs0 + st) * UPS);
+        if (!FUSE || st < nst) {
+          mbar_expect_tx(full0 + 8 * slot, ((dgv & 4) ? 0 : XBYr) + WBY);
+          bulk_g2s(s0 + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * slot);
+          if (!(dgv & 4)) tma_load_3d(s0, &xmap, full0 + 8 * slot, 0, 0, (gs0 + st) * UPS);
+        } else {   // router piece: global router stage rq * 4 + j of tile rt
+          const int gsr = rq * NSTR + (st - nst);
+          mbar_expect_tx(full0 + 8 * slot, XBYr + WBYR);
+          bulk_g2s(s0 + XBY, wsr + (size_t)gsr * (32 * WBYR), WBYR, full0 + 8 * slot);
+          tma_load_3d(s0, &xmap, full0 + 8 * slot, 0, 0, gsr * UPS);
+        }
       }
     }
     __syncwarp();
@@ -1144,9 +1181,15 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       constexpr int KST = UPS * 64;
       const uint32_t bq = base4 & 0xFFu;
       int pe = 1;
-      for (int st = 0; st < nst; ++st) {
-        const int kbeg = (gs0 + st) * KST, kend = kbeg + KST;
+      for (int st = 0; st < nstt; ++st) {
         const int slot = st % NSTAGE;
+        if (FUSE && st >= nst) {   // router stages: nothing to correct, only the slot hand-back (in order, as below)
+          SK2_WAIT(full0 + 8 * slot, (st / NSTAGE) & 1);
+          __syncwarp();
+          if (lane == 0) mbar_arrive(empty0 + 8 * slot);   // every escape warp hands every stage back
+          continue;
+        }
+        const int kbeg = (gs0 + st) * KST, kend = kbeg + KST;
         // Every escape warp observes every stage, in order, works only on its own (st % NESC == ew), and hands EVERY
         // stage back (the empty barriers count NW + NESC arrivals). The producer therefore never refills a slot
         // before every escape warp has seen the stage it held, so no warp can find its slot two phases ahead (a
@@ -1288,6 +1331,84 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     }
     if (trace && warp == 0 && lane == 0) tr[16 + 3 * st + 2] = gtime();
   }
+  if (pdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the next kernel may start its prologue
+  if constexpr (FUSE) {
+    // router piece: 8 rows (one tile) over 4 stages of 8 units; hi and lo BF16 tiles into two FP32 accumulators
+    float accr[2][MT][4];
+#pragma unroll
+    for (int h = 0; h < 2; ++h)
+#pragma unroll
+      for (int mt = 0; mt < MT; ++mt) accr[h][mt][0] = accr[h][mt][1] = accr[h][mt][2] = accr[h][mt][3] = 0.f;
+    for (int st = nst; st < nstt; ++st) {
+      const int slot = st % NSTAGE;
+      mbar_wait(full0 + 8 * slot, (st / NSTAGE) & 1);
+      const uint32_t s0 = sbase + slot * SST;
+      const int ui = wk;
+      const uint32_t xt = s0 + ui * XU;
+      const uint32_t a0 = s0 + XBY + warp * 2048 + lane * 32;
+      uint32_t bh[8], bo[8];
+      asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(bh[0]), "=r"(bh[1]), "=r"(bh[2]), "=r"(bh[3]) : "r"(a0));
+      asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(bh[4]), "=r"(bh[5]), "=r"(bh[6]), "=r"(bh[7]) : "r"(a0 + 16));
+      asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(bo[0]), "=r"(bo[1]), "=r"(bo[2]), "=r"(bo[3]) : "r"(a0 + 1024));
+      asm volatile("ld.shared.v4.u32 {%0,%1,%2,%3}, [%4];" : "=r"(bo[4]), "=r"(bo[5]), "=r"(bo[6]), "=r"(bo[7]) : "r"(a0 + 1040));
+      uint32_t a[4][MT][4];
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt)
+          ldsm_x4((PK && trow[mt] >= M) ? zrow
+                      : xt + trow[mt] * 128 + (((2 * j + chi) ^ ((ui * Mb + trow[mt]) & 7)) << 4),
+                  a[j][mt][0], a[j][mt][1], a[j][mt][2], a[j][mt][3]);
+      __syncwarp();
+      if (lane == 0) mbar_arrive(empty0 + 8 * slot);
+#pragma unroll
+      for (int j = 0; j < 4; ++j)
+#pragma unroll
+        for (int mt = 0; mt < MT; ++mt) {
+          mma_bf16(accr[0][mt], a[j][mt][0], a[j][mt][1], a[j][mt][2], a[j][mt][3], bh[2 * j], bh[2 * j + 1]);
+          mma_bf16(accr[1][mt], a[j][mt][0], a[j][mt][1], a[j][mt][2], a[j][mt][3], bo[2 * j], bo[2 * j + 1]);
+        }
+    }
+    // k-warp reduction of the 8 x TOKS piece through the (now idle) ring: redr[wk][tok][8]
+    if constexpr (COMP) mbar_wait(cbar, 0);   // the escape warps are done with the ring too
+    named_bar(1, NC);
+    float* redr = reinterpret_cast<float*>(gbase);
+#pragma unroll
+    for (int mt = 0; mt < MT; ++mt) {
+      const int row = 2 * t4, tok = mt * 16 + g;
+      redr[(wk * TOKS + tok) * 8 + row] = accr[0][mt][0] + accr[1][mt][0];
+      redr[(wk * TOKS + tok) * 8 + row + 1] = accr[0][mt][1] + accr[1][mt][1];
+      redr[(wk * TOKS + tok + 8) * 8 + row] = accr[0][mt][2] + accr[1][mt][2];
+      redr[(wk * TOKS + tok + 8) * 8 + row + 1] = accr[0][mt][3] + accr[1][mt][3];
+    }
+    named_bar(1, NC);
+    // this CTA's quarter-K partial -> part[rt][rq][TOKS][8]; the last of the 4 quarters (release/acquire counter)
+    // adds them in quarter order (deterministic) and writes the router output
+    float* pp = part + ((size_t)rt * 4 + rq) * 32 * 8;
+    for (int i = tid; i < TOKS * 8; i += NC) {
+      float v = 0.f;
+#pragma unroll
+      for (int w = 0; w < WSK; ++w) v += redr[(w * TOKS + (i >> 3)) * 8 + (i & 7)];
+      __stcg(pp + i, v);
+    }
+    named_bar(1, NC);
+    __shared__ int s_rlast;
+    if (tid == 0) {
+      int old;
+      asm volatile("atom.add.release.gpu.global.s32 %0, [%1], 1;" : "=r"(old) : "l"(rcnt + rt) : "memory");
+      s_rlast = (old & 3) == 3;
+      if (s_rlast) asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    }
+    named_bar(1, NC);
+    if (s_rlast) {
+      const float* pr = part + (size_t)rt * 4 * 32 * 8;
+      for (int i = tid; i < M * 8; i += NC) {
+        const float v = __ldcg(pr + i) + __ldcg(pr + 256 + i) + __ldcg(pr + 512 + i) + __ldcg(pr + 768 + i);
+        outr[(size_t)(i >> 3) * 256 + rt * 8 + (i & 7)] = v;
+      }
+    }
+    named_bar(1, NC);   // the ring (redr) is reused by the pooler epilogue below
+  }
   if (trace && lane == 0) tr[1 + warp] = gtime();   // per consumer warp: main loop done
 
   // ---------------- epilogue: K-warps reduce through shared memory (the ring is free now)
@@ -1318,11 +1439,14 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
           for (int c = 1; c < NACC; ++c) v[e] += acc[c][mt][nt][e];
         }
         if (COMP && wk == 0) {
-          v[0] += corr[tok * CP + row];
-          v[1] += corr[tok * CP + row + 1];
-          if (tok + 8 < 32) {
-            v[2] += corr[(tok + 8) * CP + row];
-            v[3] += corr[(tok + 8) * CP + row + 1];
+#pragma unroll
+          for (int c = 0; c < NESC; ++c) {
+            v[0] += corr[c * CSZ + tok * CP + row];
+            v[1] += corr[c * CSZ + tok * CP + row + 1];
+            if (tok + 8 < TOKS) {
+              v[2] += corr[c * CSZ + (tok + 8) * CP + row];
+              v[3] += corr[c * CSZ + (tok + 8) * CP + row + 1];
+            }
           }
         }
         const uint32_t a0 = peer_r + (uint32_t)(((wk * TOKS + tok) * RP + row) * 4);
@@ -1410,9 +1534,11 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
 #endif
 }
 
-template <int MT, int TOKR, int NT, int NWR, int WSK, int UPW, int NSTAGE, bool COMP, bool HL, int NACC, int CL, typename OutT>
+template <int MT, int TOKR, int NT, int NWR, int WSK, int UPW, int NSTAGE, bool COMP, bool HL, int NACC, int CL, typename OutT,
+          bool FUSE = false>
 static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& out, const at::Tensor& ptab,
-                       int64_t pmax, int64_t base4, int M, int N, int K, int64_t dg, unsigned long long* dbg) {
+                       int64_t pmax, int64_t base4, int M, int N, int K, int64_t dg, unsigned long long* dbg,
+                       const uint8_t* wsr = nullptr, float* outr = nullptr, float* part = nullptr, int* rcnt = nullptr) {
   constexpr int NW = NWR * WSK;
   constexpr int R = NWR * NT * 8;
   constexpr int UPS = WSK * UPW;
@@ -1428,7 +1554,7 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
                       (CL > 1 ? (size_t)(CL - 1) * WSK * TOKS * RP * 4 : 0) + (size_t)pmax * 8 + 128;
   auto go = [&](auto pkc) {
     constexpr bool PK = decltype(pkc)::value;
-    auto kern = sk2_kernel<MT, TOKR, NT, NWR, WSK, UPW, NSTAGE, COMP, HL, NACC, CL, OutT, PK>;
+    auto kern = sk2_kernel<MT, TOKR, NT, NWR, WSK, UPW, NSTAGE, COMP, HL, NACC, CL, OutT, PK, FUSE>;
     static bool attr_done = false;
     if (!attr_done) {
       int dev = 0, optin = 0;
@@ -1444,27 +1570,46 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
     const __nv_bfloat16* xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
     OutT* op = reinterpret_cast<OutT*>(out.data_ptr());
     const int2* tp = reinterpret_cast<const int2*>(ptab.data_ptr());
-    if constexpr (CL > 1) {
+    const int pdl = g_sk2_pdl;
+    if (CL > 1 || pdl > 0) {
       cudaLaunchConfig_t lc = {};
       lc.gridDim = dim3(N / R * CL);
       lc.blockDim = dim3((NW + 1 + NESC) * 32);
       lc.dynamicSmemBytes = smem;
       lc.stream = at::cuda::getCurrentCUDAStream();
-      cudaLaunchAttribute at_[1];
-      at_[0].id = cudaLaunchAttributeClusterDimension;
-      at_[0].val.clusterDim.x = CL;
-      at_[0].val.clusterDim.y = 1;
-      at_[0].val.clusterDim.z = 1;
+      cudaLaunchAttribute at_[2];
+      int na = 0;
+      if (CL > 1) {
+        at_[na].id = cudaLaunchAttributeClusterDimension;
+        at_[na].val.clusterDim.x = CL;
+        at_[na].val.clusterDim.y = 1;
+        at_[na].val.clusterDim.z = 1;
+        ++na;
+      }
+      if (pdl > 0) {   // programmatic dependent launch: may start while the previous kernel in the stream finishes
+        at_[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+        at_[na].val.programmaticStreamSerializationAllowed = 1;
+        ++na;
+      }
       lc.attrs = at_;
-      lc.numAttrs = 1;
-      C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kern, xm, wsp, xp, op, tp, (int)pmax, (uint32_t)base4, M, N, K, (int)dg, dbg));
+      lc.numAttrs = na;
+      C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kern, xm, wsp, xp, op, tp, (int)pmax, (uint32_t)base4, M, N, K, (int)dg, dbg,
+                                        wsr, outr, part, rcnt, pdl));
     } else {
       kern<<<N / R, (NW + 1 + NESC) * 32, smem, at::cuda::getCurrentCUDAStream()>>>(xm, wsp, xp, op, tp, (int)pmax,
-                                                                               (uint32_t)base4, M, N, K, (int)dg, dbg);
+                                                                               (uint32_t)base4, M, N, K, (int)dg, dbg,
+                                                                               wsr, outr, part, rcnt, 0);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
   };
   if (TOKR == 8 || M < TOKR) go(std::true_type{}); else go(std::false_type{});
+}
+
+// fused pooler + router (decode layer): the `pooler` config streams its pooler rows, then one router piece per CTA
+void sk2f(at::Tensor Ws, at::Tensor Wsr, at::Tensor x, at::Tensor out, at::Tensor outr, at::Tensor ptab, int64_t pmax,
+          int64_t base4, at::Tensor part, at::Tensor rcnt, int64_t M, int64_t tokr) {
+  @@SK2F_DISPATCH@@
+  TORCH_CHECK(false, "sk2f: no config");
 }
 
 void sk2(at::Tensor Ws, at::Tensor x, at::Tensor out, at::Tensor ptab, int64_t pmax, int64_t base4,
@@ -1874,6 +2019,9 @@ void gq(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t M, int64_t 
         int64_t cl, int64_t nstage);
 void sk2(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor ptab, int64_t pmax, int64_t base4,
          int64_t M, int64_t N, int64_t K, int64_t cfg, int64_t tokr, int64_t dg, torch::Tensor dbgt);
+void sk2f(torch::Tensor Ws, torch::Tensor Wsr, torch::Tensor x, torch::Tensor out, torch::Tensor outr, torch::Tensor ptab,
+          int64_t pmax, int64_t base4, torch::Tensor part, torch::Tensor rcnt, int64_t M, int64_t tokr);
+void sk2_set_pdl(int64_t n);
 void rgemv(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t M);
 void sgemv(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t N);
 void cgemv(torch::Tensor L, torch::Tensor C, torch::Tensor x, torch::Tensor etab, int64_t pmax, torch::Tensor out, int64_t base4, int64_t rows, int64_t nth);
@@ -2277,9 +2425,12 @@ GQX_SRC = r"""
 // ============================================================================ gqx (m 33..256): BF16 weights, big tiles
 // CTA = BM = 64 NWG weight rows x BN tokens over 1/CL of K; a cluster of CL CTAs covers all of K for one row block.
 // Ring of TMA'd W [BM x 64] and x [BN x 64] tiles (128B swizzle) fed by a producer warp; warpgroup w runs SS-wgmma
-// m64nBN on rows [64w, 64w + 64). Reduction: after every rank's main loop (cluster barrier: every ring is free), each
-// rank owns BN/CL tokens; every thread st.async's the other ranks' token blocks of its accumulator fragment into the
-// owner's ring space ([src rank][thread][4 JR floats]) and sums the CL-1 incoming copies of its own block.
+// m64nBN on rows [64w, 64w + 64). Reduction (CL > 1): after its main loop every rank parks its accumulator fragments
+// in its own, drained ring ([token block][thread] float4) and arrives on a cluster barrier; rank r owns token blocks
+// [r NB / CL, (r+1) NB / CL): it sums the other ranks' copies over DSMEM, stages BF16 [token][BM rows] behind the
+// fragments and writes each token's BM rows as contiguous 16-byte chunks; a last cluster barrier keeps every rank's
+// fragments alive until all remote reads are done. Bigger BM (NWG 2..4) with deeper K splits (CL up to 8) cuts the x
+// bytes every SM has to ingest (x is re-read per row block: at BM = 64 it is twice the weight traffic at m = 128).
 template <int BN, int NWG, int NSTAGE, int CL>
 __global__ void __launch_bounds__(NWG * 128 + 32, 1)
 gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUtensorMap mapX,
@@ -2293,17 +2444,17 @@ gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
   constexpr int NTH = NWG * 128;
   constexpr int NB = BN / 8;                 // 8-token blocks of the tile; rank r owns blocks [r NB / CL, (r+1) NB / CL)
   constexpr int JM = (NB + CL - 1) / CL;     // most blocks a rank owns
+  constexpr int FRAG_BYTES = CL > 1 ? NB * NTH * 16 : 0;
   static_assert(CL <= NB, "gqx: every rank owns at least one token block");
-  static_assert(((NB + CL - 1) / CL) * 8 * BM * 2 <= NSTAGE * ST, "gqx: the BF16 staging tile must fit in the ring");
+  static_assert(FRAG_BYTES + JM * 8 * BM * 2 <= NSTAGE * ST, "gqx: fragments + BF16 staging tile must fit in the ring");
   extern __shared__ __align__(1024) unsigned char smem_raw[];
   const uint32_t sraw = (uint32_t)__cvta_generic_to_shared(smem_raw);
   const uint32_t sbase = (sraw + 1023u) & ~1023u;
   unsigned char* gbase = smem_raw + (sbase - sraw);
   const uint32_t bars = sbase + NSTAGE * ST;
-  const uint32_t full0 = bars, empty0 = bars + 8 * NSTAGE, rbar = bars + 16 * NSTAGE;
-  // CL > 1: this rank's accumulator fragments [NB][NTH] float4, outside the ring (written right after the main loop)
-  float4* frag = reinterpret_cast<float4*>(gbase + NSTAGE * ST + 16 * NSTAGE + 16);
-  float* recv = reinterpret_cast<float*>(gbase);   // [CL][NTH][4 JM] (the ring, once every rank is done with it)
+  const uint32_t full0 = bars, empty0 = bars + 8 * NSTAGE;
+  float4* frag = reinterpret_cast<float4*>(gbase);                              // [NB][NTH] (the ring, once drained)
+  __nv_bfloat16* stg = reinterpret_cast<__nv_bfloat16*>(gbase + FRAG_BYTES);   // [owned tokens][BM rows]
   const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
   uint32_t crank = 0;
   if constexpr (CL > 1) asm volatile("mov.u32 %0, %%cluster_ctarank;" : "=r"(crank));
@@ -2315,8 +2466,6 @@ gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
 
   if (tid == 0) {
     for (int i = 0; i < NSTAGE; ++i) { mbar_init(full0 + 8 * i, 1); mbar_init(empty0 + 8 * i, NWG); }
-    mbar_init(rbar, 1);
-
     asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"(&mapW) : "memory");
     asm volatile("prefetch.tensormap [%0];" :: "l"(&mapX) : "memory");
@@ -2329,7 +2478,7 @@ gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
   }
   __syncthreads();
 
-  if (warp == NWG * 4) {   // producer: refills; then joins the cluster barrier
+  if (warp == NWG * 4) {   // producer: refills; then joins the cluster barriers
     if (lane == 0) {
       for (int i = NSTAGE; i < nkb; ++i) {
         const int slot = i % NSTAGE;
@@ -2375,45 +2524,44 @@ gqx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
   const int g = lane >> 2, t4 = lane & 3;
   const int row0 = rb * BM + wg * 64 + (warp & 3) * 16 + g;
   if constexpr (CL > 1) {
-    // 1) fragments out right away (own area: no need to wait for the other ranks' main loops), 2) one cluster
-    // barrier, 3) the owner of each token block sums the other ranks' copies over DSMEM, stages BF16 [token][64 rows]
-    // in its own (free) ring and 4) writes each token's 64 rows as 128 contiguous bytes; 5) exit barrier
+    // 1) every warpgroup is done reading the ring; fragments go in (own area: the other ranks' main loops need not be
+    // over), 2) cluster barrier, 3) the owner of each token block sums the other ranks' copies over DSMEM (its own
+    // copy comes back from shared memory: a runtime block index cannot address the accumulator registers), stages
+    // BF16 [token][BM rows] behind the fragments and 4) writes each token's BM rows as contiguous 16-byte chunks;
+    // 5) exit barrier
+    if constexpr (NWG > 1) named_bar(1, NTH);
 #pragma unroll
     for (int j = 0; j < NB; ++j) frag[j * NTH + tid] = make_float4(acc[4 * j], acc[4 * j + 1], acc[4 * j + 2], acc[4 * j + 3]);
     asm volatile("barrier.cluster.arrive.release.aligned;\n\tbarrier.cluster.wait.acquire.aligned;" ::: "memory");
-    const uint32_t fl = (uint32_t)__cvta_generic_to_shared(frag);
-    __nv_bfloat16* stg = reinterpret_cast<__nv_bfloat16*>(gbase);   // [owned tokens][BM rows]
     const int jlo = ((int)crank * NB) / CL, jhi = (((int)crank + 1) * NB) / CL;
     const int rl = wg * 64 + (warp & 3) * 16 + g;   // this thread's first row within the tile
+    const uint32_t fl = (uint32_t)__cvta_generic_to_shared(frag + tid);
+    uint32_t ra[CL];
 #pragma unroll
-    for (int r = 0; r < CL; ++r) {
-      if (r != (int)crank) continue;
+    for (int r2 = 0; r2 < CL; ++r2)
+      asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra[r2]) : "r"(fl), "r"(r2));
+    for (int j = jlo; j < jhi; ++j) {
+      float4 v = frag[j * NTH + tid];
+      float4 pv[CL];
 #pragma unroll
-      for (int j = 0; j < NB; ++j) {
-        if (j < (r * NB) / CL || j >= ((r + 1) * NB) / CL) continue;
-        float4 pv[CL];
-#pragma unroll
-        for (int r2 = 0; r2 < CL; ++r2) {
-          if (r2 == r) continue;
-          uint32_t ra;
-          asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(ra) : "r"(fl + (uint32_t)((j * NTH + tid) * 16)), "r"(r2));
-          asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];"
-                       : "=f"(pv[r2].x), "=f"(pv[r2].y), "=f"(pv[r2].z), "=f"(pv[r2].w) : "r"(ra) : "memory");
-        }
-        float v0 = acc[4 * j], v1 = acc[4 * j + 1], v2 = acc[4 * j + 2], v3 = acc[4 * j + 3];
-#pragma unroll
-        for (int r2 = 0; r2 < CL; ++r2) {
-          if (r2 == r) continue;
-          v0 += pv[r2].x; v1 += pv[r2].y; v2 += pv[r2].z; v3 += pv[r2].w;
-        }
-        const int tl = 8 * (j - (r * NB) / CL) + 2 * t4;   // token within the owned slice
-        stg[tl * BM + rl] = __float2bfloat16_rn(v0);
-        stg[tl * BM + rl + 8] = __float2bfloat16_rn(v2);
-        stg[(tl + 1) * BM + rl] = __float2bfloat16_rn(v1);
-        stg[(tl + 1) * BM + rl + 8] = __float2bfloat16_rn(v3);
+      for (int r2 = 0; r2 < CL; ++r2) {
+        if (r2 == (int)crank) continue;
+        asm volatile("ld.shared::cluster.v4.f32 {%0,%1,%2,%3}, [%4];"
+                     : "=f"(pv[r2].x), "=f"(pv[r2].y), "=f"(pv[r2].z), "=f"(pv[r2].w)
+                     : "r"(ra[r2] + (uint32_t)(j * NTH * 16)) : "memory");
       }
+#pragma unroll
+      for (int r2 = 0; r2 < CL; ++r2) {
+        if (r2 == (int)crank) continue;
+        v.x += pv[r2].x; v.y += pv[r2].y; v.z += pv[r2].z; v.w += pv[r2].w;
+      }
+      const int tl = 8 * (j - jlo) + 2 * t4;   // token within the owned slice
+      stg[tl * BM + rl] = __float2bfloat16_rn(v.x);
+      stg[tl * BM + rl + 8] = __float2bfloat16_rn(v.z);
+      stg[(tl + 1) * BM + rl] = __float2bfloat16_rn(v.y);
+      stg[(tl + 1) * BM + rl + 8] = __float2bfloat16_rn(v.w);
     }
-    named_bar(1, NTH);
+    named_bar(2, NTH);
     {
       constexpr int CH = BM / 8;                 // 16-byte chunks per token row
       const int nt = 8 * (jhi - jlo);
@@ -2448,17 +2596,9 @@ template <int BN, int NWG, int NSTAGE, int CL>
 static void launch_gqx(const at::Tensor& W, const at::Tensor& x, at::Tensor& out, int M, int N, int K) {
   constexpr int BM = NWG * 64;
   constexpr int ST = BM * 128 + BN * 128;
-  const size_t smem = 1024 + (size_t)NSTAGE * ST + 16 * NSTAGE + 16 + (CL > 1 ? (size_t)(BN / 8) * NWG * 128 * 16 : 0);
+  const size_t smem = 1024 + (size_t)NSTAGE * ST + 16 * NSTAGE + 16;
   auto kern = gqx_kernel<BN, NWG, NSTAGE, CL>;
-  static bool attr_done = false;
-  if (!attr_done) {
-    cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem);
-    if (CL > 8) cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
-    attr_done = true;
-  }
-  CUtensorMap mW = make_map_2d(W.data_ptr(), (uint64_t)W.size(0), (uint64_t)W.size(1), BM);
-  CUtensorMap mX = make_map_2d(x.data_ptr(), (uint64_t)M, (uint64_t)K, (uint32_t)(M < BN ? M : BN));
-  __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  TORCH_CHECK(N % BM == 0, "gqx: N % BM");
   cudaLaunchConfig_t lc = {};
   lc.gridDim = dim3(N / BM * CL);
   lc.blockDim = dim3(NWG * 128 + 32);
@@ -2471,6 +2611,21 @@ static void launch_gqx(const at::Tensor& W, const at::Tensor& x, at::Tensor& out
   at_[0].val.clusterDim.z = 1;
   lc.attrs = at_;
   lc.numAttrs = 1;
+  static bool attr_done = false;
+  if (!attr_done) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    if (CL > 8) cudaFuncSetAttribute(kern, cudaFuncAttributeNonPortableClusterSizeAllowed, 1);
+    // how many clusters the GPU holds at once (GPC packing): a grid beyond it runs in two waves
+    int ncl = -1;
+    cudaOccupancyMaxActiveClusters(&ncl, kern, &lc);
+    cudaGetLastError();
+    fprintf(stderr, "[okc] gqx<bn %d, nwg %d, ns %d, cl %d>: smem %d, max active clusters %d, grid clusters %d\n",
+            BN, NWG, NSTAGE, CL, (int)smem, ncl, N / BM);
+    attr_done = true;
+  }
+  CUtensorMap mW = make_map_2d(W.data_ptr(), (uint64_t)W.size(0), (uint64_t)W.size(1), BM);
+  CUtensorMap mX = make_map_2d(x.data_ptr(), (uint64_t)M, (uint64_t)K, (uint32_t)(M < BN ? M : BN));
+  __nv_bfloat16* op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kern, mW, mX, op, M, N, K));
 }
 
@@ -2481,8 +2636,29 @@ void gqx(at::Tensor W, at::Tensor x, at::Tensor out, int64_t M, int64_t N, int64
 }
 """
 
-GQX_CONFIGS = {  # (layer, bn) -> (nwg, cl, nstage): grid = N / (64 nwg) * cl CTAs
-    ("qkv_gate", 128): (1, 3, 8),   # m 33..128: 36 row blocks x 3 K-thirds = 108 CTAs (cuBLAS 16.4 -> 14.0 us at m=128)
+# (layer, bn) -> [(nwg, cl, nstage), ...]: BM = 64 nwg rows per CTA, grid = N / BM * cl CTAs (cl-CTA clusters split K);
+# every entry is a candidate the autotuner times against cuBLAS (and gq / torchT / CUTLASS where present).
+# Bytes each SM ingests = W (BM x K/cl x 2) + x (BN x K/cl x 2): at BM = 64 the x re-reads are 2x the weights (m = 128),
+# so wider row blocks with deeper K splits (DSMEM reduce) cut the per-SM traffic; cl <= 8 (portable cluster size).
+GQX_CONFIGS = {
+    # judged (run f3e50d8b, raw graph replay us): qkv m128 (1,3,8) 17.9 | (2,6,6) 29.0 (18 clusters of 6 > 17 active: second
+    # wave) | (3,8,5) 21.8; pooler m128 gq(1,2,8) 24.5 | (2,4,6) 37.3 (32 > 30: wave) | (4,8,4) 43.6 (16 > 15: wave);
+    # unpooler m128 torchT 22.6 | (2,2,6) 24.6 | (4,4,4) 42.1 (wave); o m128 torchT 10.4 | (2,2,6) 10.5 | (1,1,8) 12.8;
+    # m256: qkv (1,3,5) 24.2 vs torch 22.8; pooler (2,4,4) 49 / (2,2,4) 56 vs cutlass 31; unpooler (2,2,4) 32 vs 27.3;
+    # o (2,2,4) 13.3 / (1,1,5) 16.6 vs 12.4. Max active clusters (smem ~200 KB): cl2 66, cl3 39, cl4 30, cl6 17, cl8 15.
+    ("qkv_gate", 128): [(1, 3, 8),    # v141: 36 row blocks x 3 = 108 CTAs
+                        (2, 5, 6),    # 18 x 5 = 90 CTAs (cl 5 capacity unknown: printed)
+                        (2, 4, 6)],   # 18 x 4 = 72 CTAs
+    ("qkv_gate", 256): [(1, 3, 5)],
+    ("pooler", 128): [(2, 3, 6),      # 32 x 3 = 96 CTAs, 32 clusters <= 39
+                      (1, 2, 8)],     # gq's geometry through the gqx epilogue (fragments via DSMEM vs gq's st.async)
+    ("pooler", 256): [(1, 2, 5)],     # 64 x 2 = 128 CTAs, NWG 1 (NWG 2 at BN 256 ran at 35% of peak)
+    ("unpooler", 128): [(1, 1, 8),    # 128 CTAs, no cluster
+                        (2, 2, 6),    # 128 CTAs (24.6 vs torchT 22.6)
+                        (4, 3, 4)],   # 32 x 3 = 96 CTAs
+    ("unpooler", 256): [(1, 1, 5)],   # 128 CTAs, no cluster
+    ("o", 128): [(2, 2, 6)],          # tie with torchT
+    ("o", 256): [(2, 2, 4)],
 }
 USE_GQX = True
 TORCHT_LAYERS = ("unpooler", "o")   # layers that also get a K-major BF16 copy for the "torchT" (mm(x, W^T)) route
@@ -2493,9 +2669,10 @@ def _gqx_src(sm90):
         return ('void gqx(at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, '
                 'int64_t) { TORCH_CHECK(false, "gqx needs sm_90"); }')
     lines = []
-    for (layer, bn), (nwg, cl, ns) in sorted(GQX_CONFIGS.items()):
-        lines.append(f"if (bn == {bn} && nwg == {nwg} && cl == {cl} && nstage == {ns}) "
-                     f"{{ launch_gqx<{bn}, {nwg}, {ns}, {cl}>(W, x, out, M, N, K); return; }}")
+    for (layer, bn), cfgs in sorted(GQX_CONFIGS.items()):
+        for nwg, cl, ns in cfgs:
+            lines.append(f"if (bn == {bn} && nwg == {nwg} && cl == {cl} && nstage == {ns}) "
+                         f"{{ launch_gqx<{bn}, {nwg}, {ns}, {cl}>(W, x, out, M, N, K); return; }}")
     return GQX_SRC.replace("@@GQX_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
 
 
@@ -2503,8 +2680,8 @@ def _gqx_bn(m):
     return 128 if m <= 128 else 256
 
 
-def _run_gqx(x, layer, m, n, k, state):
-    nwg, cl, ns = GQX_CONFIGS[(layer, _gqx_bn(m))]
+def _run_gqx(x, layer, m, n, k, state, idx=0):
+    nwg, cl, ns = GQX_CONFIGS[(layer, _gqx_bn(m))][idx]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     _get_ext().gqx(state["raw"][layer], x, out, m, n, k, _gqx_bn(m), nwg, cl, ns)
     return out
@@ -3051,10 +3228,11 @@ def _get_ext():
         cuda_src = (common + defs + _tma_srcs(sm90) + MAP_SRC + _gemm_src(sm90) + _wide_src(sm90) + _sk2_src(sm90)
                     + _gq_src(sm90) + _gqx_src(sm90) + RGEMV_SRC + _rk_src(sm90))
         _ext = load_inline(
-            name=f"okc_bf16proj_v141_{arch}" + (f"_dly{_SK2_DELAY}" if _SK2_DELAY else ""),
+            name=f"okc_bf16proj_v142_{arch}" + (f"_dly{_SK2_DELAY}" if _SK2_DELAY else ""),
             cpp_sources="#include <torch/extension.h>\n" + CPP_SRC,
             cuda_sources=cuda_src,
-            functions=["skinny_tma_a", "gemm90", "wide", "sk2", "gq", "gqx", "rgemv", "sgemv", "cgemv", "rk"],
+            functions=["skinny_tma_a", "gemm90", "wide", "sk2", "gq", "gqx", "rgemv", "sgemv", "cgemv", "rk", "sk2f",
+                       "sk2_set_pdl"],
             extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}"] + ([f"-DSK2_DELAY_ESC={_SK2_DELAY}"] if _SK2_DELAY else []),
             no_implicit_headers=True,
             verbose=False,
@@ -3338,7 +3516,21 @@ SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC, CL
     ('qkv8t_r144', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),         # tokr8 [0.969 vs 0.979]
     ('qkv16t_r200', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),        # tokr16 [0.985 vs 0.994]
     ('o16t_r68', 'o', 8192, 32, 2, 2, 1, 4, 2, 1),                  # tokr16 [0.937 vs 0.957]
+    # cluster-of-2 variants (autotuned against the picks above; x bytes per SM halve, weight bytes unchanged)
+    ('qkv32c2a', 'qkv_gate', 2304, 48, 3, 2, 4, 1, 1, 2),           # 48 x 2 = 96 CTAs, 8 consumer warps, 256 k/stage
+    ('qkv32c2b', 'qkv_gate', 2304, 48, 3, 2, 2, 2, 1, 2),           # 96 CTAs, 4 consumer warps, 256 k/stage
+    ('pooler32c2', 'pooler', 4096, 64, 4, 2, 2, 2, 1, 2),           # 64 x 2 = 128 CTAs
+    ('pooler16c2', 'pooler', 4096, 64, 4, 2, 2, 4, 1, 2),           # tokr16: 128 CTAs, 512 k/stage
+    ('unpooler32c2', 'unpooler', 8192, 128, 4, 4, 1, 4, 1, 2),      # 64 x 2 = 128 CTAs, 4 consumer warps (no K split inside)
+    # the decode layer's fused pooler + router launch (sk2f, FUSE): pooler rows then one router piece per CTA through the
+    # same ring; its stream is built like any other config, the kernel is instantiated only with FUSE
+    ('pooler', 'pooler', 4096, 32, 4, 1, 8, 1, 2, 1),
 ]
+SK2_FUSED_CONFIG = 'pooler'   # the config sk2f runs (NT 4, WSK 8, UPW 1: 8 consumer warps = the router piece's 8 K-units)
+SK2_ALT = {  # (layer, tokr) -> alternative config names the autotuner times against SK2_PICK's
+    # judged (run f3e50d8b, raw us): qkv32c2a 17.7 / qkv32c2b 16.7 vs qkv32_r208 14.4; pooler32c2 22.1 vs 19.1;
+    # pooler16c2 20.5 vs 18.0; unpooler32c2 21.8 vs 18.5: halving the x bytes per SM never paid for the cluster epilogue
+}
 SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
     ('o', 16): 'o16t_r68',
@@ -3396,22 +3588,91 @@ def _sk2_geom(cfg, tokr):
     return hl, nstage
 
 
+DIAG_SK2 = True   # measurement runs: compile the sk2 diagnostics in and time the dg modes from prepare (see _diag_sk2)
+DIAG_SK2_SHAPES = [("pooler", 8), ("pooler", 16), ("pooler", 32), ("qkv_gate", 8), ("qkv_gate", 32), ("unpooler", 16),
+                   ("unpooler", 32), ("o", 16)]
+DIAG_SK2_MODES = [(0, "full"), (1, "no-epilogue"), (2, "no-compute"), (4, "no-x"), (6, "loads-only"), (8, "alu-not-mma"),
+                  (16, "no-ldmatrix")]
+
+
 def _sk2_src(sm90):
     if not sm90:
         return ('void sk2(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, '
-                'int64_t, int64_t, int64_t, at::Tensor) { TORCH_CHECK(false, "sk2 needs sm_90"); }')
+                'int64_t, int64_t, int64_t, at::Tensor) { TORCH_CHECK(false, "sk2 needs sm_90"); }\n'
+                'void sk2f(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, '
+                'at::Tensor, at::Tensor, int64_t, int64_t) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
+                'void sk2_set_pdl(int64_t) {}')
     lines = []
     for ci, cfg in enumerate(SK2_CONFIGS):
         name, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
         for tokr in (8, 16, 32):
-            if SK2_PICK.get((layer, tokr)) != name:
+            if SK2_PICK.get((layer, tokr)) != name and name not in SK2_ALT.get((layer, tokr), ()):
                 continue
             hl, nstage = _sk2_geom(cfg, tokr)
             mt = 2 if tokr == 32 else 1
             ot = "float" if hl else "__nv_bfloat16"
             lines.append(f"if (cfg == {ci} && tokr == {tokr}) {{ launch_sk2<{mt}, {tokr}, {NT}, {NWR}, {WSK}, {UPW}, {nstage}, "
                          f"{str(not hl).lower()}, {str(hl).lower()}, {1 if (mt == 2 and not hl and nstage >= 4 and NT == 4) else NACC}, {CL}, {ot}>(Ws, x, out, ptab, pmax, base4, M, N, K, dg, dbg); return; }}")
-    return SK2_SRC.replace("@@SK2_DISPATCH@@", "\n  ".join(lines))
+    flines = []   # fused pooler + router: the `pooler` config (NT 4, WSK 8, UPW 1) with FUSE, every tokr
+    for ci, cfg in enumerate(SK2_CONFIGS):
+        name, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
+        if name != SK2_FUSED_CONFIG:
+            continue
+        for tokr in (8, 16, 32):
+            hl, nstage = _sk2_geom(cfg, tokr)
+            mt = 2 if tokr == 32 else 1
+            nacc = 1 if (mt == 2 and nstage >= 4 and NT == 4) else NACC
+            flines.append(f"if (tokr == {tokr}) {{ launch_sk2<{mt}, {tokr}, {NT}, {NWR}, {WSK}, {UPW}, {nstage}, true, false, "
+                          f"{nacc}, 1, __nv_bfloat16, true>(Ws, x, out, ptab, pmax, base4, M, 4096, 8192, 0, nullptr, "
+                          f"reinterpret_cast<const uint8_t*>(Wsr.data_ptr()), outr.data_ptr<float>(), part.data_ptr<float>(), "
+                          f"rcnt.data_ptr<int>()); return; }}")
+    src = SK2_SRC.replace("@@SK2_DISPATCH@@", "\n  ".join(lines)).replace("@@SK2F_DISPATCH@@", "\n  ".join(flines))
+    if DIAG_SK2:
+        src = "#define SK2_DIAG 1\n" + src
+    return src
+
+
+def _diag_sk2(weights, state):
+    """Attribution of the sk2 kernels on this GPU: graph replays from a cold L2 (as the autotuner) of each dg mode."""
+    if not (DIAG_SK2 and state.get("sm90")):
+        return
+    dev = weights["o"].device
+    flush = torch.ones(64 * 1024 * 1024 // 1024, 1024, dtype=torch.float32, device=dev)
+    sink = torch.empty(1024, dtype=torch.float32, device=dev)
+    g = torch.Generator(device=dev)
+    g.manual_seed(999)
+    for layer, m in DIAG_SK2_SHAPES:
+        w = weights[layer]
+        n = 1024 if (layer == "unpooler" and m <= 8) else w.shape[0]
+        k = w.shape[1]
+        if _sk2_name(layer, m) not in state.get("sk2", {}):
+            continue
+        x = torch.randn(m, k, device=dev, generator=g).to(torch.bfloat16)
+        res = []
+        for dg, name in DIAG_SK2_MODES:
+            try:
+                _run_sk2(x, layer, m, n, k, state, dg=dg)
+                torch.cuda.synchronize()
+                gr = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(gr):
+                    _run_sk2(x, layer, m, n, k, state, dg=dg)
+                ts = []
+                for _ in range(12):
+                    torch.sum(flush, dim=0, out=sink)
+                    e0 = torch.cuda.Event(enable_timing=True)
+                    e1 = torch.cuda.Event(enable_timing=True)
+                    e0.record()
+                    gr.replay()
+                    e1.record()
+                    torch.cuda.synchronize()
+                    ts.append(e0.elapsed_time(e1) * 1000)
+                res.append(f"{name}={sorted(ts)[len(ts) // 2]:.1f}")
+                del gr
+            except RuntimeError as e:   # noqa: BLE001
+                res.append(f"{name}=ERR({str(e)[:40]})")
+        print(f"[okc] diag sk2 {layer} m={m} ({_sk2_name(layer, m)}): " + " ".join(res), file=sys.stderr)
+    del flush
+    torch.cuda.synchronize()
 
 
 def sk2_tileunits(w):
@@ -3628,12 +3889,38 @@ def sk2_prepare(weights, state):
     state.pop("sk2_bal", None)
 
 
-def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None):
-    name = _sk2_name(layer, m)
+def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None, name=None):
+    name = name or _sk2_name(layer, m)
     ci, stream, tab, pmax, b4, n_rows = state["sk2"][name]
     out = torch.empty((m, n), dtype=torch.float32 if layer == "router" else torch.bfloat16, device=x.device)
-    _get_ext().sk2(stream, x, out, tab, pmax, b4, m, n, k, ci, _sk2_tokr(m), dg, state["dummy"] if dbg is None else dbg)
+    ext = _get_ext()
+    ext.sk2_set_pdl(SK2_PDL)
+    ext.sk2(stream, x, out, tab, pmax, b4, m, n, k, ci, _sk2_tokr(m), dg, state["dummy"] if dbg is None else dbg)
     return out
+
+
+def fused_pooler_router(x, state):
+    """Pooler and router of one decode step in ONE launch (m <= 32, sm_90): x [m, 8192] bf16 ->
+    (pooler [m, 4096] bf16, router [m, 256] fp32). Same numerics as the separate sk2 kernels: 12-bit lossless pooler
+    weights with exact escape corrections, router as BF16 hi + lo with FP32 accumulation (quarter-K partials added in
+    a fixed order). Used by the decode layer (pooler and router read the same h back to back); standalone scoring
+    never calls it."""
+    m = x.shape[0]
+    assert m <= 32 and state.get("sm90") and SK2_FUSED_CONFIG in state["sk2"] and "router" in state["sk2"]
+    ci, stream, tab, pmax, b4, n_rows = state["sk2"][SK2_FUSED_CONFIG]
+    rstream = state["sk2"]["router"][1]
+    if "fused_part" not in state:
+        state["fused_part"] = torch.empty(32 * 4 * 32 * 8, dtype=torch.float32, device=x.device)
+        state["fused_cnt"] = torch.zeros(32, dtype=torch.int32, device=x.device)
+    out = torch.empty((m, 4096), dtype=torch.bfloat16, device=x.device)
+    outr = torch.empty((m, 256), dtype=torch.float32, device=x.device)
+    ext = _get_ext()
+    ext.sk2_set_pdl(SK2_PDL)
+    ext.sk2f(stream, rstream, x, out, outr, tab, pmax, b4, state["fused_part"], state["fused_cnt"], m, _sk2_tokr(m))
+    return out, outr
+
+
+SK2_PDL = 0   # decode layer: set to N > 0 for programmatic dependent launches (N weight stages before the wait); 0 here
 
 
 def _mt_key(m):
@@ -3775,6 +4062,7 @@ def prepare(weights):
         print(f"[okc] CUTLASS route off: {_cut_err}", file=sys.stderr)
     _selftest(weights, state)
     _autotune(weights, state)
+    _diag_sk2(weights, state)
     torch.cuda.empty_cache()
     return state
 
@@ -3815,6 +4103,17 @@ def _route_key(layer, m, route):
 SELFTEST_M = (1, 8, 16, 32, 33, 128, 200, 256)
 
 
+def _cand_key(layer, m, ch):
+    """The disable-set key of a candidate tuple (per config where a route has several)."""
+    if ch[0] == "skinny" and ch[2][0] == "alt":
+        return ("skinny_alt", layer, m)
+    if ch[0] == "gqx":
+        return (layer, "gqx", _gqx_bn(m), ch[1])
+    if ch[0] == "sk2" and len(ch) > 1:
+        return (layer, "sk2", ch[1], _sk2_tokr(m))
+    return _route_key(layer, m, ch[0])
+
+
 def _selftest(weights, state):
     """Run every custom path once on a random input against an FP64 reference; disable (-> cuBLAS) any path that
     does not match.  Guards against a kernel that misbehaves on a GPU this file was not tested on."""
@@ -3833,8 +4132,7 @@ def _selftest(weights, state):
             for ch in _candidates(layer, m, state):
                 if ch[0] == "torch":
                     continue
-                key = (("skinny_alt", layer, m) if (ch[0] == "skinny" and ch[2][0] == "alt")
-                       else _route_key(layer, m, ch[0]))
+                key = _cand_key(layer, m, ch)
                 try:
                     out = _run(ch, x, layer, m, nn, k, state).double()
                     torch.cuda.synchronize()
@@ -3845,6 +4143,25 @@ def _selftest(weights, state):
                 if not err < tol:
                     state["disabled"].add(key)
                     print(f"[okc] selftest {layer} m={m} {ch[0]}: rel err {err:.3e} -> disabled", file=sys.stderr)
+    # the fused pooler + router launch (decode layer only): both outputs against FP64, every token bucket
+    state["fused_ok"] = False
+    if state.get("sm90") and SK2_FUSED_CONFIG in state.get("sk2", {}) and "router" in state.get("sk2", {}):
+        try:
+            worst = 0.0
+            for m in (1, 8, 16, 32):
+                x = torch.randn(m, 8192, device=weights["pooler"].device, generator=g).to(torch.bfloat16)
+                out, outr = fused_pooler_router(x, state)
+                torch.cuda.synchronize()
+                ref = (x.double() @ weights["pooler"].double().T).to(torch.bfloat16).double()
+                refr = x.double() @ weights["router"].double().T
+                e1 = ((out.double() - ref).norm() / ref.norm()).item()
+                e2 = ((outr.double() - refr).norm() / refr.norm()).item()
+                worst = max(worst, e1 / 5e-3, e2 / 2e-5)
+            state["fused_ok"] = worst < 1.0
+            print(f"[okc] selftest fused pooler+router: worst err/tol {worst:.3f} -> {'ok' if state['fused_ok'] else 'FAIL'}",
+                  file=sys.stderr)
+        except RuntimeError as e:   # noqa: BLE001
+            print(f"[okc] selftest fused pooler+router: {str(e)[:200]}", file=sys.stderr)
 
 
 def _run_skinny(x, layer, m, n, k, state, cfg, tu_key, dg=0):
@@ -3905,13 +4222,13 @@ def _run(choice, x, layer, m, n, k, state):
     if kind == "wide":
         return _run_wide(x, layer, m, n, k, state)
     if kind == "sk2":
-        return _run_sk2(x, layer, m, n, k, state)
+        return _run_sk2(x, layer, m, n, k, state, name=choice[1] if len(choice) > 1 else None)
     if kind == "gemm":
         return _run_gemm(x, layer, m, n, k, state)
     if kind == "gq":
         return _run_gq(x, layer, m, n, k, state)
     if kind == "gqx":
-        return _run_gqx(x, layer, m, n, k, state)
+        return _run_gqx(x, layer, m, n, k, state, choice[1] if len(choice) > 1 else 0)
     if kind == "cgemv":   # m = 1: 12-bit compressed GEMV (qkv, o, unpooler slice, pooler)
         cg = state["cg"][layer]
         rows, nth = CG_CONFIGS[layer]
@@ -3978,12 +4295,17 @@ def _candidates(layer, m, state):
     if (m <= 32 and c[0][0] != "sk2" and _sk2_name(layer, m) in state.get("sk2", {})
             and _route_key(layer, m, "sk2") not in state["disabled"]):
         c.insert(0, ("sk2",))
+    if m <= 32:
+        for alt in SK2_ALT.get((layer, _sk2_tokr(m)), ()):
+            if alt in state.get("sk2", {}) and _cand_key(layer, m, ("sk2", alt)) not in state["disabled"]:
+                c.insert(0, ("sk2", alt))
     if (USE_GQ and state["sm90"] and 32 < m <= 256 and layer != "router" and (layer, _gq_bn(m)) in GQ_CONFIGS
             and _route_key(layer, m, "gq") not in state["disabled"]):
         c.insert(0, ("gq",))
-    if (USE_GQX and state["sm90"] and 32 < m <= 256 and layer != "router" and (layer, _gqx_bn(m)) in GQX_CONFIGS
-            and _route_key(layer, m, "gqx") not in state["disabled"]):
-        c.insert(0, ("gqx",))
+    if USE_GQX and state["sm90"] and 32 < m <= 256 and layer != "router":
+        for i in range(len(GQX_CONFIGS.get((layer, _gqx_bn(m)), ()))):
+            if _cand_key(layer, m, ("gqx", i)) not in state["disabled"]:
+                c.insert(0, ("gqx", i))
     if layer == "router" and m == 1 and "router_f32" in state:
         c.insert(0, ("rgemv",))
     if (USE_RK and layer == "router" and 32 < m <= 256 and state["sm90"] and "rk_zc" in state and state.get("nsm", 0) >= 16
@@ -4066,11 +4388,20 @@ def _autotune(weights, state):
     # one line per shape in the run's log: candidate times (us, raw graph replay incl. ~4 us replay cost) and the pick
     for layer, m, tl in state.get("tune_log", []):
         ch = state["choice"][(layer, m)]
-        desc = " ".join(f"{name}{'/' + 'x'.join(map(str, c[1])) if c[0] == 'skinny' else ''}={t}"
-                        for (name, t), c in zip(tl, _candidates(layer, m, state)))
-        pick = ch[0] + ("/" + "x".join(map(str, ch[1])) if ch[0] == "skinny" else "")
+        desc = " ".join(f"{_cand_name(c)}={t}" for (name, t), c in zip(tl, _candidates(layer, m, state)))
+        pick = _cand_name(ch)
         print(f"[okc] tune {layer} m={m}: {desc} -> {pick}", file=sys.stderr)
     print(f"[okc] disabled: {sorted(state['disabled'])}", file=sys.stderr)
+
+
+def _cand_name(c):
+    if c[0] == "skinny":
+        return c[0] + "/" + "x".join(map(str, c[1]))
+    if c[0] == "gqx" and len(c) > 1:
+        return f"gqx[{c[1]}]"
+    if c[0] == "sk2" and len(c) > 1:
+        return f"sk2/{c[1]}"
+    return c[0]
 
 
 def _nearby_choice(layer, m, state):
@@ -4092,6 +4423,8 @@ def _nearby_choice(layer, m, state):
         if ch is None:
             return None
     if ch[0] == "gq" and (layer, _gq_bn(m)) not in GQ_CONFIGS:
+        return None
+    if ch[0] == "gqx" and (layer, _gqx_bn(m)) not in GQX_CONFIGS:
         return None
     return ch
 
