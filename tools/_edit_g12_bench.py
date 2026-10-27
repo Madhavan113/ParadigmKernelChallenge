@@ -8,13 +8,22 @@ BODY = r'''    # == BEGIN g12 bench ==
         print("BENCH g12 rb/tb/ck/nsw/nsx/ks (wgmma 12-bit, K split + PDL reduce) vs current; '!' = fp32 rel err > 5e-3; 'g' = GEMM only (no reduce)")
         # (rb, tb, ck, nsw, nsx, ks); ks per layer: 128 CTAs (pooler 32 tiles x 4, qkv 18 x 8, unpooler/o 64 x 2); check e38ce861:
         # the wgmma path is correct; GEMM-only ties cuBLAS at pooler m=128 (23.1 vs 23.3) with the pipe drained per chunk
-        g12_cfgs = {128: [(2, 1, 1, 4, 4, 4), (2, 1, 1, 4, 3, 4), (2, 1, 1, 3, 4, 4), (2, 1, 1, 3, 3, 4), (2, 1, 1, 4, 4, 8), (2, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 4)],
+        g12_cfgs = {128: [(2, 1, 1, 4, 4, 4), (2, 1, 1, 4, 3, 4), (2, 1, 1, 3, 3, 4), (2, 1, 1, 4, 4, 8), (2, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 4)],
                     256: []}
         g12_ks = {"pooler": {4: 4, 8: 8, 2: 2}, "qkv_gate": {4: 8, 8: 16, 2: 4}, "unpooler": {4: 2, 8: 4, 2: 1}, "o": {4: 2, 8: 4, 2: 1}}
 
-        def g12cfg(c, layer, mode=0):
-            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=g12_ks[layer][c[5]], mode=mode)
+        def g12cfg(c, layer, mode=0, drain=0, rv=3):
+            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=g12_ks[layer][c[5]], mode=mode, drain=drain, rv=rv)
 
+        # check d3d8a686: the delayed release (drain=0) was wrong (rel err ~ 1.8e-2 * sqrt(chunks)) with the v2 reduce,
+        # and both reduces cost ~20 us: separate the two with a drain x reduce-version matrix on pooler m=128
+        c0_ = (2, 1, 1, 4, 4, 4)
+        parts = [row("current", "pooler", 128, 4096, None)]
+        for drain in (1, 0):
+            parts.append(row(f"g d{drain}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 2, drain)))
+            for rv in (1, 2, 3):
+                parts.append(row(f"d{drain} rv{rv}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 0, drain, rv)))
+        print("  m=128 pooler 2/1/1/4/4/ks4 drain x reduce: " + " | ".join(parts))
         for m in (128, 256):
             for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 8192), ("o", 8192)):
                 if not budget() or not g12_cfgs[m]:
@@ -23,10 +32,9 @@ BODY = r'''    # == BEGIN g12 bench ==
                 for c in g12_cfgs[m]:
                     if layer == "qkv_gate" and n % (64 * c[0]) != 0:
                         continue
-                    cc = g12cfg(c, layer)
-                    parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}", layer, m, n, cc))
-                    if c in (g12_cfgs[m][0], g12_cfgs[m][3]):
-                        parts.append(row("g", layer, m, n, g12cfg(c, layer, 2)))
+                    for drain in (1, 0):
+                        cc = g12cfg(c, layer, 0, drain)
+                        parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}/d{drain}", layer, m, n, cc))
                 print(f"  m={m} {layer:9s} n={n}: " + " | ".join(parts))
         dg = state["diag"]
         for layer, n, m, c in (("pooler", 4096, 128, (2, 1, 1, 4, 4, 4)), ("pooler", 4096, 128, (2, 1, 1, 3, 3, 4)), ("qkv_gate", 2304, 128, (2, 1, 1, 4, 4, 4)),

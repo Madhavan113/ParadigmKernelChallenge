@@ -3216,7 +3216,7 @@ __device__ __forceinline__ void wgmma_m64n128k16_rs(float* d, uint32_t a0, uint3
 __device__ __forceinline__ void acc_fence(float* d) {
     asm volatile("" : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3]), "+f"(d[4]), "+f"(d[5]), "+f"(d[6]), "+f"(d[7]), "+f"(d[8]), "+f"(d[9]), "+f"(d[10]), "+f"(d[11]), "+f"(d[12]), "+f"(d[13]), "+f"(d[14]), "+f"(d[15]), "+f"(d[16]), "+f"(d[17]), "+f"(d[18]), "+f"(d[19]), "+f"(d[20]), "+f"(d[21]), "+f"(d[22]), "+f"(d[23]), "+f"(d[24]), "+f"(d[25]), "+f"(d[26]), "+f"(d[27]), "+f"(d[28]), "+f"(d[29]), "+f"(d[30]), "+f"(d[31]), "+f"(d[32]), "+f"(d[33]), "+f"(d[34]), "+f"(d[35]), "+f"(d[36]), "+f"(d[37]), "+f"(d[38]), "+f"(d[39]), "+f"(d[40]), "+f"(d[41]), "+f"(d[42]), "+f"(d[43]), "+f"(d[44]), "+f"(d[45]), "+f"(d[46]), "+f"(d[47]), "+f"(d[48]), "+f"(d[49]), "+f"(d[50]), "+f"(d[51]), "+f"(d[52]), "+f"(d[53]), "+f"(d[54]), "+f"(d[55]), "+f"(d[56]), "+f"(d[57]), "+f"(d[58]), "+f"(d[59]), "+f"(d[60]), "+f"(d[61]), "+f"(d[62]), "+f"(d[63]) :: "memory");
 }
-template <int RB, int TB, int CK, int NSW, int NSX, bool DIAG>
+template <int RB, int TB, int CK, int NSW, int NSX, bool DIAG, bool DRAIN>
 __global__ void __launch_bounds__(128 * RB * TB, 1)
 g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __restrict__ Wt, int eb,
            float* __restrict__ part, int N, int K, unsigned long long* __restrict__ diag)
@@ -3276,12 +3276,21 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
     for (int c = 0; c < NC; ++c) {
         const int swi = c % NSW, sxi = c % NSX;
         __syncthreads();                                                // chunk c-1 fully consumed (wgmma waited below)
-        // delayed release: chunk c-2's wgmmas are complete (every warp passed two wait_group 1 steps of chunk c-1
-        // before this barrier), so its slots are refilled here; chunk c-1's wgmmas may still be in flight
-        if (c > 1 && tid == 0) {
-            if (c - 2 + NSX < NC) issue_x(c - 2 + NSX, (c - 2) % NSX);
-            if (c - 2 + NSW < NC) issue_w(c - 2 + NSW, (c - 2) % NSW);
+        // DRAIN: every wgmma of chunk c-1 was waited before this barrier -> refill its slots now (check e38ce861:
+        // correct). Else delayed release: chunk c-2's wgmmas are complete (every warp passed wait_group 1 at two
+        // steps of chunk c-1), so its slots are refilled; chunk c-1's last wgmma may still be in flight.
+        if constexpr (DRAIN) {
+            if (c > 0 && tid == 0) {
+                if (c - 1 + NSX < NC) issue_x(c - 1 + NSX, (c - 1) % NSX);
+                if (c - 1 + NSW < NC) issue_w(c - 1 + NSW, (c - 1) % NSW);
+            }
+        } else {
+            if (c > 1 && tid == 0) {
+                if (c - 2 + NSX < NC) issue_x(c - 2 + NSX, (c - 2) % NSX);
+                if (c - 2 + NSW < NC) issue_w(c - 2 + NSW, (c - 2) % NSW);
+            }
         }
+        acc_fence(acc);
         mbar_wait(smem_u32(&xfull[sxi]), (uint32_t)((c / NSX) & 1));
         mbar_wait(smem_u32(&full[swi]), (uint32_t)((c / NSW) & 1));
         if constexpr (DIAG) { if (c == 0) t1 = gtimer(); }
@@ -3317,6 +3326,12 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
                 }
             }
         }
+        if constexpr (DRAIN) {
+            wgmma_wait<0>();
+            reg_fence4(a[0][0], a[0][1], a[0][2], a[0][3]);
+            reg_fence4(a[1][0], a[1][1], a[1][2], a[1][3]);
+        }
+        acc_fence(acc);
     }
     wgmma_wait<0>();
     reg_fence4(a[0][0], a[0][1], a[0][2], a[0][3]);
@@ -3350,6 +3365,73 @@ g12_kernel(const __grid_constant__ CUtensorMap xmap, int m, const uint8_t* __res
 // (thread = (row, 8-token group); independent of the GEMM, before griddepcontrol.wait), then the K splits of
 // part[z][n][tok] (coalesced over tok), then bf16x2 row stores out[tok][n0 .. n0+16).
 constexpr int G12_RNL = 16;
+// v1 (check e38ce861, correct, ~18 us: serial dependent loads per thread, scattered 2 B stores): thread = (n, tok)
+__global__ void __launch_bounds__(256)
+g12_reduce1_kernel(const float* __restrict__ part, int KS, int m, int N,
+                   const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+                   const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
+{
+    const int n = blockIdx.x, tok = threadIdx.x;
+    if (tok >= m) return;
+    const int e0 = esc_roff[n], e1 = esc_roff[n + 1];
+    float ev = 0.f;
+    for (int e = e0; e < e1; ++e) ev += esc_d[e] * __bfloat162float(X[(size_t)tok * ldx + esc_k[e]]);
+    pdl_wait();
+    float sum = ev;
+    for (int zz = 0; zz < KS; ++zz) sum += __ldcg(part + ((size_t)zz * N + n) * m + tok);
+    out[(size_t)tok * ldo + n] = __float2bfloat16(sum);
+}
+// v3: v2's tile, but the partial reads are float4 with up to 8 loads in flight per thread (4 splits x 2 float4)
+__global__ void __launch_bounds__(256)
+g12_reduce3_kernel(const float* __restrict__ part, int KS, int m, int N,
+                   const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
+                   const __nv_bfloat16* __restrict__ X, int ldx, __nv_bfloat16* __restrict__ out, int ldo)
+{
+    __shared__ __align__(16) float acc[G12_RNL * 256];                  // [nl][tok] with row stride m (dense)
+    __shared__ int s_off[G12_RNL + 1];
+    const int n0 = blockIdx.x * G12_RNL, tid = threadIdx.x;
+    if (tid <= G12_RNL) s_off[tid] = esc_roff[n0 + tid];
+    for (int i = tid; i < G12_RNL * m; i += 256) acc[i] = 0.f;
+    __syncthreads();
+    {
+        const int nl = tid >> 4, tg = tid & 15;
+        for (int tg2 = tg; tg2 * 8 < m; tg2 += 16)
+            for (int e = s_off[nl]; e < s_off[nl + 1]; ++e) {
+                const int kk = esc_k[e];
+                const float d = esc_d[e];
+                #pragma unroll
+                for (int i = 0; i < 8; ++i) acc[nl * m + 8 * tg2 + i] += d * __bfloat162float(X[(size_t)(8 * tg2 + i) * ldx + kk]);
+            }
+    }
+    pdl_wait();
+    const int F4 = G12_RNL * m / 4;                                       // float4 per split tile (512 at m = 128)
+    for (int z0 = 0; z0 < KS; z0 += 4) {
+        float4 v[4][4];
+        #pragma unroll
+        for (int zi = 0; zi < 4; ++zi)
+            #pragma unroll
+            for (int j = 0; j < 4; ++j) {
+                const int f = tid + j * 256;
+                v[zi][j] = (z0 + zi < KS && f < F4) ? __ldcg(reinterpret_cast<const float4*>(part + ((size_t)(z0 + zi) * N + n0) * m) + f)
+                                                   : make_float4(0.f, 0.f, 0.f, 0.f);
+            }
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int f = tid + j * 256;
+            if (f < F4) {
+                float4 s = *reinterpret_cast<float4*>(acc + 4 * f);
+                #pragma unroll
+                for (int zi = 0; zi < 4; ++zi) { s.x += v[zi][j].x; s.y += v[zi][j].y; s.z += v[zi][j].z; s.w += v[zi][j].w; }
+                *reinterpret_cast<float4*>(acc + 4 * f) = s;
+            }
+        }
+    }
+    __syncthreads();
+    for (int i = tid; i < m * (G12_RNL / 2); i += 256) {
+        const int tok = i / (G12_RNL / 2), p = i % (G12_RNL / 2);
+        *reinterpret_cast<__nv_bfloat162*>(out + (size_t)tok * ldo + n0 + 2 * p) = __floats2bfloat162_rn(acc[(2 * p) * m + tok], acc[(2 * p + 1) * m + tok]);
+    }
+}
 __global__ void __launch_bounds__(256)
 g12_reduce_kernel(const float* __restrict__ part, int KS, int m, int N,
                   const int* __restrict__ esc_roff, const int* __restrict__ esc_k, const float* __restrict__ esc_d,
@@ -3394,14 +3476,14 @@ g12_reduce_kernel(const float* __restrict__ part, int KS, int m, int N,
 
 __host__ constexpr int g12_smem_bytes(int rb, int tb, int ck, int nsw, int nsx) { return 1024 + nsw * rb * 4 * ck * 3072 + nsx * (2 * ck) * (128 * tb) * 128; }
 
-template <int RB, int TB, int CK, int NSW, int NSX, bool DIAG>
+template <int RB, int TB, int CK, int NSW, int NSX, bool DIAG, bool DRAIN>
 void launch_g12(const CUtensorMap& xmap, int m, const uint8_t* Wt, int eb, float* part, int N, int K, int ks,
                 unsigned long long* diag, cudaStream_t stream)
 {
     constexpr int smem = g12_smem_bytes(RB, TB, CK, NSW, NSX);
     static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(g12_kernel<RB, TB, CK, NSW, NSX, DIAG>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
-    g12_kernel<RB, TB, CK, NSW, NSX, DIAG><<<dim3(N / (64 * RB), ks), 128 * RB * TB, smem, stream>>>(xmap, m, Wt, eb, part, N, K, diag);
+    if (!attr) { cudaFuncSetAttribute(g12_kernel<RB, TB, CK, NSW, NSX, DIAG, DRAIN>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    g12_kernel<RB, TB, CK, NSW, NSX, DIAG, DRAIN><<<dim3(N / (64 * RB), ks), 128 * RB * TB, smem, stream>>>(xmap, m, Wt, eb, part, N, K, diag);
 }
 // == END g12 device ==
 
@@ -3894,7 +3976,7 @@ void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
 // == BEGIN g12 host ==
 void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,
          torch::Tensor out, torch::Tensor part, torch::Tensor diag, int64_t n, int64_t k,
-         int64_t rb, int64_t tb, int64_t ck, int64_t nsw, int64_t nsx, int64_t ks, bool diag_on, bool pdl, int64_t mode)
+         int64_t rb, int64_t tb, int64_t ck, int64_t nsw, int64_t nsx, int64_t ks, bool diag_on, bool pdl, int64_t mode, int64_t drain, int64_t rv)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const int m = (int)X.size(0);
@@ -3912,21 +3994,22 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
     bool launched = false;
 #define G12_CASE(RB_, TB_, CK_, SW_, SX_) \
     if (!launched && rb == RB_ && tb == TB_ && ck == CK_ && nsw == SW_ && nsx == SX_) { \
-        if (diag_on) launch_g12<RB_, TB_, CK_, SW_, SX_, true>(xmap, m, Wp, (int)eb, pp, (int)n, (int)k, (int)ks, dg, stream); \
-        else launch_g12<RB_, TB_, CK_, SW_, SX_, false>(xmap, m, Wp, (int)eb, pp, (int)n, (int)k, (int)ks, dg, stream); \
+        if (diag_on && !drain) launch_g12<RB_, TB_, CK_, SW_, SX_, true, false>(xmap, m, Wp, (int)eb, pp, (int)n, (int)k, (int)ks, dg, stream); \
+        else if (!diag_on && drain) launch_g12<RB_, TB_, CK_, SW_, SX_, false, true>(xmap, m, Wp, (int)eb, pp, (int)n, (int)k, (int)ks, dg, stream); \
+        else if (!diag_on) launch_g12<RB_, TB_, CK_, SW_, SX_, false, false>(xmap, m, Wp, (int)eb, pp, (int)n, (int)k, (int)ks, dg, stream); \
+        else TORCH_CHECK(false, "g12: DIAG is instantiated for the delayed-release variant only"); \
         launched = true; }
     G12_CASE(2, 1, 1, 4, 4)
     G12_CASE(2, 1, 1, 4, 3)
-    G12_CASE(2, 1, 1, 3, 4)
     G12_CASE(2, 1, 1, 3, 3)
     G12_CASE(1, 1, 1, 4, 4)
 #undef G12_CASE
     TORCH_CHECK(launched, "g12: unsupported config (rb, tb, ck, nsw, nsx)");
     if (mode == 2) return;                                               // bench: GEMM only
-    TORCH_CHECK(n % G12_RNL == 0 && m <= 256 && out.stride(0) % 2 == 0, "g12: reduce geometry");
+    TORCH_CHECK(n % G12_RNL == 0 && m <= 256 && m % 4 == 0 && out.stride(0) % 2 == 0, "g12: reduce geometry");
     cudaLaunchConfig_t cfg = {};
-    cfg.gridDim = dim3((unsigned)(n / G12_RNL));
-    cfg.blockDim = dim3(256);
+    cfg.gridDim = rv == 1 ? dim3((unsigned)n) : dim3((unsigned)(n / G12_RNL));
+    cfg.blockDim = rv == 1 ? dim3((unsigned)m) : dim3(256);
     cfg.dynamicSmemBytes = 0;
     cfg.stream = stream;
     cudaLaunchAttribute attr[1];
@@ -3934,7 +4017,8 @@ void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
-    const cudaError_t err = cudaLaunchKernelEx(&cfg, g12_reduce_kernel, (const float*)pp, (int)ks, m, (int)n,
+    auto rk = rv == 1 ? g12_reduce1_kernel : (rv == 2 ? g12_reduce_kernel : g12_reduce3_kernel);
+    const cudaError_t err = cudaLaunchKernelEx(&cfg, rk, (const float*)pp, (int)ks, m, (int)n,
         esc_roff.data_ptr<int>(), esc_k.data_ptr<int>(), esc_d.data_ptr<float>(),
         reinterpret_cast<const __nv_bfloat16*>(X.data_ptr()), ldx, reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), ldo);
     TORCH_CHECK(err == cudaSuccess, "g12 reduce launch failed: ", cudaGetErrorString(err));
@@ -3966,7 +4050,7 @@ void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
          torch::Tensor out, torch::Tensor diag, int64_t n, int64_t k, int64_t r, int64_t ck, int64_t w, int64_t nsw, int64_t nsx, int64_t nt, bool diag_on, int64_t variant, torch::Tensor etab);
 void g12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,
          torch::Tensor out, torch::Tensor part, torch::Tensor diag, int64_t n, int64_t k,
-         int64_t rb, int64_t tb, int64_t ck, int64_t nsw, int64_t nsx, int64_t ks, bool diag_on, bool pdl, int64_t mode);
+         int64_t rb, int64_t tb, int64_t ck, int64_t nsw, int64_t nsx, int64_t ks, bool diag_on, bool pdl, int64_t mode, int64_t drain, int64_t rv);
 """
 
 _EXT = None
@@ -4560,7 +4644,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
         if pk is None or wt is None:
             return torch.matmul(x, w.t(), out=out)
         build().g12(x, wt, pk["eb"], pk["esc_roff"], pk["esc_k"], pk["esc_delta"], out, state["partials"], state["diag"], n, k,
-                    cfg["rb"], cfg["tb"], cfg["ck"], cfg["nsw"], cfg["nsx"], cfg["ks"], bool(cfg.get("diag")), True, int(cfg.get("mode", 0)))
+                    cfg["rb"], cfg["tb"], cfg["ck"], cfg["nsw"], cfg["nsx"], cfg["ks"], bool(cfg.get("diag")), True, int(cfg.get("mode", 0)), int(cfg.get("drain", 0)), int(cfg.get("rv", 3)))
         return out
     if cfg.get("tb12"):
         pk = state.get(layer + "_p12")
@@ -4913,13 +4997,22 @@ def _bench(state):
         print("BENCH g12 rb/tb/ck/nsw/nsx/ks (wgmma 12-bit, K split + PDL reduce) vs current; '!' = fp32 rel err > 5e-3; 'g' = GEMM only (no reduce)")
         # (rb, tb, ck, nsw, nsx, ks); ks per layer: 128 CTAs (pooler 32 tiles x 4, qkv 18 x 8, unpooler/o 64 x 2); check e38ce861:
         # the wgmma path is correct; GEMM-only ties cuBLAS at pooler m=128 (23.1 vs 23.3) with the pipe drained per chunk
-        g12_cfgs = {128: [(2, 1, 1, 4, 4, 4), (2, 1, 1, 4, 3, 4), (2, 1, 1, 3, 4, 4), (2, 1, 1, 3, 3, 4), (2, 1, 1, 4, 4, 8), (2, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 4)],
+        g12_cfgs = {128: [(2, 1, 1, 4, 4, 4), (2, 1, 1, 4, 3, 4), (2, 1, 1, 3, 3, 4), (2, 1, 1, 4, 4, 8), (2, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 2), (1, 1, 1, 4, 4, 4)],
                     256: []}
         g12_ks = {"pooler": {4: 4, 8: 8, 2: 2}, "qkv_gate": {4: 8, 8: 16, 2: 4}, "unpooler": {4: 2, 8: 4, 2: 1}, "o": {4: 2, 8: 4, 2: 1}}
 
-        def g12cfg(c, layer, mode=0):
-            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=g12_ks[layer][c[5]], mode=mode)
+        def g12cfg(c, layer, mode=0, drain=0, rv=3):
+            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=g12_ks[layer][c[5]], mode=mode, drain=drain, rv=rv)
 
+        # check d3d8a686: the delayed release (drain=0) was wrong (rel err ~ 1.8e-2 * sqrt(chunks)) with the v2 reduce,
+        # and both reduces cost ~20 us: separate the two with a drain x reduce-version matrix on pooler m=128
+        c0_ = (2, 1, 1, 4, 4, 4)
+        parts = [row("current", "pooler", 128, 4096, None)]
+        for drain in (1, 0):
+            parts.append(row(f"g d{drain}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 2, drain)))
+            for rv in (1, 2, 3):
+                parts.append(row(f"d{drain} rv{rv}", "pooler", 128, 4096, g12cfg(c0_, "pooler", 0, drain, rv)))
+        print("  m=128 pooler 2/1/1/4/4/ks4 drain x reduce: " + " | ".join(parts))
         for m in (128, 256):
             for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 8192), ("o", 8192)):
                 if not budget() or not g12_cfgs[m]:
@@ -4928,10 +5021,9 @@ def _bench(state):
                 for c in g12_cfgs[m]:
                     if layer == "qkv_gate" and n % (64 * c[0]) != 0:
                         continue
-                    cc = g12cfg(c, layer)
-                    parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}", layer, m, n, cc))
-                    if c in (g12_cfgs[m][0], g12_cfgs[m][3]):
-                        parts.append(row("g", layer, m, n, g12cfg(c, layer, 2)))
+                    for drain in (1, 0):
+                        cc = g12cfg(c, layer, 0, drain)
+                        parts.append(row("/".join(str(v) for v in c[:5]) + f"/ks{cc['ks']}/d{drain}", layer, m, n, cc))
                 print(f"  m={m} {layer:9s} n={n}: " + " | ".join(parts))
         dg = state["diag"]
         for layer, n, m, c in (("pooler", 4096, 128, (2, 1, 1, 4, 4, 4)), ("pooler", 4096, 128, (2, 1, 1, 3, 3, 4)), ("qkv_gate", 2304, 128, (2, 1, 1, 4, 4, 4)),
