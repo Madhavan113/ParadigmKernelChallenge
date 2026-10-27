@@ -3,3 +3,4 @@ __pycache__/
 .DS_Store
 tools/out_*
 muse_*/submission_*.py
+tools/sass_*.txt
