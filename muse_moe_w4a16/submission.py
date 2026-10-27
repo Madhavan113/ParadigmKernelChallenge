@@ -256,6 +256,11 @@ CUDA_SRC = r'''
 #ifndef OKC_NOLOAD
 #define OKC_NOLOAD 0
 #endif
+#ifndef OKC_RLDIST
+#define OKC_RLDIST 16  // OKC_ROUTE_LOGITS: above this many tokens the selection is distributed over the CTAs (token t by
+                       // CTA t mod G), published in global memory and followed by a grid barrier; up to it every CTA
+                       // selects every token itself (the tiny FAST1 builds always do)
+#endif
 #ifndef OKC_ROUTE_LOGITS
 #define OKC_ROUTE_LOGITS 0  // routing in the kernel from the router logits (fp32 [M, 256]) and bias (fp32 [256]):
                             // scores = sigmoid(logit * ROUTER_MULTIPLIER), top-8 of scores + bias (ties: lower id),
@@ -522,7 +527,8 @@ __device__ __forceinline__ float sigmoid_tl(float x) { return div_full(1.f, 1.f 
 // on ties; butterfly max over the lanes keeping value desc, index asc; the winner masked to -inf). Writes S.eid (local
 // ids) for this CTA; CTA 0 also writes the global ids and the renormalized weights (read by the final pass of every
 // CTA after the grid barrier).
-__device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, int lo, const float4 (&lq)[2], const float (&bv)[8]) {
+__device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, int lo, const float4 (&lq)[2], const float (&bv)[8],
+                                             bool store_eid, bool store_out) {
   const int lane = threadIdx.x & 31;
   const float lv[8] = {lq[0].x, lq[0].y, lq[0].z, lq[0].w, lq[1].x, lq[1].y, lq[1].z, lq[1].w};
   float sc[8], sel[8];
@@ -563,8 +569,8 @@ __device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, in
 #pragma unroll
     for (int k = 1; k < 8; ++k) { g = (lane == k) ? chosen[k] : g; ww = (lane == k) ? w[k] : ww; }
     const int el = (g - lo + 256) & 255;  // the layer's local id: (id - local_start) mod 256, local if < 32
-    S.eid[t * 8 + lane] = (signed char)(el < p.nloc ? el : -1);
-    if (blockIdx.x == 0) {
+    if (store_eid) S.eid[t * 8 + lane] = (signed char)(el < p.nloc ? el : -1);
+    if (store_out) {
       p.gid_out[t * 8 + lane] = g;
       const_cast<float*>(p.topk_w)[t * 8 + lane] = div_full(ww, den);
     }
@@ -581,7 +587,14 @@ __device__ void route(const Params& p, Smem& S) {
   const int i0 = warp * CH, i1 = min(E, i0 + CH);
   if (tid < NW * 32) S.wc[tid >> 5][tid & 31] = 0;
 #if OKC_ROUTE_LOGITS
-  // (S.eid was filled by the in-kernel selection)
+  if (!OKC_TINY && p.M > OKC_RLDIST) {  // distributed selection: the global ids from every CTA (else S.eid is filled)
+    const int lo = p.lsp ? __ldg(p.lsp) : p.lo;
+#pragma unroll 4
+    for (int i = tid; i < E; i += NT) {
+      const int el = (__ldcg(p.gid_out + i) - lo + 256) & 255;
+      S.eid[i] = (signed char)(el < p.nloc ? el : -1);
+    }
+  }
 #elif OKC_RLOAD && OKC_WGS  // (the small builds lose 1-2% with it: their E is at most 256)
   {  // 16 B loads (E = 8 M; the launcher checks the alignment): one or two per thread, all issued before the stores
     constexpr int LPT = (EMAX / 4 + NT - 1) / NT;
@@ -3748,14 +3761,27 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
         q[0] = __ldg(lg); q[1] = __ldg(lg + 1);
       }
     };
-    ld(warp, q0);
-    ld(warp + NW, q1);
-    for (int t = warp; t < p.M; t += NW) {
-      ld(t + 2 * NW, q2);
-      route_select(p, S, t, lo, q0, bv);
+    const bool dist = !OKC_TINY && p.M > OKC_RLDIST;  // (the tiny builds' FAST1 needs S.eid before routing)
+    const int G = (int)gridDim.x;
+    const int t0 = dist ? (int)blockIdx.x + warp * G : warp, ts = dist ? NW * G : NW;
+    ld(t0, q0);
+    ld(t0 + ts, q1);
+    for (int t = t0; t < p.M; t += ts) {
+      ld(t + 2 * ts, q2);
+      route_select(p, S, t, lo, q0, bv, !dist, dist || blockIdx.x == 0);
       q0[0] = q1[0]; q0[1] = q1[1]; q1[0] = q2[0]; q1[1] = q2[1];
     }
     CTA_SYNC();
+    if (dist) {  // every CTA's selections are visible after this barrier (counter by launch generation, as the final one)
+      if (tid == 0) {
+        const int gen = *reinterpret_cast<volatile const int*>(p.ctr + 3);
+        int* bc = p.ctr + 6 + (gen & 1);
+        __threadfence();
+        atomicAdd(bc, 1);
+        while (ld_acquire(bc) < G) __nanosleep(64);
+      }
+      CTA_SYNC();
+    }
   }
 #endif
 #if FAST1_ON
@@ -3945,7 +3971,12 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   {  // the previous launch's ss copy and barrier counter are the next launch's: zero them now (this CTA's share)
     float* other = (S.gen & 1) ? p.ss : p.ss1;
     for (int i = blockIdx.x * NT + tid; i < EMAX; i += gridDim.x * NT) other[i] = 0.f;
-    if (blockIdx.x == 0 && tid == 0) p.ctr[4 + ((S.gen + 1) & 1)] = 0;
+    if (blockIdx.x == 0 && tid == 0) {
+      p.ctr[4 + ((S.gen + 1) & 1)] = 0;
+#if OKC_ROUTE_LOGITS
+      p.ctr[6 + ((S.gen + 1) & 1)] = 0;  // the next launch's pre-routing barrier (OKC_RLDIST)
+#endif
+    }
   }
 #if OKC_WS
   if (tid == 0) {  // this CTA's unit ranges for the helper warp (the same exact split run_phase uses: no fat jobs)
