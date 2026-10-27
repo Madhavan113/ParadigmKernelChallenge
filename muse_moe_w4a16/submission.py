@@ -3806,13 +3806,14 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
       }
     }
     CTA_SYNC();
-    if (dist) {  // every CTA's selections are visible after this barrier (counter by launch generation, as the final one)
+    if (dist) {  // every CTA's selections are visible after this barrier: a monotonic epoch barrier (ctr[6] = distributed
+                 // launches completed, bumped by CTA 0 after the final barrier; ctr[7] = arrivals), so interleaved
+                 // launches of other builds, which never touch these counters, cannot leave a stale count
       if (tid == 0) {
-        const int gen = *reinterpret_cast<volatile const int*>(p.ctr + 3);
-        int* bc = p.ctr + 6 + (gen & 1);
+        const int e = *reinterpret_cast<volatile const int*>(p.ctr + 6);
         __threadfence();
-        atomicAdd(bc, 1);
-        while (ld_acquire(bc) < G) __nanosleep(64);
+        atomicAdd(p.ctr + 7, 1);
+        while (ld_acquire(p.ctr + 7) < (e + 1) * G) __nanosleep(64);
       }
       CTA_SYNC();
     }
@@ -4005,12 +4006,7 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   {  // the previous launch's ss copy and barrier counter are the next launch's: zero them now (this CTA's share)
     float* other = (S.gen & 1) ? p.ss : p.ss1;
     for (int i = blockIdx.x * NT + tid; i < EMAX; i += gridDim.x * NT) other[i] = 0.f;
-    if (blockIdx.x == 0 && tid == 0) {
-      p.ctr[4 + ((S.gen + 1) & 1)] = 0;
-#if OKC_ROUTE_LOGITS
-      p.ctr[6 + ((S.gen + 1) & 1)] = 0;  // the next launch's pre-routing barrier (OKC_RLDIST)
-#endif
-    }
+    if (blockIdx.x == 0 && tid == 0) p.ctr[4 + ((S.gen + 1) & 1)] = 0;
   }
 #if OKC_WS
   if (tid == 0) {  // this CTA's unit ranges for the helper warp (the same exact split run_phase uses: no fat jobs)
@@ -4101,6 +4097,9 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   }
   CTA_SYNC();
   DBG(4);
+#if OKC_ROUTE_LOGITS
+  if (!OKC_TINY && p.M > OKC_RLDIST && blockIdx.x == 0 && tid == 0) p.ctr[6] += 1;  // distributed-routing epoch
+#endif
 #if OKC_ROUTE_LOGITS && OKC_FINPF && OKC_FINCOL && !OKC_WGS
 #pragma unroll
   for (int s = 0; s < 8; ++s) wvp[s] = (qvp[s] >= 0) ? __ldcg(p.topk_w + tkp * 8 + s) : 0.f;
