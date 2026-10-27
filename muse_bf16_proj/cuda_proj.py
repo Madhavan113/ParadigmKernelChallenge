@@ -1399,6 +1399,15 @@ void launch_w12b(const __nv_bfloat16* X, int ldx, int m, const uint8_t* Wt, int 
 // CTAs split K; each writes fp32 partials part[z][tok][n]; w12m_reduce_kernel (PDL) sums the slices, adds the
 // escapes of row n (esc_roff per row: delta x x[tok][k]) and writes bf16.
 constexpr int W12M_WARPS = 8;
+// non-volatile forms: ptxas may schedule the fragment loads ahead of the mmas (the loads keep a memory clobber so they
+// stay behind the barrier that publishes the stage)
+__device__ __forceinline__ void ldsm_x4_nv(uint32_t& a0, uint32_t& a1, uint32_t& a2, uint32_t& a3, uint32_t addr) {
+    asm("ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n" : "=r"(a0), "=r"(a1), "=r"(a2), "=r"(a3) : "r"(addr) : "memory");
+}
+__device__ __forceinline__ void mma16816_nv(float* c, uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint32_t b0, uint32_t b1) {
+    asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3]) : "r"(a0), "r"(a1), "r"(a2), "r"(a3), "r"(b0), "r"(b1));
+}
 __host__ __device__ constexpr int w12m_stage_bytes(int mw, int nt) { return W12M_WARPS * mw * W12_TILE_BYTES + 8 * nt * W12_XSTRIDE * 2; }
 
 template <int MW, int NT, int NSTAGE>
@@ -1493,15 +1502,22 @@ w12m_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* 
                         decode4(L0, Nw & 0xFFFFu, lut0, lut1, a[i][q][0], a[i][q][1]);
                         decode4(L1, Nw >> 16, lut0, lut1, a[i][q][2], a[i][q][3]);
                     }
+                // B fragments of GB token blocks at a time, then their mmas in an order that keeps the mmas on one
+                // accumulator GB*MW apart (warps issue in order: a dependent mma right behind its producer stalls)
+                constexpr int GB = NT <= 16 ? NT : 8;
                 #pragma unroll
-                for (int nb = 0; nb < NT; ++nb) {
-                    uint32_t b0, b1, b2, b3;
-                    ldsm_x4(b0, b1, b2, b3, xb + (nb * 8 * W12_XSTRIDE + h * 64 + ps * 32) * 2);
+                for (int nb0 = 0; nb0 < NT; nb0 += GB) {
+                    uint32_t b[GB][4];
                     #pragma unroll
-                    for (int i = 0; i < MW; ++i) {
-                        mma16816(acc[i][nb], a[i][0][0], a[i][0][1], a[i][0][2], a[i][0][3], b0, b1);
-                        mma16816(acc[i][nb], a[i][1][0], a[i][1][1], a[i][1][2], a[i][1][3], b2, b3);
-                    }
+                    for (int j = 0; j < GB; ++j)
+                        ldsm_x4_nv(b[j][0], b[j][1], b[j][2], b[j][3], xb + ((nb0 + j) * 8 * W12_XSTRIDE + h * 64 + ps * 32) * 2);
+                    #pragma unroll
+                    for (int q = 0; q < 2; ++q)
+                        #pragma unroll
+                        for (int j = 0; j < GB; ++j)
+                            #pragma unroll
+                            for (int i = 0; i < MW; ++i)
+                                mma16816_nv(acc[i][nb0 + j], a[i][q][0], a[i][q][1], a[i][q][2], a[i][q][3], b[j][2 * q], b[j][2 * q + 1]);
                 }
             }
         }
