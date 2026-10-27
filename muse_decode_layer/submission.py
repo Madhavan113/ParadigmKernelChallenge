@@ -74,7 +74,9 @@ TUNE_MARGIN = 0.95
 # pr at T=32: separate bfp 166.8 / 318.7 vs fused bfpf 167.9 / 320.2 us (32x1 sliding / full). T=256 pr/un: 4-way tie.
 # un at T=1/8 (the 1024-row slice): bfp 80.7 / 80.1 / 116.7 / 138.2 vs split-K 81.9 / 81.2 / 118.8 / 140.1 us (1x1 s/f, 1x8 s/f).
 PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp", (32, "pr"): "bfp",
-            (128, "qkv"): True, (256, "qkv"): True}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
+            (128, "qkv"): (True, "mm16"), (256, "qkv"): (True, "mm16")}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
+# a tuple pins the choice to the faster of those picks by the tuner's own times (here: cuBLAS fp32 out vs bf16 out,
+# never the Triton split-K the isolated tuner prefers)
 FORCE_MM = None
 FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boundary/router kernels      # None: the tuner's per-(T, matrix) dense choice; else force one backend everywhere   # set to 0/1/2 to override the tuner's megakernel threshold (pod experiments)
 
@@ -13086,6 +13088,11 @@ def dense(x, w, T, state=None, name=None):
     if pick == "bfp" and T <= BFP_MAX_T and name in _BFP_LAYER and state.get("bfp") is not None:
         # bf16_proj's kernel (BF16 out, as SGLang's GEMM): the consumers read P as one [1, T, N] partial
         return _bfp_gemm(state, name, x, T, N, K).view(1, T, N), 1
+    if pick == "mm16":
+        # cuBLAS with BF16 output (SGLang's own bf16 GEMM call): a different kernel from the fp32-output call, which at
+        # T = 128/256 lands on a 19-24 us split-K kernel for the o projection (bf16 out: 8-10 us); the consumers read
+        # P in any dtype (the bf16_proj paths at T <= 32 already hand them bf16)
+        return torch.nn.functional.linear(x, w).view(1, T, N), 1
     if pick is True or pick == "bfp":       # above BFP_MAX_T a bfp pick runs as cuBLAS (measured in the chain)
         out = torch.mm(x, w.t(), out_dtype=torch.float32)
         return out.view(1, T, N), 1
@@ -13975,11 +13982,19 @@ def _tune(st, log=False):
                     t_bfpf = _graph_time(lambda: bfp_fused_pooler_router(xd, st["bfp"]), flush, reps=5)
                 except Exception:  # noqa: BLE001  (sm_80 or an older bf16_proj file: not offered)
                     t_bfpf = 1e30
-            opts = {False: t_tri, True: t_mm, "bfp": t_bfp, "bfpf": t_bfpf}
+            t_mm16 = 1e30
+            if name != "pr":   # the router logits stay fp32 (hi + lo rows); the other three may come out bf16 as SGLang's
+                st["mm_pick"][(T, name)] = "mm16"
+                try:
+                    t_mm16 = _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+                except Exception:  # noqa: BLE001
+                    t_mm16 = 1e30
+            opts = {False: t_tri, True: t_mm, "bfp": t_bfp, "bfpf": t_bfpf, "mm16": t_mm16}
+            st.setdefault("mm_times", {})[(T, name)] = opts
             bestp = min(opts, key=lambda p: opts[p])
             st["mm_pick"][(T, name)] = bestp
             if log:
-                msg.append(f"{name}{ {False: 'T', True: 'M', 'bfp': 'B', 'bfpf': 'F'}[bestp] }:{opts[bestp]:.0f}")
+                msg.append(f"{name}{ {False: 'T', True: 'M', 'bfp': 'B', 'bfpf': 'F', 'mm16': 'm'}[bestp] }:{opts[bestp]:.0f}")
         if st["bank"] is not None and T <= 384:
             xm = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
             raw = torch.randint(0, N_EXPERTS, (T, 8), generator=g, device=dev, dtype=torch.int32)
@@ -14120,6 +14135,9 @@ def prepare(weights):
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
+        if isinstance(v, tuple):
+            times = st.get("mm_times", {}).get(k, {})
+            v = min(v, key=lambda p: times.get(p, 1e30))
         st.setdefault("mm_pick", {})[k] = v
     torch.cuda.synchronize()
     if st.get("att_ok"):
