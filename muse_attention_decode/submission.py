@@ -102,7 +102,7 @@ namespace {
 #define OKC_XNOWAIT 0   // (probe) per-request loop: no wait for the tile's copies (garbage), the compute-bound tile time
 #endif
 #ifndef OKC_XNOWAITF
-#define OKC_XNOWAITF 0  // (probe) flat consumers: no wait for the stage's copies (garbage), the consumer-bound tile time
+#define OKC_XNOWAITF 0  // (probe) flat producers issue no K/V copies (stale data): the consumer-bound tile time
 #endif
 #ifndef OKC_CPHINT
 #define OKC_CPHINT 0    // flat producer: K/V copies with an L2 evict_first cache hint (the rows are read once)
@@ -1908,6 +1908,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         PROF_MARK(0);
         if (x == 0 && q == 0) FPRO_STAMP(46);
         const uint32_t kb = smem_u32(S.k + st * STAGE_BYTES), vb = smem_u32(S.v + st * STAGE_BYTES);
+        if constexpr (!OKC_XNOWAITF) {   // (OKC_XNOWAITF probe: no copies, the stage barrier completes at once)
 #if OKC_PFAST
         // common tiles (every row cached, page size 1, caches below 4 GB): one shift-add per row, no per-row
         // branches (the producer's instructions take issue slots from the consumers on the same SMSPs)
@@ -1947,6 +1948,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
             cp_async16_zero(kb + so, p.k_cache);
             cp_async16_zero(vb + so, p.v_cache);
           }
+        }
         }
         cp_async_mbar_arrive(&S.full[st]);
         if (x == 0 && q == 0) FPRO_STAMP(43);
@@ -2137,7 +2139,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     return lo < hi;
   };
   auto ws_acquire = [&](int i, int st) {
-    if constexpr (!OKC_XNOWAITF) mbar_wait_full(&S.full[st], ((tb + i) / STAGES) & 1);   // (probe: no wait)
+    mbar_wait_full(&S.full[st], ((tb + i) / STAGES) & 1);
     const int t0 = start + i * TILE;
     const int lo = max(t0, seq), hi = min(t0 + TILE, end);
     if (lo < hi) {   // same for every consumer thread
@@ -2628,7 +2630,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     }
 
 #if OKC_NOCOMPUTE
-    if constexpr (WS) { __syncwarp(); if (lane == 0) mbar_arrive(&S.empty[(tb + i) % STAGES]); }
+    if constexpr (WS) { __syncwarp(); if (OKC_XP_ARRALL || lane == 0) mbar_arrive(&S.empty[(tb + i) % STAGES]); }
     continue;
 #endif
     const uint8_t* K = S.k + ((tb + i) % STAGES) * STAGE_BYTES;
@@ -2961,7 +2963,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       if constexpr (PIPE8) {
         patched = false;   // (waited for, patched and its QK^T issued when the previous tile's PV went out)
       } else if constexpr (ADDR) {
-        if constexpr (!OKC_XNOWAITF) mbar_wait_full(&S.full[st_c], ph_c);   // (probe: no wait)
+        mbar_wait_full(&S.full[st_c], ph_c);
         if constexpr (OKC_RARE) patched = ((uint32_t)i - r_lo > r_span) && (i >= i_new) && ws_patch_ni<L, NT, PTR>(&S, i, st_c, start, seq, end, tid);
         else if constexpr (OKC_PATCHNI && WS) patched = (i >= i_new) && ws_patch_ni<L, NT, PTR>(&S, i, st_c, start, seq, end, tid);
         else patched = (i >= i_new) && ws_patch(i, st_c);
