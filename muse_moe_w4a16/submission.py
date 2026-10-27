@@ -187,6 +187,14 @@ CUDA_SRC = r'''
 #ifndef OKC_WS
 #define OKC_WS 0  // tiny build: one extra helper warp issues the ring's TMA copies and runs every skinny epilogue
 #endif
+#ifndef OKC_WSDYN
+#define OKC_WSDYN 0  // WS: dynamic unit claiming: each phase = static equal slices of the first units, then a pool
+                     // of the last max(G, nS >> OKC_WSDYNS) units claimed one at a time (one atomic in flight) by the
+                     // helper warp, which owns the whole unit sequence (both phases) and publishes it in S.uid
+#endif
+#ifndef OKC_WSDYNS
+#define OKC_WSDYNS 2
+#endif
 #ifndef OKC_LAUNCHCHK
 #define OKC_LAUNCHCHK 0  // dev: check the launch and synchronize after it (reports smem size and the CUDA error)
 #endif
@@ -305,7 +313,15 @@ constexpr int RB_A_LOG = 9, RB_B_LOG = 8;
 static_assert((1 << RB_B_LOG) == RB_B, "RB_B must be 256");
 constexpr int BFLAG = 1 << 30;  // uslot: a phase-B unit prefetched at the end of phase A
 // dynamic tail: the last pool units of a phase's skinny work are claimed at run time (OKC_DYNK per CTA)
-__device__ __forceinline__ int dyn_pool(int nS, int G) { const int d = G * OKC_DYNK; return SKDYN ? (d < nS ? d : nS) : 0; }
+__device__ __forceinline__ int dyn_pool(int nS, int G) {
+#if OKC_WSDYN
+  const int d = max(G, nS >> OKC_WSDYNS);
+  return d < nS ? d : nS;
+#else
+  const int d = G * OKC_DYNK;
+  return SKDYN ? (d < nS ? d : nS) : 0;
+#endif
+}
 static_assert((1 << RB_A_LOG) == RB_A, "RB_A must be 512");
 static_assert(OKC_NSF <= 7 && OKC_NS <= 5, "barrier slots");   // 256-row blocks (fat units)
 constexpr int MMAX = 384, EMAX = MMAX * 8, JMAX = 32 + EMAX / FT_T + 8;
@@ -349,6 +365,8 @@ struct Smem {
 #if OKC_WS
   uint64_t wse[8], wsrf[8], wsre[8];  // WS: ring slot released by all compute warps / partials ready / buffer free
   int wsr[4];                          // WS: this CTA's phase A and phase B unit ranges
+  int wsd[4];                          // WSDYN: pool bounds [nAs, nA) and [nBs, nB)
+  int uid[8];                          // WSDYN: unit of sequence index q at q & 7: (q << 16) | (PB << 15) | v
 #endif
 #if OKC_WGS
   uint64_t bars[24];  // WGS: 0..3 weights full, 4..7 weights empty, 8..15 x full, 16..23 x empty
@@ -363,6 +381,8 @@ struct Smem {
 #endif
 #if OKC_WGS
   int wgr[4];         // WGS: this CTA's phase A and phase B unit ranges
+  int wgd[4];         // WGSDYN: pool stage ranges [Ts, T) per phase
+  int wseg[16];       // WGSDYN: published pieces (tag << 20 | u << 8 | s0 << 4 | s1 - 1), index k & 15
 #endif
   int seq, fseq, preissued, preissuedB;
   int fcnt[32];     // OKC_SPLIT: FAST1 per-expert entry counts (the preissue's job -> expert map)
@@ -2303,6 +2323,223 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
 }
 #endif
 
+#if OKC_WSDYN
+// ---------------------------------------------------------------- WSDYN: dynamic unit claiming on the WS ring
+// A CTA's unit sequence q = 0, 1, ... is: its static phase-A slice [wsr[0], wsr[1]), then phase-A pool units claimed
+// from p.ctr[0] (pool = [wsd[0], wsd[1])), then its static phase-B slice, then phase-B pool units (p.ctr[1]). The
+// helper warp's lane 0 owns the sequence: it claims (one atomic kept in flight), publishes S.uid[q & 7] and issues the
+// TMA into slot q % NS as soon as every compute warp holds unit q's codes (S.wse). The compute warps follow S.uid and
+// never issue. Phase-A credits to doneA[j] come from the helper (per-job counts in S.dync) once its last phase-A
+// epilogue is done. The last sequence entry is WSD_END.
+static_assert(!OKC_WSDYN || (OKC_WS && OKC_WSB && OKC_NW == 8 && OKC_SKT == 8 && OKC_FAST1 > 0 && OKC_TINY), "OKC_WSDYN: WSB tiny build");
+constexpr int WSD_END = 0x7FFF;
+__device__ __forceinline__ int wsd_uid_read(const Smem& S, int q) {
+  const volatile int* u = &S.uid[q & 7];
+  int x;
+  while (((x = *u) >> 16) != q) __nanosleep(20);
+  return x & 0xFFFF;
+}
+__device__ __forceinline__ void wsd_publish(Smem& S, int q, int pb, int v) {
+  *reinterpret_cast<volatile int*>(&S.uid[q & 7]) = (q << 16) | (pb << 15) | v;
+}
+struct WsdSrc {       // the helper lane's claim state
+  int ph;             // 0 static A, 1 pool A, 2 static B, 3 pool B, 4 done
+  int vnext, vend;    // static cursor
+  int pend;           // pool claim in flight (-1: none)
+  __device__ __forceinline__ bool next(const Params& p, const Smem& S, int& pb, int& v) {
+    for (;;) {
+      if (ph == 0 || ph == 2) {
+        if (vnext < vend) { pb = ph >> 1; v = vnext++; return true; }
+        ++ph;
+        pend = -1;
+      } else if (ph == 1 || ph == 3) {
+        const int base = S.wsd[ph == 1 ? 0 : 2], end = S.wsd[ph == 1 ? 1 : 3];
+        if (base < end) {
+          int* ctr = p.ctr + (ph >> 1);
+          const int cl = pend >= 0 ? pend : atomicAdd(ctr, 1);
+          pend = atomicAdd(ctr, 1);  // the next claim: its value is first needed one unit later
+          if (base + cl < end) { pb = ph >> 1; v = base + cl; return true; }
+        }
+        ++ph;
+        if (ph == 2) { vnext = S.wsr[2]; vend = S.wsr[3]; }
+      } else {
+        return false;
+      }
+    }
+  }
+};
+__device__ __forceinline__ void wsd_issue(const Params& p, Smem& S, int q, int pb, int v, unsigned char* ring) {
+  const int sl = q % OKC_NS;
+  wsd_publish(S, q, pb, v);
+  if (pb) ring_issue<true>(p, S, v, ring + sl * UNIT_BYTES, S.bars + sl);
+  else ring_issue<false>(p, S, v, ring + sl * UNIT_BYTES, S.bars + sl);
+}
+// compute warps: follow the published sequence; per unit: x for the job (registers), wait the slot, codes to registers,
+// release the slot, 32 MMAs, partials to the helper
+__device__ void skinny_ring_wsd(const Params& p, Smem& S, unsigned char* ring) {
+  const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+  const uint32_t k16 = 16u + p.zero;  // opaque 16 (scale decode IMAD)
+  (void)k16;
+  const int njF = S.njF;
+  uint4 x0[2 * NCH];
+  int curj = -1;
+  bool curpb = false;
+  for (int q = 0;; ++q) {
+    const int u = wsd_uid_read(S, q);
+    if ((u & 0x7FFF) == WSD_END) break;
+    const bool PB = (u >> 15) & 1;
+    const int v = u & 0x7FFF;
+    const int j = njF + (PB ? (v >> RB_B_LOG) : (v >> RB_A_LOG));
+    if (j != curj || PB != curpb) {
+      curj = j; curpb = PB;
+      if (PB) {
+        if (lane == 0) { while (ld_acquire(p.doneA + j) < RB_A) __nanosleep(64); }
+        __syncwarp();
+        load_x_regs<true>(p, S, j, lane, warp, x0);
+      } else {
+        load_x_regs<false>(p, S, j, lane, warp, x0);
+      }
+    }
+    const int sl = q % OKC_NS;
+    mbar_wait(S.bars + sl, (uint32_t)((q / OKC_NS) & 1));
+    const unsigned char* slot = ring + sl * UNIT_BYTES;
+    const uint4 sc = *reinterpret_cast<const uint4*>(slot + UNIT_CODES + warp * 512 + lane * 16);
+    uint4 wq[NCH];
+#pragma unroll
+    for (int c = 0; c < NCH; ++c) wq[c] = *reinterpret_cast<const uint4*>(slot + (warp * NCH + c) * 512 + lane * 16);
+    __syncwarp();
+    if (lane == 0) mbar_arrive1(S.wse + sl);  // codes and scales in registers: the helper may refill the slot
+    float acc[4] = {0.f, 0.f, 0.f, 0.f}, acc2[4] = {0.f, 0.f, 0.f, 0.f};
+#if OKC_NACC == 4
+    float acc3[4] = {0.f, 0.f, 0.f, 0.f}, acc4[4] = {0.f, 0.f, 0.f, 0.f};
+#endif
+#pragma unroll
+    for (int c = 0; c < NCH; ++c) {
+      const uint4 w = wq[c];
+#if OKC_PRMTSC
+      const uint32_t swd = c < 4 ? (c < 2 ? sc.x : sc.y) : (c < 6 ? sc.z : sc.w);
+      const uint32_t sg = SCDK(swd, (c & 1) * 2, k16), sg8 = SCDK(swd, (c & 1) * 2 + 1, k16);
+#else
+      const uint32_t sw = (c < 4 ? (c < 2 ? sc.x : sc.y) : (c < 6 ? sc.z : sc.w)) >> ((c & 1) * 16);
+      const uint32_t sg = S.lut[sw & 0xff], sg8 = S.lut[(sw >> 8) & 0xff];
+#endif
+      const uint32_t ww[4] = {w.x, w.y, w.z, w.w};
+      const uint32_t b[8] = {x0[2 * c].x, x0[2 * c].y, x0[2 * c].z, x0[2 * c].w,
+                             x0[2 * c + 1].x, x0[2 * c + 1].y, x0[2 * c + 1].z, x0[2 * c + 1].w};
+#pragma unroll
+      for (int st = 0; st < 4; ++st) {
+        uint32_t r0, r1, r2, r3;
+        dq4(ww[st], r0, r1, r2, r3);
+#if OKC_NACC == 4
+        mma_bf16(st == 0 ? acc : st == 1 ? acc2 : st == 2 ? acc3 : acc4, bmul2(r0, sg), bmul2(r1, sg8), bmul2(r2, sg), bmul2(r3, sg8), b[2 * st], b[2 * st + 1]);
+#else
+        mma_bf16((st & 1) ? acc2 : acc, bmul2(r0, sg), bmul2(r1, sg8), bmul2(r2, sg), bmul2(r3, sg8), b[2 * st], b[2 * st + 1]);
+#endif
+      }
+    }
+#if OKC_NACC == 4
+#pragma unroll
+    for (int k = 0; k < 4; ++k) acc[k] += acc2[k] + acc3[k] + acc4[k];
+#else
+    acc[0] += acc2[0]; acc[1] += acc2[1]; acc[2] += acc2[2]; acc[3] += acc2[3];
+#endif
+    const int bb = q % NRB;
+    mbar_wait(S.wsre + bb, (uint32_t)(((q / NRB) & 1) ^ 1));  // the helper has consumed this buffer's previous unit
+    *reinterpret_cast<float4*>(&S.red[bb][warp][lane][0]) = make_float4(acc[0], acc[1], acc[2], acc[3]);
+    CTA_SYNC();  // partials visible
+    if (tid == 0) mbar_arrive1(S.wsrf + bb);
+  }
+}
+// helper warp: claims and issues the sequence (lane 0), runs every epilogue, credits doneA
+__device__ void ws_helper_d(const Params& p, Smem& S, unsigned char* ring) {
+  const int lane = threadIdx.x & 31;
+  WS_JOIN();  // routing tables, ranges and pool bounds are ready
+  const int njF = S.njF;
+  WsdSrc src{0, S.wsr[0] + S.preissued, S.wsr[1], -1};
+  bool ended = false;
+  if (lane == 0) {
+    for (int q = S.preissued; q < OKC_NS && !ended; ++q) {
+      int pb, v;
+      if (src.next(p, S, pb, v)) wsd_issue(p, S, q, pb, v, ring);
+      else { wsd_publish(S, q, 0, WSD_END); ended = true; }
+    }
+  }
+  const int gg = lane >> 2, tt = lane & 3;
+  bool credited = false;
+  auto credit = [&]() {  // this CTA's phase-A units, per job, into doneA (after its epilogue stores)
+    __threadfence();
+    __syncwarp();
+    for (int jj = lane; jj < S.njS; jj += 32) {
+      const int k = S.dync[njF + jj];
+      if (k) atomicAdd(p.doneA + njF + jj, k);
+    }
+    credited = true;
+  };
+  for (int q = 0;; ++q) {
+    const int u = wsd_uid_read(S, q);
+    if ((u & 0x7FFF) == WSD_END) break;
+    const bool PB = (u >> 15) & 1;
+    const int v = u & 0x7FFF;
+    if (lane == 0 && !ended) {  // unit q + NS into unit q's slot once every compute warp holds unit q's codes
+      mbar_wait(S.wse + q % OKC_NS, (uint32_t)((q / OKC_NS) & 1));
+      int pb, v2;
+      if (src.next(p, S, pb, v2)) wsd_issue(p, S, q + OKC_NS, pb, v2, ring);
+      else { wsd_publish(S, q + OKC_NS, 0, WSD_END); ended = true; }
+    }
+    const int rbs = PB ? RB_B : RB_A;
+    const int j = njF + (PB ? (v >> RB_B_LOG) : (v >> RB_A_LOG)), rb = v & (rbs - 1);
+    const int bb = q % NRB;
+    mbar_wait(S.wsrf + bb, (uint32_t)((q / NRB) & 1));
+    float4 sm = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+    for (int w = 0; w < NW; ++w) {
+      const float4 t = *reinterpret_cast<const float4*>(&S.red[bb][w][lane][0]);
+      sm.x += t.x; sm.y += t.y; sm.z += t.z; sm.w += t.w;
+    }
+    __syncwarp();
+    if (lane == 0) mbar_arrive1(S.wsre + bb);  // buffer free again
+    const int cnt = S.jC[j], st = S.jS[j], ce = S.jE[j];
+    if (!PB) {
+      const float gsc = p.gsA[ce] * TWO62;
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int tk = 2 * tt + h;
+        if (tk < cnt) {
+          const float gt = (h ? sm.y : sm.x) * gsc, up = (h ? sm.w : sm.z) * gsc;
+          st_keep_bf16(p.inter + ((size_t)(st + tk) * ID + rb * 8 + gg), __float2bfloat16(probe_q(SILU_DIV(gt, 1.f + __expf(-gt)) * up)));
+        }
+      }
+      if (lane == 0) S.dync[j] += 1;
+      if (!credited) {  // last phase-A unit of this CTA (the next entry is phase B or the end): credit now, before
+        const int un = wsd_uid_read(S, q + 1);  // the compute warps block on doneA for the first phase-B unit
+        if ((un & 0x7FFF) == WSD_END || ((un >> 15) & 1)) credit();
+      }
+    } else {
+      const float gsc = p.gsB[ce] * TWO62;
+      const int n0 = rb * 16 + gg;
+      const float nw0 = 1.f + __bfloat162float(p.normw[n0]), nw1 = 1.f + __bfloat162float(p.normw[n0 + 8]);
+#pragma unroll
+      for (int h = 0; h < 2; ++h) {
+        const int tk = 2 * tt + h;
+        const float v0f = (h ? sm.y : sm.x) * gsc * nw0, v1f = (h ? sm.w : sm.z) * gsc * nw1;
+        float sq = v0f * v0f + v1f * v1f;
+        if (tk < cnt) {
+          st_keep_f32(p.ybuf + ((size_t)(st + tk) * HD + n0), v0f);
+          st_keep_f32(p.ybuf + ((size_t)(st + tk) * HD + n0 + 8), v1f);
+        }
+        sq += __shfl_xor_sync(0xffffffffu, sq, 4);
+        sq += __shfl_xor_sync(0xffffffffu, sq, 8);
+        sq += __shfl_xor_sync(0xffffffffu, sq, 16);
+        if (gg == 0 && tk < cnt) atomicAdd(&ss_cur()[st + tk], sq);
+      }
+    }
+  }
+  if (!credited) credit();
+  __threadfence();
+  WS_JOIN();  // every epilogue store of this CTA is done before the grid barrier
+}
+#endif
+
 template <bool BIG, bool PB>
 __device__ __forceinline__ void skinny_split(int nS, int nF, int G, int c, int& v0, int& v1) {
   const float rG = __fdividef(1.f, (float)G);
@@ -2350,7 +2587,19 @@ constexpr int WGS_PIECE = 9216;                 // one warpgroup's weights in a 
 constexpr int WGS_XS = WGS_NT * 4096;           // an x slot: up to FT_T rows x 256 K
 constexpr int BW_F = 0, BW_E = 3, BX_F = 6, BX_E = 6 + WGS_NX;  // barrier indices
 static_assert(BX_E + WGS_NX <= 24, "WGS barriers");
-constexpr int WGS_SLOTS = 160;                  // fixup slots per phase (>= grid + 1)
+#ifndef OKC_WGSDYN
+#define OKC_WGSDYN 0  // WGS: dynamic stage claiming: cost-weighted static ranges over the first (1 - 2^-WGSDYNS) of
+                      // each phase's cost, then OKC_WGSSEG-stage segments claimed from a global counter by the weights
+                      // producer, which publishes the (unit, stage range) pieces for the consumers and the x producer;
+                      // cut units use unit-indexed fixup slots and the last-arriving share runs the epilogue
+#endif
+#ifndef OKC_WGSDYNS
+#define OKC_WGSDYNS 2
+#endif
+#ifndef OKC_WGSSEG
+#define OKC_WGSSEG 4
+#endif
+constexpr int WGS_SLOTS = OKC_WGSDYN ? JMAX * 32 : 160;  // fixup slots per phase (>= grid + 1 | one per unit)
 constexpr int WGS_FIXW = WGS_NT * 512;          // floats per (slot, warpgroup): [n-tile][128 threads][4]
 constexpr size_t WGS_FIXF = (size_t)2 * WGS_SLOTS * 4 * WGS_FIXW + 2 * WGS_SLOTS * 4 + 136 * 16;  // + doneAs
 __device__ __forceinline__ float* wgs_fix(const Params& p, int pb) {
@@ -2390,6 +2639,10 @@ __device__ __forceinline__ int wgs_cost(int pb, int cnt) {
 #endif
 #ifndef OKC_WGSPR
 #define OKC_WGSPR 1  // WGS: the x producer warp computes the stage ranges while the consumers gather
+#endif
+#if OKC_WGSDYN
+#undef OKC_WGSDFIN
+#define OKC_WGSDFIN 0  // (dynamic shares arrive in no fixed order: the last arriver finishes)
 #endif
 #ifndef OKC_WGSDFIN
 #define OKC_WGSDFIN 2  // WGS: stream-K split units finished by a designated share (see wgs_flush): bit0 phase A, bit1 phase B
@@ -2546,6 +2799,80 @@ __device__ __forceinline__ int wgs_split(int pb, int g0, int g1) {
   return (OKC_WGSREORD && pb == 0 && (g1 & 15) != 0 && ue > g0) ? ue : g0;
 }
 __device__ void wgs_ranges(const Params& p, Smem& S);  // below (needs the cost tables)
+#if OKC_WGSDYN
+// piece ring: entry k = (k & 0xFFF) << 20 | u << 8 | s0 << 4 | (s1 - 1); the end of a phase is u = 0xFFF
+constexpr int WGS_PEND = 0xFFF00;
+__device__ __forceinline__ void wgs_pub(Smem& S, int k, int u, int s0, int s1) {
+  *reinterpret_cast<volatile uint32_t*>(&S.wseg[k & 15]) = ((uint32_t)(k & 0xFFF) << 20) | ((uint32_t)u << 8) | ((uint32_t)s0 << 4) | (uint32_t)(s1 - 1);
+}
+__device__ __forceinline__ int wgs_piece(const Smem& S, int k) {
+  const volatile uint32_t* e = reinterpret_cast<const volatile uint32_t*>(&S.wseg[k & 15]);
+  uint32_t x;
+  while (((x = *e) >> 20) != (uint32_t)(k & 0xFFF)) __nanosleep(20);
+  return (int)(x & 0xFFFFFu);
+}
+// weights producer: walks the static ranges, then claims pool segments; publishes every (unit, s0, s1) piece before
+// issuing its stages
+__device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
+  WS_JOIN();  // routing tables and this CTA's stage ranges are ready
+  if ((threadIdx.x & 31) != 0) return;
+  int ws = 0, n = 0, k = 0;
+  uint32_t wph = 0;
+  unsigned long long wring_wait = 0;
+  auto stage = [&](int pb, int gs) {
+    const int ubl = pb ? 4 : 5;
+    const unsigned char* base = pb ? p.wBs : p.wAs;
+    const int u = gs >> 4, st = gs & 15;
+    const int j = u >> ubl, ub = u & ((1 << ubl) - 1);
+    if (n >= WGS_NS) {
+      unsigned long long tr0 = 0;
+      if (OKC_DEBUG) tr0 = gtimer();
+      wgs_wait(S.bars + BW_E + ws, wph ^ 1, 1000 + gs);
+      if (OKC_DEBUG) wring_wait += gtimer() - tr0;
+    }
+    uint64_t* bar = S.bars + BW_F + ws;
+    const unsigned char* src = base + ((size_t)(((S.jE[j] << ubl) + ub) * 16 + st)) * (size_t)UNIT_BYTES;
+#if OKC_WGSX & 32
+    (void)src;
+    mbar_arrive1(bar);
+#else
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(UNIT_BYTES) : "memory");
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" L2H_SUFFIX " [%0], [%1], %2, [%3]" L2H_OPERAND ";\n"
+                 ::"r"(smem_u32(ring + ws * UNIT_BYTES)), "l"(src), "r"(UNIT_BYTES), "r"(smem_u32(bar)) L2H_ARG : "memory");
+#endif
+    if (++ws == WGS_NS) { ws = 0; wph ^= 1; }
+    ++n;
+  };
+  auto range = [&](int pb, int a, int b) {  // stages [a, b) as unit pieces
+    for (int gs = a; gs < b;) {
+      const int u = gs >> 4, s0 = gs & 15, s1 = min(16, s0 + (b - gs));
+      wgs_pub(S, k++, u, s0, s1);
+      for (int st = s0; st < s1; ++st) stage(pb, (u << 4) + st);
+      gs += s1 - s0;
+    }
+  };
+#pragma unroll 1
+  for (int pb = 0; pb < 2; ++pb) {
+    const int g0 = S.wgr[2 * pb], g1 = S.wgr[2 * pb + 1], sp = wgs_split(pb, g0, g1);
+    range(pb, sp, g1);
+    if (sp > g0) range(pb, g0, sp);
+    const int Ts = S.wgd[2 * pb], T = S.wgd[2 * pb + 1];
+    if (Ts < T) {
+      int* ctr = p.ctr + pb;
+      int pend = atomicAdd(ctr, 1);
+      for (;;) {
+        const int cl = pend;
+        pend = atomicAdd(ctr, 1);  // the next claim, in flight while this segment streams
+        const int a = Ts + cl * OKC_WGSSEG;
+        if (a >= T) break;
+        range(pb, a, min(T, a + OKC_WGSSEG));
+      }
+    }
+    wgs_pub(S, k++, 0xFFF, 0, 1);  // end of phase pb
+  }
+  if (OKC_DEBUG && p.dbg) p.dbg[(size_t)gridDim.x * 8 + (size_t)gridDim.x * 4 + blockIdx.x] = wring_wait;
+}
+#else
 __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
   if ((threadIdx.x & 31) != 0) return;
@@ -2583,6 +2910,7 @@ __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
   }
   if (OKC_DEBUG && p.dbg) p.dbg[(size_t)gridDim.x * 8 + (size_t)gridDim.x * 4 + blockIdx.x] = wring_wait;  // weight-ring empty waits (ns)
 }
+#endif
 // x producer: one bulk copy per stage (lane 0): the job's x slice for the stage is contiguous in xA (phase A, written
 // by every CTA's gather pass at the start) or xB (phase B, written by the phase-A epilogues), N_pad x 512 B
 constexpr int WGS_XROWS = EMAX + 8 * JMAX;  // padded rows of all jobs, upper bound
@@ -2600,6 +2928,9 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
   int xs = 0, n = 0;
   uint32_t xph = 0;
   unsigned long long xwaitA = 0, xwaitB = 0, xstallB = 0, xring_wait = 0;
+#if OKC_WGSDYN
+  int k = 0;  // piece sequence (published by the weights producer)
+#endif
 #pragma unroll 1
   for (int pb = 0; pb < 2; ++pb) {
     const int g0 = S.wgr[2 * pb], g1 = S.wgr[2 * pb + 1], sp = wgs_split(pb, g0, g1);
@@ -2607,11 +2938,27 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
     const __nv_bfloat16* xsrc = pb ? p.xB : p.xA;
     int curj = -1, npad = 8;
     const __nv_bfloat16* jb = xsrc;
+#if OKC_WGSDYN
+    (void)g0; (void)g1; (void)sp;
+    int ps0 = 0, ps1 = 0, pu = 0;  // current piece
+#pragma unroll 1
+    for (int st = 0;; ++st, ++n) {
+      if (st >= ps1) {
+        const int e = wgs_piece(S, k++);
+        if (e == WGS_PEND) break;
+        pu = e >> 8; ps0 = (e >> 4) & 15; ps1 = (e & 15) + 1;
+        st = ps0;
+      }
+      const int u = pu;
+      const int j = u >> ubl;
+      const int gs = (u << 4) + st;
+#else
 #pragma unroll 1
     for (int i = 0, gs = sp; i < g1 - g0; ++i, ++gs, ++n) {
       if (gs == g1) gs = g0;  // [sp, g1) done: then [g0, sp)
       const int u = gs >> 4, st = gs & 15;
       const int j = u >> ubl;
+#endif
       if (n >= WGS_NX) {
         unsigned long long tr0 = 0;
         if (OKC_DEBUG) tr0 = gtimer();
@@ -2938,10 +3285,21 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
   if (!PB) pd = WgsPend{1, u, -1, 0};  // the doneA release waits until the stores are done: deferred
 }
 template <bool PB>
-__device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned char* ring, int g0, int g1, int& seq) {
+__device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned char* ring, int g0, int g1, int& seq, int& k) {
   // (__forceinline__: outlined by NVVM when it grows, a CALL that makes ptxas serialize every wgmma, C7510)
   constexpr int UBL = PB ? 4 : 5;
   WgsPend pd{0, 0, 0, 0};
+#if OKC_WGSDYN
+  (void)g0; (void)g1;
+#pragma unroll 1
+  for (;;) {
+    const int e = wgs_piece(S, k++);  // the weights producer's published piece
+    if (e == WGS_PEND) break;
+    const int u = e >> 8, s0 = (e >> 4) & 15, s1 = (e & 15) + 1;
+    const int slot = (s1 - s0 == 16) ? -1 : u;  // a unit split between CTAs: fixup slot = the unit
+    const int ntt = (S.jC[u >> UBL] + 7) >> 3;
+#else
+  (void)k;
 #pragma unroll 1
   for (int gs = wgs_split(PB, g0, g1), ge = g1;;) {
     if (gs >= ge) {  // [sp, g1) done: then [g0, sp); the bounds come back from smem (no extra live state)
@@ -2952,6 +3310,7 @@ __device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned cha
     // a unit split between CTAs: its fixup slot is the CTA holding its first stage
     const int slot = (s1 - s0 == 16) ? -1 : (s0 == 0 ? (int)blockIdx.x : wgs_cta_of(S, PB, u << 4, gridDim.x));
     const int ntt = (S.jC[u >> UBL] + 7) >> 3;
+#endif
     switch (ntt) {
       case 1: wgs_seg<PB, 1>(p, S, ring, u, s0, s1, slot, seq, pd); break;
 #if OKC_FT_T > 8
@@ -2966,7 +3325,9 @@ __device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned cha
       default: wgs_seg<PB, 8>(p, S, ring, u, s0, s1, slot, seq, pd); break;
 #endif
     }
+#if !OKC_WGSDYN
     gs += s1 - s0;
+#endif
   }
   wgs_flush<PB>(p, S, pd);
 }
@@ -2993,8 +3354,16 @@ __device__ __forceinline__ int wgs_stage_at(const Smem& S, int nj, int pb, uint3
 }
 __device__ __forceinline__ void wgs_range(const Smem& S, int nj, int pb, int c, int G, int& g0, int& g1) {
   const uint32_t tot = pb ? S.wtotB : S.wtot;
+#if OKC_WGSDYN
+  // static ranges over the first (1 - 2^-WGSDYNS) of the cost; the stages from stage_at(tots) on are the pool
+  if (nj == 0) { g0 = g1 = 0; return; }
+  const uint32_t tots = tot - (tot >> OKC_WGSDYNS);
+  g0 = wgs_stage_at(S, nj, pb, tots * (uint32_t)c / (uint32_t)G);
+  g1 = wgs_stage_at(S, nj, pb, tots * (uint32_t)(c + 1) / (uint32_t)G);
+#else
   g0 = wgs_stage_at(S, nj, pb, tot * (uint32_t)c / (uint32_t)G);
   g1 = c == G - 1 ? (nj << (9 - pb)) : wgs_stage_at(S, nj, pb, tot * (uint32_t)(c + 1) / (uint32_t)G);
+#endif
 }
 // this CTA's stage ranges (stream-K over 256-row units x 16 stages), one thread: the producers stream the same
 __device__ __noinline__ void wgs_ranges(const Params& p, Smem& S) {
@@ -3002,6 +3371,12 @@ __device__ __noinline__ void wgs_ranges(const Params& p, Smem& S) {
   wgs_prefix(S, nj);
   wgs_range(S, nj, 0, blockIdx.x, gridDim.x, S.wgr[0], S.wgr[1]);
   wgs_range(S, nj, 1, blockIdx.x, gridDim.x, S.wgr[2], S.wgr[3]);
+#if OKC_WGSDYN
+  S.wgd[0] = nj ? wgs_stage_at(S, nj, 0, S.wtot - (S.wtot >> OKC_WGSDYNS)) : 0;
+  S.wgd[1] = nj << 9;
+  S.wgd[2] = nj ? wgs_stage_at(S, nj, 1, S.wtotB - (S.wtotB >> OKC_WGSDYNS)) : 0;
+  S.wgd[3] = nj << 8;
+#endif
 #if OKC_DEBUG && OKC_WGSFIT
   if (p.dbg) {  // per-phase stage counts by n-tiles (bytes 0..7), for the cost-model fit
     for (int pb = 0; pb < 2; ++pb) {
@@ -3058,7 +3433,10 @@ __device__ __forceinline__ void run_phase(const Params& p, Smem& S, __nv_bfloat1
       cpf = OKC_CPFF || njF == 0;
     }
   }
-#if OKC_WS
+#if OKC_WSDYN
+  (void)cpf; (void)cBn; (void)v0; (void)v1;
+  if (!PB) skinny_ring_wsd(p, S, reinterpret_cast<unsigned char*>(xbuf));  // both phases in one dynamic sequence
+#elif OKC_WS
   (void)cpf; (void)cBn;
   skinny_ring_ws<PB>(p, S, v0, v1, reinterpret_cast<unsigned char*>(xbuf), S.bars, S.seq);
 #else
@@ -3097,7 +3475,9 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   // programmatic dependent launch: everything below reads the previous kernel's outputs (routing, x) or writes
   // scratch, so wait for it here; without the launch attribute this returns at once
   asm volatile("griddepcontrol.wait;\n" ::: "memory");
-#if OKC_WS
+#if OKC_WSDYN
+  if (tid >= NT) { ws_helper_d(p, S, reinterpret_cast<unsigned char*>(xbuf)); return; }
+#elif OKC_WS
   if (tid >= NT) { ws_helper(p, S, reinterpret_cast<unsigned char*>(xbuf)); return; }
 #endif
 #if OKC_WGS
@@ -3185,6 +3565,9 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
       const int n = min(OKC_FAST1, v1 - v0);
 #endif
       asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
+#if OKC_WSDYN
+      for (int k = 0; k < 8; ++k) *reinterpret_cast<volatile int*>(&S.uid[k]) = -1;  // no stale sequence tags
+#endif
 #if OKC_SPLIT
 #pragma unroll
       for (int i = 0; i < OKC_FAST1; ++i) {
@@ -3198,6 +3581,9 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #endif
         const unsigned char* src = p.wAu + ((size_t)e * RB_A + (v & (RB_A - 1))) * (size_t)UNIT_BYTES;
         unsigned char* slot = reinterpret_cast<unsigned char*>(xbuf) + i * UNIT_BYTES;
+#if OKC_WSDYN
+        *reinterpret_cast<volatile int*>(&S.uid[i]) = (i << 16) | v;  // sequence index i = phase-A unit v
+#endif
         asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(S.bars + i)), "r"(UNIT_BYTES) : "memory");
         asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" L2H_SUFFIX " [%0], [%1], %2, [%3]" L2H_OPERAND ";\n"
                      ::"r"(smem_u32(slot)), "l"(src), "r"(UNIT_BYTES), "r"(smem_u32(S.bars + i)) L2H_ARG : "memory");
@@ -3245,12 +3631,15 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     S.fseq = 0;
     S.preissuedB = 0;
     S.xbuf_ptr = xbuf;
+#if OKC_WGSDYN
+    for (int k = 0; k < 16; ++k) S.wseg[k] = -1;  // no stale piece tags from an earlier launch
+#endif
     // the generation can only change at this launch's grid barrier, which every CTA reaches after this point
     const int gen = *reinterpret_cast<volatile const int*>(p.ctr + 3);  // launch generation (bumped at the barrier)
     S.gen = gen;
     S.ssp = (gen & 1) ? p.ss1 : p.ss;
   }
-#if SKDYN
+#if SKDYN || OKC_WSDYN
   for (int i = tid; i < JMAX; i += NT) S.dync[i] = 0;
 #endif
   route(p, S);
@@ -3269,8 +3658,15 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     const int G = gridDim.x, c = blockIdx.x;
     const float rG = __fdividef(1.f, (float)G);
     const int nA = S.njS * RB_A, nB = S.njS * RB_B;
+#if OKC_WSDYN
+    const int nAs = nA - dyn_pool(nA, G), nBs = nB - dyn_pool(nB, G);  // static parts (the same split FAST1 used)
+    S.wsr[0] = muldiv_g(nAs, c, G, rG); S.wsr[1] = muldiv_g(nAs, c + 1, G, rG);
+    S.wsr[2] = muldiv_g(nBs, c, G, rG); S.wsr[3] = muldiv_g(nBs, c + 1, G, rG);
+    S.wsd[0] = nAs; S.wsd[1] = nA; S.wsd[2] = nBs; S.wsd[3] = nB;
+#else
     S.wsr[0] = muldiv_g(nA, c, G, rG); S.wsr[1] = muldiv_g(nA, c + 1, G, rG);
     S.wsr[2] = muldiv_g(nB, c, G, rG); S.wsr[3] = muldiv_g(nB, c + 1, G, rG);
+#endif
   }
   WS_JOIN();
 #endif
@@ -3305,10 +3701,10 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #endif
   {
     unsigned char* ring = reinterpret_cast<unsigned char*>(xbuf);
-    int seq = 0;
-    wgs_phase<false>(p, S, ring, S.wgr[0], S.wgr[1], seq);
+    int seq = 0, wk = 0;
+    wgs_phase<false>(p, S, ring, S.wgr[0], S.wgr[1], seq, wk);
     DBG(2);
-    wgs_phase<true>(p, S, ring, S.wgr[2], S.wgr[3], seq);
+    wgs_phase<true>(p, S, ring, S.wgr[2], S.wgr[3], seq, wk);
     DBG(3);
   }
 #else
@@ -3982,7 +4378,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "A"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "C"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 DIAG_VARIANT_SETS = {
@@ -3993,6 +4389,25 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "D": {  # WGS: dynamic stage claiming (WGSDYN) vs stream-K static ranges, pool size / segment length, timelines
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "wgs_dyn": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1",), "shapes": _WGS_SHAPES},
+        "wgs_dyn_s1": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSDYNS=1"), "shapes": _WGS_SHAPES},
+        "wgs_dyn_seg8": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSSEG=8"), "shapes": _WGS_SHAPES},
+        "wgs_dyn_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+    },
+    "C": {  # tiny builds: dynamic unit claiming (WSDYN) vs static slices, pool size, timelines
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_dyn": {"defines": TINY_DEFINES + ("-DOKC_WSDYN=1",), "shapes": [1]},
+        "tiny_dyn_s1": {"defines": TINY_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_WSDYNS=1"), "shapes": [1]},
+        "tiny_dyn_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_dyn": {"defines": TINY2_DEFINES + ("-DOKC_WSDYN=1",), "shapes": [8]},
+        "mid": {"defines": MID_DEFINES, "shapes": [8, 16]},
+        "mid_dyn": {"defines": MID_DEFINES + ("-DOKC_WSDYN=1",), "shapes": [8, 16]},
+        "mid_dyn_s1": {"defines": MID_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_WSDYNS=1"), "shapes": [16]},
+        "mid_dyn_dbg": {"defines": MID_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_DEBUG=1"), "shapes": [16]},
     },
     "B": {  # tiny builds: early slot release (WSER), ring depth, timelines
         "main": {"defines": MAIN_DEFINES, "shapes": [8, 16]},
@@ -4007,7 +4422,7 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else _WGS_SHAPES if DIAG_SET == "D" else [1, 8, 16]
 DIAG_SEED = 1234
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
@@ -4250,7 +4665,7 @@ EMAX = MMAX * 8
 JMAX = 32 + EMAX // 64 + 8
 
 
-WGS_FIXF = 2 * 160 * 4 * 4096 + 2 * 160 * 4 + 136 * 16   # moe WGS_FIXF: stream-K fixups + doneAs after ybuf (zero between calls)
+WGS_FIXF = 2 * (JMAX * 32) * 4 * 4096 + 2 * (JMAX * 32) * 4 + 136 * 16   # moe WGS_FIXF with unit-indexed fixup slots (OKC_WGSDYN; the 160-slot builds need less): stream-K fixups + doneAs after ybuf (zero between calls)
 WGS_XROWS = EMAX + 8 * (32 + EMAX // 32 + 8)  # >= moe WGS_XROWS for FT_T >= 32
 
 
