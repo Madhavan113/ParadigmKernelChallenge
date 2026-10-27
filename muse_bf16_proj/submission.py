@@ -3662,19 +3662,8 @@ void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
 #define T12E_NTD(R_, C_, W_, SW_, SX_) T12E_CASE_D(R_, C_, W_, SW_, SX_, 1) T12E_CASE_D(R_, C_, W_, SW_, SX_, 2) T12E_CASE_D(R_, C_, W_, SW_, SX_, 4)
     CUtensorMap xmap;
     if (variant == 5) xmap = okc_x_map3(X.data_ptr(), m, (int)k, ldx, 8 * (int)nt, 2 * (int)ck);
-    T12E_CASE(16, 4, 4, 4, 4, 1) T12E_CASE(16, 4, 4, 4, 4, 2)
-    T12E_CASE(16, 4, 4, 4, 3, 1) T12E_CASE(16, 4, 4, 4, 3, 2)
-    T12E_CASE(16, 4, 4, 5, 4, 1) T12E_CASE(16, 4, 4, 5, 4, 2)
-    T12E_CASE(16, 4, 4, 5, 3, 1) T12E_CASE(16, 4, 4, 5, 3, 2)
-    T12E_CASE(16, 4, 4, 6, 4, 1) T12E_CASE(16, 4, 4, 6, 4, 2)
-    T12E_CASE(16, 4, 4, 6, 3, 1) T12E_CASE(16, 4, 4, 6, 3, 2)
-    T12E_CASE(16, 4, 4, 3, 4, 1) T12E_CASE(16, 4, 4, 3, 4, 2)
-    T12E_CASE(16, 4, 4, 3, 3, 1) T12E_CASE(16, 4, 4, 3, 3, 2)
-    T12E_CASE(16, 4, 8, 4, 4, 1) T12E_CASE(16, 4, 8, 4, 4, 2)
-    T12E_CASE(16, 4, 8, 4, 3, 1) T12E_CASE(16, 4, 8, 4, 3, 2)
-    T12E_CASE(16, 4, 8, 5, 4, 1) T12E_CASE(16, 4, 8, 5, 4, 2)
-    T12E_CASE(16, 4, 8, 6, 3, 1) T12E_CASE(16, 4, 8, 6, 3, 2)
-    T12E_CASE_D(16, 4, 4, 4, 4, 1) T12E_CASE_D(16, 4, 4, 4, 3, 2)
+    T12E_CASE(16, 4, 4, 3, 3, 1)
+    T12E_CASE(16, 4, 4, 3, 3, 2)
 #undef T12C_NT
 #undef T12E_NT
 #undef T12E_NTD
@@ -3969,7 +3958,9 @@ W12B_SHAPES = {}   # w12 ties the table at m=8 on the judge (check a6b2bd96: poo
 # (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
 T12_SHAPES = {}
 # tb12: the single-launch TMA bulk-copy 12-bit GEMM (one CTA per r-row tile over the full K): (layer, n, m) -> (r, ck, w, nsw, nsx)
-TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 4, 4), ("pooler", 4096, 16): (16, 4, 4, 4, 3)}   # t12e (check d59a9b55 bench: 14.9 / 15.8 vs 17.9 / 17.8); the other shapes lose or tie
+TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 3, 3), ("pooler", 4096, 16): (16, 4, 4, 3, 3), ("unpooler", 8192, 16): (16, 4, 4, 3, 3)}
+# t12e: 16-row tiles, 4 compute warps + producer, 3 weight + 3 x stages. Judge (check 8d975106, 4/4 and 4/3 rings): pooler m=8 15.2 vs 18.2,
+# m=16 16.5 vs 18.0; bench 3/3 rings: pooler 14.8 / 15.8, unpooler m=16 16.9 vs 18.2. qkv / o / m=1 / m=32 / the unpooler slice lose or tie.
 _TB12_ON = False   # set by prepare() after the tb12 self-test (table output + probe rows) passes
 T12_LAYOUTS = {(16, 4)}   # (r, ck) weight layouts kept in state (the bench sweeps them)
 T12_ASM = True   # PRMT decode via inline PTX (the plain-Triton decode is for the interpreter)
@@ -4403,7 +4394,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 200
 BENCH_STREAM = False  # STEP 1: bulk-copy stream sweep
 BENCH_T12 = True      # STEP 2: tb12 rows

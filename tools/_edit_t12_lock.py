@@ -9,7 +9,7 @@ a = s.index("    CUtensorMap xmap;\n"); b = s.index("#undef T12C_NT")
 if final:
     cases = ("    CUtensorMap xmap;\n"
              "    if (variant == 5) xmap = okc_x_map3(X.data_ptr(), m, (int)k, ldx, 8 * (int)nt, 2 * (int)ck);\n"
-             "    T12E_CASE(16, 4, 4, 4, 4, 1)\n    T12E_CASE(16, 4, 4, 4, 3, 2)\n")
+             "    T12E_CASE(16, 4, 4, 3, 3, 1)\n    T12E_CASE(16, 4, 4, 3, 3, 2)\n")
 else:
     cfgs = [(16, 4, 4, 4, 4), (16, 4, 4, 4, 3), (16, 4, 4, 5, 4), (16, 4, 4, 5, 3), (16, 4, 4, 6, 4), (16, 4, 4, 6, 3),
             (16, 4, 4, 3, 4), (16, 4, 4, 3, 3), (16, 4, 8, 4, 4), (16, 4, 8, 4, 3), (16, 4, 8, 5, 4), (16, 4, 8, 6, 3)]
@@ -23,7 +23,12 @@ w.write_text(s)
 
 sp = root / "muse_bf16_proj/submission.py"; t = sp.read_text()
 a = t.index("TB12_SHAPES = {"); b = t.index("\n", a) + 1
-t = t[:a] + ('TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 4, 4), ("pooler", 4096, 16): (16, 4, 4, 4, 3)}   # t12e (check d59a9b55 bench: 14.9 / 15.8 vs 17.9 / 17.8); the other shapes lose or tie\n') + t[b:]
+if final:
+    t = t[:a] + ('TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 3, 3), ("pooler", 4096, 16): (16, 4, 4, 3, 3), ("unpooler", 8192, 16): (16, 4, 4, 3, 3)}\n'
+                 '# t12e: 16-row tiles, 4 compute warps + producer, 3 weight + 3 x stages. Judge (check 8d975106, 4/4 and 4/3 rings): pooler m=8 15.2 vs 18.2,\n'
+                 '# m=16 16.5 vs 18.0; bench 3/3 rings: pooler 14.8 / 15.8, unpooler m=16 16.9 vs 18.2. qkv / o / m=1 / m=32 / the unpooler slice lose or tie.\n') + t[b:]
+else:
+    t = t[:a] + ('TB12_SHAPES = {("pooler", 4096, 8): (16, 4, 4, 4, 4), ("pooler", 4096, 16): (16, 4, 4, 4, 3)}   # t12e (check d59a9b55 bench: 14.9 / 15.8 vs 17.9 / 17.8); the other shapes lose or tie\n') + t[b:]
 t = t.replace("T12_LAYOUTS = {(32, 2), (16, 2), (32, 4), (16, 4)}", "T12_LAYOUTS = {(16, 4)}")
 if final:
     t = t.replace("BENCH = True        # microbenchmarks", "BENCH = False       # microbenchmarks")

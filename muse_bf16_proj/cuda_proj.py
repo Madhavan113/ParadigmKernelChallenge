@@ -3116,19 +3116,8 @@ void t12(torch::Tensor X, torch::Tensor Wt, int64_t eb, torch::Tensor esc_roff, 
 #define T12E_NTD(R_, C_, W_, SW_, SX_) T12E_CASE_D(R_, C_, W_, SW_, SX_, 1) T12E_CASE_D(R_, C_, W_, SW_, SX_, 2) T12E_CASE_D(R_, C_, W_, SW_, SX_, 4)
     CUtensorMap xmap;
     if (variant == 5) xmap = okc_x_map3(X.data_ptr(), m, (int)k, ldx, 8 * (int)nt, 2 * (int)ck);
-    T12E_CASE(16, 4, 4, 4, 4, 1) T12E_CASE(16, 4, 4, 4, 4, 2)
-    T12E_CASE(16, 4, 4, 4, 3, 1) T12E_CASE(16, 4, 4, 4, 3, 2)
-    T12E_CASE(16, 4, 4, 5, 4, 1) T12E_CASE(16, 4, 4, 5, 4, 2)
-    T12E_CASE(16, 4, 4, 5, 3, 1) T12E_CASE(16, 4, 4, 5, 3, 2)
-    T12E_CASE(16, 4, 4, 6, 4, 1) T12E_CASE(16, 4, 4, 6, 4, 2)
-    T12E_CASE(16, 4, 4, 6, 3, 1) T12E_CASE(16, 4, 4, 6, 3, 2)
-    T12E_CASE(16, 4, 4, 3, 4, 1) T12E_CASE(16, 4, 4, 3, 4, 2)
-    T12E_CASE(16, 4, 4, 3, 3, 1) T12E_CASE(16, 4, 4, 3, 3, 2)
-    T12E_CASE(16, 4, 8, 4, 4, 1) T12E_CASE(16, 4, 8, 4, 4, 2)
-    T12E_CASE(16, 4, 8, 4, 3, 1) T12E_CASE(16, 4, 8, 4, 3, 2)
-    T12E_CASE(16, 4, 8, 5, 4, 1) T12E_CASE(16, 4, 8, 5, 4, 2)
-    T12E_CASE(16, 4, 8, 6, 3, 1) T12E_CASE(16, 4, 8, 6, 3, 2)
-    T12E_CASE_D(16, 4, 4, 4, 4, 1) T12E_CASE_D(16, 4, 4, 4, 3, 2)
+    T12E_CASE(16, 4, 4, 3, 3, 1)
+    T12E_CASE(16, 4, 4, 3, 3, 2)
 #undef T12C_NT
 #undef T12E_NT
 #undef T12E_NTD
