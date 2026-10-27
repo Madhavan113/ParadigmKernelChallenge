@@ -54,7 +54,7 @@ QKV = 2304
 ROUTER_MULT = 0.1767766952966369
 LOG2E = 1.4426950408889634
 
-_TUNE_LOG = False
+_TUNE_LOG = True   # prepare() prints the tuner's candidate times and picks per token count (untimed; judge .log)
 FORCE_PBMAX = None
 # Programmatic Dependent Launch for this file's Triton glue: each kernel launches while its producer drains and
 # waits (griddepcontrol.wait) right before its first read of producer data; weights and older inputs load before.
@@ -73,8 +73,10 @@ TUNE_MARGIN = 0.95
 # qkv at T=128 cuBLAS 249.4 vs split-K 251.0 (16x8 sliding); qkv at T=256 cuBLAS 351.1 vs split-K 353.5 (32x8 sliding).
 # pr at T=32: separate bfp 166.8 / 318.7 vs fused bfpf 167.9 / 320.2 us (32x1 sliding / full). T=256 pr/un: 4-way tie.
 # un at T=1/8 (the 1024-row slice): bfp 80.7 / 80.1 / 116.7 / 138.2 vs split-K 81.9 / 81.2 / 118.8 / 140.1 us (1x1 s/f, 1x8 s/f).
-PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp", (32, "pr"): "bfp",
+PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp",
             (128, "qkv"): (True, "mm16"), (256, "qkv"): (True, "mm16")}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
+# ((32, "pr"): "bfp" was pinned over the fused launch (1.1 us in-chain); with the routing fused into that launch the
+# tuner's own timing, which includes the routing kernel / tail, decides)
 # a tuple pins the choice to the faster of those picks by the tuner's own times (here: cuBLAS fp32 out vs bf16 out,
 # never the Triton split-K the isolated tuner prefers)
 FORCE_MM = None
@@ -115,6 +117,18 @@ def _bfp_pdl(T):
 def _bfp_gemm(st, name, x, m, n, k):
     _bfp_pdl(m)
     return bfp_kernel_fn({"x": x, "config": {"layer": _BFP_LAYER[name], "m": m, "n": n, "k": k}}, st["bfp"])
+
+
+FUSE_ROUTE = True   # the fused pooler + router launch (sk2f) also does the routing and the pre-expert norm in its last
+                    # CTA, replacing the _route_split launch (T <= 32, agent/Marlin experts: plain xm layout)
+
+
+def _fused_route(state, data, ids, lids, wts, xm):
+    """The route tuple for bfp_fused_pooler_router, or None when the separate _route_split kernel must run."""
+    ls = data["local_start"]
+    if not FUSE_ROUTE or ls.dtype != torch.int32 or state["g_preexp"].dtype != torch.bfloat16:
+        return None
+    return (state["bias"], state["g_preexp"], ids, lids, wts, xm, ls)
 
 
 SCRATCH_GUARD = 1 << 16   # sentinel words after each buffer my glue allocates: wide enough for far overruns (v154m-style state ~4K words out)
@@ -1187,12 +1201,22 @@ def _tune(st, log=False):
         for name, w, K in (("qkv", st["qkv"], HIDDEN), ("o", st["o"], 1024), ("pr", st["pr"], HIDDEN),
                            ("un", st["unpool_slice"] if T <= 8 else st["unpool"], D_EXPERT)):
             xd = (torch.randn(T, K, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+            # the pooler + router candidates are timed WITH the routing kernel / the fused routing tail they imply
+            r_ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
+            r_lids = torch.empty((T, 8), device=dev, dtype=torch.int32)
+            r_wts = torch.empty((T, 8), device=dev, dtype=torch.float32)
+            r_xm = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
+
+            def _pr_split(pooled, logits):
+                _route_split[(T,)](pooled, logits, st["bias"], st["g_preexp"], r_ids, r_wts, r_xm, data["local_start"],
+                                   r_lids, PERMUTED=False, num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+
             if st.get("bfp") is not None:
                 st["mm_pick"][(T, name)] = "bfp"
                 try:
                     if name == "pr":
-                        t_bfp = _graph_time(lambda: (_bfp_gemm(st, "pool", xd, T, D_EXPERT, HIDDEN),
-                                                     _bfp_gemm(st, "router", xd, T, N_EXPERTS, HIDDEN)),
+                        t_bfp = _graph_time(lambda: _pr_split(_bfp_gemm(st, "pool", xd, T, D_EXPERT, HIDDEN),
+                                                              _bfp_gemm(st, "router", xd, T, N_EXPERTS, HIDDEN)),
                                             flush, reps=5)
                     else:
                         nn = w.shape[0]
@@ -1214,7 +1238,12 @@ def _tune(st, log=False):
             t_bfpf = 1e30
             if name == "pr" and T <= 32 and st.get("bfp") is not None and "bfp_fused_pooler_router" in globals():
                 try:
-                    t_bfpf = _graph_time(lambda: bfp_fused_pooler_router(xd, st["bfp"]), flush, reps=5)
+                    _bfp_pdl(T)
+                    rt = _fused_route(st, data, r_ids, r_lids, r_wts, r_xm)
+                    if rt is not None:
+                        t_bfpf = _graph_time(lambda: bfp_fused_pooler_router(xd, st["bfp"], rt), flush, reps=5)
+                    else:
+                        t_bfpf = _graph_time(lambda: _pr_split(*bfp_fused_pooler_router(xd, st["bfp"])), flush, reps=5)
                 except Exception:  # noqa: BLE001  (sm_80 or an older bf16_proj file: not offered)
                     t_bfpf = 1e30
             t_mm16 = 1e30
@@ -1392,7 +1421,8 @@ def _attn_cfg(B, L, sliding):
 
 # The attention module's extension, built once for this layer: its source with the layer's measured flags (the
 # standalone entry's defaults are QDIRECT=1, PK2=1, W0ENABLE=0; this build is their "v298w1").
-ATT_BUILD_FLAGS = ("-DOKC_QDIRECT=0", "-DOKC_PK2=0", "-DOKC_W0ENABLE=1")
+ATT_BUILD_FLAGS = ()   # A/B 7d23a37c vs c8b5aab9: the standalone defaults (QDIRECT=1 PK2=1 W0ENABLE=0) measured 0.3-3 us
+                       # faster per attention launch on 10 of 12 shapes than the layer's old build (0/0/1)
 
 
 def _att7():
@@ -1608,18 +1638,6 @@ def _after_attention(data, state, o_in, gate, T):
         _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
                          num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
     # 4. pooler + router (BF16 hi + lo rows, FP32 accumulation), routing, pre-expert norm
-    mmp = state.get("mm_pick", {})
-    ppick = mmp.get((T, "pr"), mmp.get((_bucket(T), "pr"), False))
-    if ppick == "bfpf" and T <= 32 and state.get("bfp") is not None:
-        # bf16_proj's fused pooler + router: one launch, both read h once (bf16 [T, 4096], fp32 [T, 256])
-        _bfp_pdl(T)
-        P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
-    elif ppick == "bfp" and state.get("bfp") is not None:
-        pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
-        logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed
-        P, S = (pooled, logits), -1
-    else:
-        P, S = dense(h, state["pr"], T, state, "pr")
     ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     lids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     wts = torch.empty((T, 8), **f32)
@@ -1635,7 +1653,23 @@ def _after_attention(data, state, o_in, gate, T):
     if not (use_marlin or use_ma):
         raise RuntimeError("no expert backend: neither the moe agent's kernel nor SGLang's Marlin is available")
     xm = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
-    if S == -1:  # pooler and router came from the bf16_proj kernels as two separate tensors
+    mmp = state.get("mm_pick", {})
+    ppick = mmp.get((T, "pr"), mmp.get((_bucket(T), "pr"), False))
+    if ppick == "bfpf" and T <= 32 and state.get("bfp") is not None:
+        # bf16_proj's fused pooler + router: one launch, both read h once (bf16 [T, 4096], fp32 [T, 256]); with
+        # FUSE_ROUTE its last CTA also does the routing and the pre-expert norm (no _route_split launch)
+        _bfp_pdl(T)
+        route = _fused_route(state, data, ids, lids, wts, xm) if (use_marlin or use_ma) else None
+        P, S = bfp_fused_pooler_router(h, state["bfp"], route), (-2 if route is not None else -1)
+    elif ppick == "bfp" and state.get("bfp") is not None:
+        pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
+        logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed
+        P, S = (pooled, logits), -1
+    else:
+        P, S = dense(h, state["pr"], T, state, "pr")
+    if S == -2:  # the routing and xm were produced inside the fused pooler + router launch
+        pass
+    elif S == -1:  # pooler and router came from the bf16_proj kernels as two separate tensors
         pooled, logits = P
         _route_split[(T,)](pooled, logits, state["bias"], state["g_preexp"], ids, wts, xm,
                            data["local_start"], lids, PERMUTED=not (use_marlin or use_ma), num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))

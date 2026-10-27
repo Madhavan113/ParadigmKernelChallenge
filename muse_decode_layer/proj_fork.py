@@ -1008,7 +1008,10 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
            const __nv_bfloat16* __restrict__ x, OutT* __restrict__ out,
            const int2* __restrict__ ptab, int pmax, uint32_t base4, int M, int N, int K, int dg,
            unsigned long long* __restrict__ dbg, const uint8_t* __restrict__ Wsr, float* __restrict__ outr,
-           float* __restrict__ part, int* __restrict__ rcnt, int pdl) {
+           float* __restrict__ part, int* __restrict__ rcnt, int pdl,
+           const float* __restrict__ rbias, const __nv_bfloat16* __restrict__ gpre, int* __restrict__ rids,
+           int* __restrict__ rlids, float* __restrict__ rwts, __nv_bfloat16* __restrict__ xm, const int* __restrict__ rls,
+           float* __restrict__ part2, int* __restrict__ dcnt) {
 #if __CUDA_ARCH__ >= 900
   const int dgv = SK2_DIAG ? dg : 0;   // diagnostics (dg) compiled out of production builds
   auto gtime = []() { unsigned long long t; asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t)); return t; };
@@ -1474,6 +1477,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   }
   if (trace && tid == 0) tr[14] = gtime();
   constexpr int R4 = R / 4;
+  float ssq = 0.f;   // FUSE route: this thread's sum of squares of its bf16 pooled outputs
   for (int idx = tid; idx < R4 * M; idx += NC) {
     const int tt = idx / R4, row = (idx - tt * R4) * 4;
     float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
@@ -1505,6 +1509,103 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       pk.x = *reinterpret_cast<uint32_t*>(&lo);
       pk.y = *reinterpret_cast<uint32_t*>(&hi);
       *reinterpret_cast<uint2*>(o) = pk;
+      if constexpr (FUSE) {
+        const float2 l2 = __bfloat1622float2(lo), h2 = __bfloat1622float2(hi);
+        ssq += l2.x * l2.x + l2.y * l2.y + h2.x * h2.x + h2.y * h2.y;
+      }
+    }
+  }
+  if constexpr (FUSE) {
+    if (dcnt != nullptr) {
+      // ---- fused routing tail (decode layer): per-token sum of squares of this CTA's 32 bf16 pooled columns ->
+      // part2[cta][tok]; a grid ticket; the LAST CTA computes the top-8 routing from the router logits and the
+      // pre-expert RMSNorm of the pooled rows: what the layer's _route_split kernel did as a separate launch.
+      static_assert(R == 32 && NC >= 256, "sk2 fused route: pooler config (R = 32, 8 consumer warps)");
+      // lanes 8 tt .. 8 tt + 7 hold token tt's 8 column groups (idx = tid, R4 = 8, one pass for M <= 32)
+      ssq += __shfl_xor_sync(0xffffffffu, ssq, 1);
+      ssq += __shfl_xor_sync(0xffffffffu, ssq, 2);
+      ssq += __shfl_xor_sync(0xffffffffu, ssq, 4);
+      if ((tid & 7) == 0 && (tid >> 3) < M) __stcg(part2 + cta * 32 + (tid >> 3), ssq);
+      __shared__ int s_rlast2;
+      named_bar(1, NC);
+      if (tid == 0) {   // release: this CTA's pooled rows, router rows and partial are visible before its count
+        int old;
+        asm volatile("atom.add.release.gpu.global.s32 %0, [%1], 1;" : "=r"(old) : "l"(dcnt) : "memory");
+        s_rlast2 = (old % (int)gridDim.x) == (int)gridDim.x - 1;   // the counter only ever grows by gridDim.x per launch
+        if (s_rlast2) asm volatile("fence.acq_rel.gpu;" ::: "memory");
+      }
+      named_bar(1, NC);
+      if (!s_rlast2) return;
+      const float NEG_INF = __int_as_float(0xff800000u);
+      const int ls = __ldcg(rls);
+      float* ssm = red;   // [TOKS]: per-token sum of squares, the CTA partials added in a fixed order
+      if (warp == 0) {
+        for (int tt = lane; tt < M; tt += 32) {
+          float s = 0.f;
+          for (int c = 0; c < (int)gridDim.x; ++c) s += __ldcg(part2 + c * 32 + tt);
+          ssm[tt] = s;
+        }
+      }
+      // top-8 of sigmoid(0.1768 logit) + bias per token, one warp per token (lane holds 8 experts); weights = the
+      // selected sigmoid scores over their sum; ties -> the smallest index (as the Triton argmax)
+      for (int tt = warp; tt < M; tt += NW) {
+        float sc[8], sel[8];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const float l = __ldcg(outr + (size_t)tt * 256 + lane * 8 + j);
+          sc[j] = 1.f / (1.f + __expf(-l * 0.1767766952966369f));
+          sel[j] = sc[j] + __ldg(rbias + lane * 8 + j);
+        }
+        float wsum = 0.f, myw = 0.f;
+        int myid = 0;
+#pragma unroll
+        for (int k = 0; k < 8; ++k) {
+          float bm = NEG_INF;
+          int bi = lane * 8;
+#pragma unroll
+          for (int j = 0; j < 8; ++j)
+            if (sel[j] > bm) { bm = sel[j]; bi = lane * 8 + j; }
+#pragma unroll
+          for (int off = 16; off > 0; off >>= 1) {
+            const float om = __shfl_xor_sync(0xffffffffu, bm, off);
+            const int oi = __shfl_xor_sync(0xffffffffu, bi, off);
+            if (om > bm || (om == bm && oi < bi)) { bm = om; bi = oi; }
+          }
+          float mine = 0.f;
+          if ((bi >> 3) == lane) {   // static indexing (no local memory): select by an unrolled compare
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+              if ((bi & 7) == j) { mine = sc[j]; sel[j] = NEG_INF; }
+          }
+          const float val = __shfl_sync(0xffffffffu, mine, bi >> 3);
+          wsum += val;
+          if (lane == k) { myid = bi; myw = val; }
+        }
+        if (lane < 8) {
+          rids[tt * 8 + lane] = myid;
+          rwts[tt * 8 + lane] = myw / (wsum + 1e-15f);
+          const int lid = (myid - ls + 256) % 256;
+          rlids[tt * 8 + lane] = lid < 32 ? lid : -1;
+        }
+      }
+      named_bar(1, NC);
+      // pre-expert RMSNorm: xm = pooled * rsqrt(mean(pooled^2) + 1e-5) * (1 + w); 8 bf16 columns per thread step
+      for (int i = tid; i < M * 512; i += NC) {
+        const int tt = i >> 9, c8 = (i & 511) * 8;
+        const float rs = rsqrtf(ssm[tt] * (1.f / 4096.f) + 1e-5f);
+        const uint4 pv = __ldcg(reinterpret_cast<const uint4*>(out + (size_t)tt * N + c8));
+        const uint4 gv = __ldg(reinterpret_cast<const uint4*>(gpre + c8));
+        const __nv_bfloat162* p2 = reinterpret_cast<const __nv_bfloat162*>(&pv);
+        const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gv);
+        uint4 ov;
+        __nv_bfloat162* o2 = reinterpret_cast<__nv_bfloat162*>(&ov);
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float2 p = __bfloat1622float2(p2[j]), gg = __bfloat1622float2(g2[j]);
+          o2[j] = __floats2bfloat162_rn(p.x * rs * (1.f + gg.x), p.y * rs * (1.f + gg.y));
+        }
+        *reinterpret_cast<uint4*>(xm + (size_t)tt * 4096 + c8) = ov;
+      }
     }
   }
   if (trace && tid == 0) tr[15] = gtime();
@@ -1519,7 +1620,10 @@ template <int MT, int TOKR, int NT, int NWR, int WSK, int UPW, int NSTAGE, bool 
           bool FUSE = false>
 static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& out, const at::Tensor& ptab,
                        int64_t pmax, int64_t base4, int M, int N, int K, int64_t dg, unsigned long long* dbg,
-                       const uint8_t* wsr = nullptr, float* outr = nullptr, float* part = nullptr, int* rcnt = nullptr) {
+                       const uint8_t* wsr = nullptr, float* outr = nullptr, float* part = nullptr, int* rcnt = nullptr,
+                       const float* rbias = nullptr, const __nv_bfloat16* gpre = nullptr, int* rids = nullptr,
+                       int* rlids = nullptr, float* rwts = nullptr, __nv_bfloat16* xmo = nullptr, const int* rls = nullptr,
+                       float* part2 = nullptr, int* dcnt = nullptr) {
   constexpr int NW = NWR * WSK;
   constexpr int R = NWR * NT * 8;
   constexpr int UPS = WSK * UPW;
@@ -1575,11 +1679,12 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
       lc.attrs = at_;
       lc.numAttrs = na;
       C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kern, xm, wsp, xp, op, tp, (int)pmax, (uint32_t)base4, M, N, K, (int)dg, dbg,
-                                        wsr, outr, part, rcnt, pdl));
+                                        wsr, outr, part, rcnt, pdl, rbias, gpre, rids, rlids, rwts, xmo, rls, part2, dcnt));
     } else {
       kern<<<N / R, (NW + 1 + NESC) * 32, smem, at::cuda::getCurrentCUDAStream()>>>(xm, wsp, xp, op, tp, (int)pmax,
                                                                                (uint32_t)base4, M, N, K, (int)dg, dbg,
-                                                                               wsr, outr, part, rcnt, 0);
+                                                                               wsr, outr, part, rcnt, 0, rbias, gpre, rids,
+                                                                               rlids, rwts, xmo, rls, part2, dcnt);
       C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
   };
@@ -1587,7 +1692,9 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
 }
 
 void sk2f(at::Tensor Ws, at::Tensor Wsr, at::Tensor x, at::Tensor out, at::Tensor outr, at::Tensor ptab, int64_t pmax,
-          int64_t base4, at::Tensor part, at::Tensor rcnt, int64_t M, int64_t tokr) {
+          int64_t base4, at::Tensor part, at::Tensor rcnt, int64_t M, int64_t tokr, at::Tensor rbias, at::Tensor gpre,
+          at::Tensor rids, at::Tensor rlids, at::Tensor rwts, at::Tensor xm, at::Tensor rls, at::Tensor part2,
+          at::Tensor dcnt, int64_t fuse_route) {
   @@SK2F_DISPATCH@@
   TORCH_CHECK(false, "sk2f: no config");
 }
@@ -1970,7 +2077,9 @@ void gq(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t M, int64_t 
 void sk2(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor ptab, int64_t pmax, int64_t base4,
          int64_t M, int64_t N, int64_t K, int64_t cfg, int64_t tokr, int64_t dg, torch::Tensor dbgt);
 void sk2f(torch::Tensor Ws, torch::Tensor Wsr, torch::Tensor x, torch::Tensor out, torch::Tensor outr, torch::Tensor ptab,
-          int64_t pmax, int64_t base4, torch::Tensor part, torch::Tensor rcnt, int64_t M, int64_t tokr);
+          int64_t pmax, int64_t base4, torch::Tensor part, torch::Tensor rcnt, int64_t M, int64_t tokr, torch::Tensor rbias,
+          torch::Tensor gpre, torch::Tensor rids, torch::Tensor rlids, torch::Tensor rwts, torch::Tensor xm, torch::Tensor rls,
+          torch::Tensor part2, torch::Tensor dcnt, int64_t fuse_route);
 void sk2_set_pdl(int64_t n);
 """
 
@@ -2672,7 +2781,8 @@ def _sk2_src(sm90):
         return ('void sk2(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, '
                 'int64_t, int64_t, int64_t, at::Tensor) { TORCH_CHECK(false, "sk2 needs sm_90"); }\n'
                 'void sk2f(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, '
-                'at::Tensor, at::Tensor, int64_t, int64_t) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
+                'at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
+                'at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
                 'void sk2_set_pdl(int64_t) {}')
     lines = []
     for ci, cfg in enumerate(SK2_CONFIGS):
@@ -2697,7 +2807,13 @@ def _sk2_src(sm90):
             flines.append(f"if (tokr == {tokr}) {{ launch_sk2<{mt}, {tokr}, {NT}, {NWR}, {WSK}, {UPW}, {nstage}, true, false, "
                           f"{nacc}, 1, __nv_bfloat16, true>(Ws, x, out, ptab, pmax, base4, M, 4096, 8192, 0, nullptr, "
                           f"reinterpret_cast<const uint8_t*>(Wsr.data_ptr()), outr.data_ptr<float>(), part.data_ptr<float>(), "
-                          f"rcnt.data_ptr<int>()); return; }}")
+                          f"rcnt.data_ptr<int>(), fuse_route ? rbias.data_ptr<float>() : nullptr, "
+                          f"fuse_route ? reinterpret_cast<const __nv_bfloat16*>(gpre.data_ptr()) : nullptr, "
+                          f"fuse_route ? rids.data_ptr<int>() : nullptr, fuse_route ? rlids.data_ptr<int>() : nullptr, "
+                          f"fuse_route ? rwts.data_ptr<float>() : nullptr, "
+                          f"fuse_route ? reinterpret_cast<__nv_bfloat16*>(xm.data_ptr()) : nullptr, "
+                          f"fuse_route ? rls.data_ptr<int>() : nullptr, fuse_route ? part2.data_ptr<float>() : nullptr, "
+                          f"fuse_route ? dcnt.data_ptr<int>() : nullptr); return; }}")
     return (SK2_SRC.replace("@@SK2_DISPATCH@@", "\n  ".join(lines))
             .replace("@@SK2F_DISPATCH@@", "\n  ".join(flines)))
 
@@ -2829,11 +2945,15 @@ def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None):
     return out
 
 
-def fused_pooler_router(x, state):
+def fused_pooler_router(x, state, route=None):
     """Pooler and router of one decode step in ONE launch (m <= 32, sm_90): x [m, 8192] bf16 ->
     (pooler [m, 4096] bf16, router [m, 256] fp32). Same numerics as the separate sk2 kernels: 12-bit lossless pooler
     weights with exact escape corrections, router as BF16 hi + lo with FP32 accumulation (quarter-K partials added in
-    a fixed order)."""
+    a fixed order).
+    route = (bias fp32 [256], pre-expert norm weight bf16 [4096], ids int32 [m, 8], local ids int32 [m, 8], weights
+    fp32 [m, 8], xm bf16 [m, 4096], local_start int32 [1]): the last CTA of the launch also does the routing (top-8 of
+    sigmoid(0.1768 logit) + bias; weights = the selected sigmoid scores over their sum; local id = (id - start) mod 256
+    if < 32 else -1) and the pre-expert RMSNorm of the pooled rows into xm (the decode layer's _route_split)."""
     m = x.shape[0]
     assert m <= 32 and state.get("sm90") and "pooler" in state["sk2"] and "router" in state["sk2"]
     ci, stream, tab, pmax, b4, n_rows = state["sk2"]["pooler"]
@@ -2841,11 +2961,19 @@ def fused_pooler_router(x, state):
     if "fused_part" not in state:
         state["fused_part"] = torch.empty(32 * 4 * 32 * 8, dtype=torch.float32, device=x.device)
         state["fused_cnt"] = torch.zeros(32, dtype=torch.int32, device=x.device)
+        state["fused_part2"] = torch.zeros(128 * 32, dtype=torch.float32, device=x.device)   # [pooler CTA][token] sum sq
+        state["fused_dcnt"] = torch.zeros(1, dtype=torch.int32, device=x.device)             # grid ticket (never reset)
     out = torch.empty((m, 4096), dtype=torch.bfloat16, device=x.device)
     outr = torch.empty((m, 256), dtype=torch.float32, device=x.device)
     ext = _get_ext()
     ext.sk2_set_pdl(SK2_PDL)
-    ext.sk2f(stream, rstream, x, out, outr, tab, pmax, b4, state["fused_part"], state["fused_cnt"], m, _sk2_tokr(m))
+    d = state["dummy"]
+    if route is None:
+        rbias = gpre = rids = rlids = rwts = xm = rls = d
+    else:
+        rbias, gpre, rids, rlids, rwts, xm, rls = route
+    ext.sk2f(stream, rstream, x, out, outr, tab, pmax, b4, state["fused_part"], state["fused_cnt"], m, _sk2_tokr(m),
+             rbias, gpre, rids, rlids, rwts, xm, rls, state["fused_part2"], state["fused_dcnt"], 0 if route is None else 1)
     return out, outr
 
 
