@@ -2671,6 +2671,21 @@ __device__ __forceinline__ int wgs_cost(int pb, int cnt) {
 #ifndef OKC_WGSFCI
 #define OKC_WGSFCI 3
 #endif
+#ifndef OKC_WGSMMAN
+#define OKC_WGSMMAN 0  // WGS: jobs with <= this many n-tiles run on per-warp mma.sync (wgs_seg_mma) instead of wgmma
+#endif
+#ifndef OKC_WGSMMANA
+#define OKC_WGSMMANA 4  // wgs_seg_mma: accumulator chains for 1-n-tile jobs
+#endif
+#ifndef OKC_WGSGS4N
+#define OKC_WGSGS4N 0  // WGS: jobs with <= this many n-tiles commit 4 k16 steps per wgmma group (small accumulators)
+#endif
+#ifndef OKC_WGSWD
+#define OKC_WGSWD 1    // WGS: wgmma groups kept in flight (wait_group depth); OKC_WGSWD + 1 A-fragment buffers
+#endif
+#ifndef OKC_XNOSC
+#define OKC_XNOSC 0    // dev: WGS without the block-scale multiplies (timing only)
+#endif
 #ifndef OKC_WGSGS
 #define OKC_WGSGS 2  // WGS: k16 steps per wgmma commit group (4 serializes the N=16..32 variants at 96 registers: C7512)
 #endif
@@ -3210,8 +3225,9 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
   float d[WGS_NT][4];  // written first by a scale-d = 0 wgmma (no zeroing: ptxas would serialize the wgmmas, C7513)
   // k16 steps per commit group: the whole function shares one register budget (96 at 544 threads) and ptxas
   // serializes every wgmma if any pipeline does not fit (C7512), so the wide-N variants commit 2 steps at a time
-  constexpr int GS = OKC_WGSGS;
-  uint32_t af[2][GS][4];
+  constexpr int GS = (NTT <= OKC_WGSGS4N) ? 4 : OKC_WGSGS;  // 4 steps per commit group where the accumulators are small
+  constexpr int NB = OKC_WGSWD + 1;                           // A-fragment buffers: OKC_WGSWD groups stay in flight
+  uint32_t af[NB][GS][4];
   int prev = -1;  // x slot the last committed group may still read
 #if OKC_WGSDESC0
   // slot-0 descriptor and code pointer, once per segment: a stage adds its slot's offset (the address field cannot
@@ -3265,12 +3281,17 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
           // one bf16x2, and the multiplies broadcast its halves (HMUL2 .H0_H0 / .H1_H1): 2 instructions per k16 fewer
           const uint32_t sw = js < 2 ? scg.x : scg.y, sb = (uint32_t)(js & 1) * 2u;
           const uint32_t sgp = __byte_perm(sw, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16c + 0x5C005C00u;
-          af[ci & 1][jj][0] = bmul2l(r0, sgp); af[ci & 1][jj][1] = bmul2h(r1, sgp);
-          af[ci & 1][jj][2] = bmul2l(r2, sgp); af[ci & 1][jj][3] = bmul2h(r3, sgp);
+#if OKC_XNOSC
+          (void)sgp;
+          af[ci % NB][jj][0] = r0; af[ci % NB][jj][1] = r1; af[ci % NB][jj][2] = r2; af[ci % NB][jj][3] = r3;  // dev: no scale
+#else
+          af[ci % NB][jj][0] = bmul2l(r0, sgp); af[ci % NB][jj][1] = bmul2h(r1, sgp);
+          af[ci % NB][jj][2] = bmul2l(r2, sgp); af[ci % NB][jj][3] = bmul2h(r3, sgp);
+#endif
 #else
           const uint32_t sg = SCDK(scg.x, js, k16c), s8 = SCDK(scg.y, js, k16c);
-          af[ci & 1][jj][0] = bmul2(r0, sg); af[ci & 1][jj][1] = bmul2(r1, s8);
-          af[ci & 1][jj][2] = bmul2(r2, sg); af[ci & 1][jj][3] = bmul2(r3, s8);
+          af[ci % NB][jj][0] = bmul2(r0, sg); af[ci % NB][jj][1] = bmul2(r1, s8);
+          af[ci % NB][jj][2] = bmul2(r2, sg); af[ci % NB][jj][3] = bmul2(r3, s8);
 #endif
         }
         wg_fence();
@@ -3279,12 +3300,12 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
           if (FIRST && ci == 0 && jj == 0)
             WGSMMA<NTT>::mma0(d, af[0][0][0], af[0][0][1], af[0][0][2], af[0][0][3], xd);
           else
-            WGSMMA<NTT>::mma(d, af[ci & 1][jj][0], af[ci & 1][jj][1], af[ci & 1][jj][2], af[ci & 1][jj][3],
+            WGSMMA<NTT>::mma(d, af[ci % NB][jj][0], af[ci % NB][jj][1], af[ci % NB][jj][2], af[ci % NB][jj][3],
                              xd + (uint64_t)((lg * 4 + h * GS + jj) * 16));
         }
         wg_commit();
-        wg_wait<1>();
-        if (ci == 0) {
+        wg_wait<OKC_WGSWD>();
+        if (ci == OKC_WGSWD - 1) {  // the previous stage's last group has retired: its x slot is free
           if (prev >= 0) {  // the previous stage's last group just retired: its x slot is free
             if (lane == 0) mbar_arrive1(S.bars + BX_E + prev);
             prev = -1;
@@ -3320,6 +3341,93 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
   for (int nt = 0; nt < NTT; ++nt) wgs_epi_tile<PB>(p, S, j, r16, nt, d[nt]);
   if (!PB) pd = WgsPend{1, u, -1, 0};  // the doneA release waits until the stores are done: deferred
 }
+#if OKC_WGSMMAN > 0
+// wgs_seg on per-warp mma.sync (m16n8k16) for jobs of <= OKC_WGSMMAN n-tiles: the same loads, dequant, scales and
+// epilogue / fixup paths as the wgmma version (the dequantized registers are an m16n8k16 A fragment, warp wp of the
+// warpgroup owns rows 16 wp.. of its 64; the wgmma D fragment of a warp is the mma.sync C fragment), but no
+// warpgroup-wide synchronization, descriptor or commit/wait per step: B fragments are 32-bit LDS from the x ring's
+// core matrices ([n8][k8][8 rows][16 B]: row g at +16 g, k = 2t at +4 t), 4 independent accumulator chains
+template <bool PB, int NTT>
+__device__ __forceinline__ void wgs_seg_mma(const Params& p, Smem& S, unsigned char* ring, int u, int s0, int s1, int slot,
+                                            int& seq, WgsPend& pd) {
+  const int tid = threadIdx.x, lane = tid & 31;
+  const int warp = WARP_IDX(tid);
+  const int wg = warp >> 2, wp = warp & 3, g = lane >> 2, t = lane & 3, wt = tid & 127;
+  constexpr int UBL = PB ? 4 : 5;
+  constexpr int NA = NTT == 1 ? OKC_WGSMMANA : 2;  // independent accumulator chains per n-tile
+  const uint32_t k16c = 16u + p.zero;
+  const unsigned char* xring = ring + WGS_NS * UNIT_BYTES + g * 16 + t * 4;
+  float acc[NA][NTT][4];
+#pragma unroll
+  for (int a = 0; a < NA; ++a)
+#pragma unroll
+    for (int nt = 0; nt < NTT; ++nt) { acc[a][nt][0] = 0.f; acc[a][nt][1] = 0.f; acc[a][nt][2] = 0.f; acc[a][nt][3] = 0.f; }
+#pragma unroll 1
+  for (int st = s0; st < s1; ++st) {
+    const int ws = seq % WGS_NS, xs = seq % WGS_NX;
+    wgs_wait(S.bars + BW_F + ws, (uint32_t)(seq / WGS_NS) & 1u, 3000000 + seq);
+    const unsigned char* pc = ring + ws * UNIT_BYTES + wg * WGS_PIECE;
+    wgs_wait(S.bars + BX_F + xs, (uint32_t)(seq / WGS_NX) & 1u, 4000000 + seq);
+    const unsigned char* xb = xring + xs * WGS_XS;
+    uint4 cwn = *reinterpret_cast<const uint4*>(pc + (wp * 32 + lane) * 16);
+    uint2 scn = *reinterpret_cast<const uint2*>(pc + 8192 + (wp * 8 + g) * 8);
+#pragma unroll
+    for (int lg = 0; lg < 4; ++lg) {
+      const uint4 cwg = cwn;
+      const uint2 scg = scn;
+      if (lg < 3) {
+        cwn = *reinterpret_cast<const uint4*>(pc + (((lg + 1) * 4 + wp) * 32 + lane) * 16);
+        scn = *reinterpret_cast<const uint2*>(pc + 8192 + (((lg + 1) * 4 + wp) * 8 + g) * 8);
+      } else if (lane == 0) {
+        mbar_arrive1(S.bars + BW_E + ws);  // every code and scale of this stage is in registers: weights slot free
+      }
+#pragma unroll
+      for (int js = 0; js < 4; ++js) {
+        const uint32_t q = js == 0 ? cwg.x : js == 1 ? cwg.y : js == 2 ? cwg.z : cwg.w;
+        uint32_t r0, r1, r2, r3;
+        dq4(q, r0, r1, r2, r3);
+        const uint32_t sw = js < 2 ? scg.x : scg.y, sb = (uint32_t)(js & 1) * 2u;
+        const uint32_t sgp = __byte_perm(sw, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16c + 0x5C005C00u;
+        const uint32_t a0 = bmul2l(r0, sgp), a1 = bmul2h(r1, sgp), a2 = bmul2l(r2, sgp), a3 = bmul2h(r3, sgp);
+        const int step = lg * 4 + js;  // k16 step in the stage: k8 blocks 2 step, 2 step + 1 (128 B each)
+#pragma unroll
+        for (int nt = 0; nt < NTT; ++nt) {
+          const uint32_t b0 = *reinterpret_cast<const uint32_t*>(xb + nt * 4096 + step * 256);
+          const uint32_t b1 = *reinterpret_cast<const uint32_t*>(xb + nt * 4096 + step * 256 + 128);
+          mma_bf16(acc[step % NA][nt], a0, a1, a2, a3, b0, b1);
+        }
+      }
+    }
+    __syncwarp();
+    if (lane == 0) mbar_arrive1(S.bars + BX_E + xs);  // the stage's x slot is free (mma.sync is synchronous)
+    if (st == s0 && pd.kind) wgs_flush<PB>(p, S, pd);  // the previous segment's deferred work
+    ++seq;
+  }
+  float d[NTT][4];
+#pragma unroll
+  for (int nt = 0; nt < NTT; ++nt)
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      float v = acc[0][nt][kk];
+#pragma unroll
+      for (int a = 1; a < NA; ++a) v += acc[a][nt][kk];
+      d[nt][kk] = v;
+    }
+  if (slot >= 0) {  // a share of a unit split between CTAs: add it now, count it later (deferred)
+    float* fb = wgs_fix(p, PB) + (size_t)(slot * 4 + wg) * WGS_FIXW + wt * 4;
+#pragma unroll
+    for (int nt = 0; nt < NTT; ++nt)
+      asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"l"(fb + nt * 512), "f"(d[nt][0]), "f"(d[nt][1]),
+                   "f"(d[nt][2]), "f"(d[nt][3]) : "memory");
+    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && (OKC_WGSDYN ? s1 == 16 : (PB ? s0 == 0 : s1 == 16))) ? 3 : 2, u, slot, s1 - s0};
+    return;
+  }
+  const int j = u >> UBL, r16 = (u & ((1 << UBL) - 1)) * 16 + wg * 4 + wp;
+#pragma unroll
+  for (int nt = 0; nt < NTT; ++nt) wgs_epi_tile<PB>(p, S, j, r16, nt, d[nt]);
+  if (!PB) pd = WgsPend{1, u, -1, 0};
+}
+#endif
 template <bool PB>
 __device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned char* ring, int g0, int g1, int& seq, int& k) {
   // (__forceinline__: outlined by NVVM when it grows, a CALL that makes ptxas serialize every wgmma, C7510)
@@ -3348,9 +3456,17 @@ __device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned cha
     const int ntt = (S.jC[u >> UBL] + 7) >> 3;
 #endif
     switch (ntt) {
+#if OKC_WGSMMAN >= 1
+      case 1: wgs_seg_mma<PB, 1>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#else
       case 1: wgs_seg<PB, 1>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#endif
 #if OKC_FT_T > 8
+#if OKC_WGSMMAN >= 2
+      case 2: wgs_seg_mma<PB, 2>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#else
       case 2: wgs_seg<PB, 2>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#endif
       case 3: wgs_seg<PB, 3>(p, S, ring, u, s0, s1, slot, seq, pd); break;
       case 4: wgs_seg<PB, 4>(p, S, ring, u, s0, s1, slot, seq, pd); break;
 #endif
@@ -4429,7 +4545,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "F"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "I"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 DIAG_VARIANT_SETS = {
@@ -4440,6 +4556,29 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "I": {  # WGS: per-warp mma.sync for small-N jobs (no warpgroup sync / descriptor / commit per step) vs wgmma
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "wgs_mma1": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=1",), "shapes": _WGS_SHAPES},
+        "wgs_mma2": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=2",), "shapes": _WGS_SHAPES},
+        "wgs_mma2_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "wgs_mma2_na2": {"defines": MAIN_DEFINES + ("-DOKC_WGSMMAN=2", "-DOKC_WGSMMANA=2"), "shapes": _WGS_SHAPES},
+    },
+    "H": {  # WGS for M <= 64: FT_T=32 frees accumulator registers (x slots 16 KB): deeper wgmma pipeline / weight ring
+        "main": {"defines": MAIN_DEFINES, "shapes": [32, 128]},
+        "wgs_ft32": {"defines": MAIN_DEFINES + ("-DOKC_FT_T=32",), "shapes": [32, 128]},
+        "wgs_ft32_wd2": {"defines": MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSWD=2"), "shapes": [32]},
+        "wgs_ft32_gs4": {"defines": MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSGS4N=4"), "shapes": [32]},
+        "wgs_ft32_ns4": {"defines": MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSNS=4"), "shapes": [32]},
+        "wgs_ft32_ns4_wd2": {"defines": MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSNS=4", "-DOKC_WGSWD=2"), "shapes": [32]},
+    },
+    "G": {  # WGS wgmma pipeline: commit-group length for small N, wait depth, no-scale ablation (bs32/128/256)
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "wgs_gs4n2": {"defines": MAIN_DEFINES + ("-DOKC_WGSGS4N=2",), "shapes": _WGS_SHAPES},
+        "wgs_wd2": {"defines": MAIN_DEFINES + ("-DOKC_WGSWD=2",), "shapes": _WGS_SHAPES},
+        "wgs_gs4n2_wd2": {"defines": MAIN_DEFINES + ("-DOKC_WGSGS4N=2", "-DOKC_WGSWD=2"), "shapes": _WGS_SHAPES},
+        "wgs_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSGS=4",), "shapes": _WGS_SHAPES},
+        "wgs_noscale": {"defines": MAIN_DEFINES + ("-DOKC_XNOSC=1",), "shapes": _WGS_SHAPES},
     },
     "F": {  # WGS early producer start (fixed consumer/range sync), bs32/128/256
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
@@ -4489,7 +4628,7 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else _WGS_SHAPES if DIAG_SET in ("D", "F") else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
@@ -4870,6 +5009,15 @@ def _diag(state, weights):
         except Exception as ex:  # diagnostics must never break the run
             print(f"[diag-bw] failed: {ex}", flush=True)
     sfx = state.get("sfx", ())
+    try:  # block-scale statistics (E4M3 bytes): share of powers of two (mantissa 0), exponent span
+        for nm in ("w13_sf", "w2_sf"):
+            b = weights[nm][:32].contiguous().view(torch.uint8)
+            pow2 = float(((b & 7) == 0).float().mean())
+            ex = (b.int() >> 3) & 15
+            print(f"[diag] {nm}: power-of-two scales {pow2:.3f}, exponent min/max {int(ex.min())}/{int(ex.max())}, "
+                  f"bytes min/max {int(b.min()):#x}/{int(b.max()):#x}", flush=True)
+    except Exception as ex:
+        print(f"[diag] scale stats failed: {ex}", flush=True)
     shapes = list(DIAG_SHAPES)
     variants = {}  # name -> (defines, shapes)
     for name, v in DIAG_VARIANTS.items():
