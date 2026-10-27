@@ -40,6 +40,8 @@ ROW_SPLIT = False            # split the row kernels over several programs with 
                              # judge (G=8/4): boundary 5.5 -> 4.7 us per call but rms_gain 2.3 -> 4.0 us; the two
                              # atomic round trips cost what the split saves, so rows stay single-program
 
+BENCH = False                # the shared regions' prepare-time microbenchmarks stay off in the layer
+
 # {{SHARED proj}}
 
 # {{SHARED attn}}
