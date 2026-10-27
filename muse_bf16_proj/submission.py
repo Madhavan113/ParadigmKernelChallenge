@@ -4245,7 +4245,7 @@ def _config(layer: str, m: int, n: int, k: int):
         return dict(g12=True, warps=warps, unroll=unroll, sk=sk)
     if _WG12_ON and (layer, n, m) in WG12_SHAPES:
         rb, tb, ck, nsw, nsx, ks = WG12_SHAPES[(layer, n, m)]
-        return dict(g12=True, rb=rb, tb=tb, ck=ck, nsw=nsw, nsx=nsx, ks=ks)
+        return dict(wg12=True, rb=rb, tb=tb, ck=ck, nsw=nsw, nsx=nsx, ks=ks)
     if _TB12_ON and (layer, n, m) in TB12_SHAPES:
         r, ck, w, nsw, nsx = TB12_SHAPES[(layer, n, m)]
         return dict(tb12=True, r=r, ck=ck, w=w, nsw=nsw, nsx=nsx, nt=tb12_nt(m), v=5)
@@ -4376,7 +4376,7 @@ def _usable(cfg, m: int, n: int, k: int) -> bool:
         return w12b_usable(m, n, k, cfg["nt"], cfg["warps"], cfg["nst"])
     if cfg.get("tb12"):
         return tb12_usable(m, n, k, cfg["r"], cfg["ck"], cfg["nt"])
-    if cfg.get("g12"):
+    if cfg.get("wg12"):
         return g12_usable(m, n, k, cfg["rb"], cfg["tb"], cfg["ck"], cfg["ks"])
     if cfg.get("m12"):
         return mma12_usable(m, n, k, cfg["mt"], cfg["rpw"], cfg["unroll"], cfg["sk"]) and (cfg["sk"] == 1 or cfg["sk"] * 16 * cfg["mt"] * n <= PARTIALS_FLOATS)
@@ -4522,7 +4522,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
         build().w12m(x, w12, pk["eb"], pk["esc_roff"], pk["esc_k"], pk["esc_delta"], out, state["partials"],
                      m, n, k, cfg["mw"], cfg["nt"], cfg["nstage"], cfg["sk"], True, cfg.get("mode", 0))
         return out
-    if cfg.get("g12"):
+    if cfg.get("wg12"):
         pk = state.get(layer + "_p12")
         wt = state.get(f"{layer}_t12_{64 * cfg['rb']}x{cfg['ck']}")
         if pk is None or wt is None:
@@ -4883,7 +4883,7 @@ def _bench(state):
                     256: [(2, 2, 1, 3, 2, 8), (2, 2, 1, 3, 2, 4), (1, 2, 1, 4, 2, 4), (1, 2, 1, 4, 2, 8)]}
 
         def g12cfg(c, mode=0):
-            return dict(g12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5], mode=mode)
+            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5], mode=mode)
 
         for m in (128, 256):
             for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 8192), ("o", 8192)):
@@ -4953,7 +4953,7 @@ def _g12_selftest(state) -> bool:
     ok = True
     for (layer, n, m), c in sorted(WG12_SHAPES.items()):
         k = state[layer].shape[1]
-        cfg = dict(g12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5])
+        cfg = dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5])
         pk = state.get(layer + "_p12")
         if pk is None or not _usable(cfg, m, n, k) or state.get(f"{layer}_t12_{64 * c[0]}x{c[2]}") is None:
             print(f"  g12 self-test {layer} m={m}: not usable"); ok = False; continue

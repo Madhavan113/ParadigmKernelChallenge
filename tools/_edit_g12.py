@@ -306,11 +306,11 @@ if "WG12_SHAPES" not in t:
         "G12_LAYOUTS = {(256, 1), (128, 1), (128, 2), (64, 1)}   # (r, ck) weight layouts for the g12 bench (BENCH)\n")
     rep("    if _TB12_ON and (layer, n, m) in TB12_SHAPES:\n",
         "    if _WG12_ON and (layer, n, m) in WG12_SHAPES:\n        rb, tb, ck, nsw, nsx, ks = WG12_SHAPES[(layer, n, m)]\n"
-        "        return dict(g12=True, rb=rb, tb=tb, ck=ck, nsw=nsw, nsx=nsx, ks=ks)\n"
+        "        return dict(wg12=True, rb=rb, tb=tb, ck=ck, nsw=nsw, nsx=nsx, ks=ks)\n"
         "    if _TB12_ON and (layer, n, m) in TB12_SHAPES:\n")
     rep('    if cfg.get("tb12"):\n        return tb12_usable(m, n, k, cfg["r"], cfg["ck"], cfg["nt"])\n',
         '    if cfg.get("tb12"):\n        return tb12_usable(m, n, k, cfg["r"], cfg["ck"], cfg["nt"])\n'
-        '    if cfg.get("g12"):\n        return g12_usable(m, n, k, cfg["rb"], cfg["tb"], cfg["ck"], cfg["ks"])\n')
+        '    if cfg.get("wg12"):\n        return g12_usable(m, n, k, cfg["rb"], cfg["tb"], cfg["ck"], cfg["ks"])\n')
     rep('    if cfg.get("tb12"):\n        pk = state.get(layer + "_p12")\n',
         '    if cfg.get("g12"):\n'
         '        pk = state.get(layer + "_p12")\n'
@@ -346,7 +346,7 @@ if "WG12_SHAPES" not in t:
     ok = True
     for (layer, n, m), c in sorted(WG12_SHAPES.items()):
         k = state[layer].shape[1]
-        cfg = dict(g12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5])
+        cfg = dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5])
         pk = state.get(layer + "_p12")
         if pk is None or not _usable(cfg, m, n, k) or state.get(f"{layer}_t12_{64 * c[0]}x{c[2]}") is None:
             print(f"  g12 self-test {layer} m={m}: not usable"); ok = False; continue

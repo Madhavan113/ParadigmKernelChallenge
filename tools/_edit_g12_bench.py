@@ -10,7 +10,7 @@ BODY = r'''    # == BEGIN g12 bench ==
                     256: [(2, 2, 1, 3, 2, 8), (2, 2, 1, 3, 2, 4), (1, 2, 1, 4, 2, 4), (1, 2, 1, 4, 2, 8)]}
 
         def g12cfg(c, mode=0):
-            return dict(g12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5], mode=mode)
+            return dict(wg12=True, rb=c[0], tb=c[1], ck=c[2], nsw=c[3], nsx=c[4], ks=c[5], mode=mode)
 
         for m in (128, 256):
             for layer, n in (("pooler", 4096), ("qkv_gate", 2304), ("unpooler", 8192), ("o", 8192)):
