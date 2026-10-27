@@ -1,0 +1,168 @@
+# muse_decode_layer: map of the derived layer file, per-shape time budget, composition tool
+
+Judged: `muse_decode_layer/submission.py` at commit 5c08f5b = job f662ee18cbb842eb, 2.092x (CI 2.061-2.123), 13/13,
+rank 50. Line references "old L" are to that file (13,774 lines); "new L" to the regenerated file of commit c6ca340
+(14,422 lines, same components, produced by `tools/compose_decode_layer.py`).
+
+## 1. Layout of the layer file and which component version is embedded
+
+| block | old L | new L | what |
+|---|---|---|---|
+| header, constants, PDL rule | 1-79 | 1-82 | `PDL = True`, `PDL_MAX_T = 32` (L59/62), `PIN_PICK` (L73/76), `_pdl(T)` |
+| attention CUDA (`ATT7_CUDA_SRC`) | 80-4925 | 85-4983 (`att_CUDA_SRC`) | BYTE-IDENTICAL to `muse_attention_decode/submission.py` L53-4898 (236,836 chars; `okc_attn_v298`) |
+| attention host | 4926-5123 | 4984-5284 | identical to the standalone L4910-5138 modulo names (`_WS7`, `_plan7`, `_TUNED7`, `OKC_*`, `_cluster_bufs7`); the layer added its own builder `_att7` (old L4938) with flags `-DOKC_QDIRECT=0 -DOKC_PK2=0 -DOKC_W0ENABLE=1` (standalone defaults: 1 / 1 / 0, CUDA L77/358/225): SAME SOURCE, DIFFERENT BUILD, ext name `muse_att_v298w1_{arch}` |
+| MoE CUDA (`MOE_CUDA_SRC`) | 5124-8626 | 5288-8836 (`moe_CUDA_SRC`) | BYTE-IDENTICAL to `muse_moe_w4a16/submission.py` L47-3549 (167,206 chars; `okc_moe_w4a16_v216x`) |
+| MoE host | 8627-8890 | 8837-9618 | the layer re-implemented the build choice (`_moe(M)`, `_moe_tiny*`, `_moe_mid`, old L8702-8756) and prepare (`_ma_prepare`, old L12172); the define tuples are the standalone's EXCEPT `TINY_DEFINES` (old L8640) lacks `-DOKC_FINPF=1` (standalone L3914: "Oct 26: bs1 +2.5% / +3.5%"); TINY2/MID carry FINPF in both. So the standalone MoE is one flag NEWER. |
+| proj (`bfp_*`, every name prefixed) | 8891-12126 | 9622-12852 | a DIVERGED FORK of the bf16_proj module, not an older copy (see 1.1) |
+| layer glue | 12127-13774 | 12853-14422 | bfp bridge, Triton kernels, tuner, prepare, kernel_fn, _after_attention |
+
+### 1.1 The proj fork vs `muse_bf16_proj/submission.py` (diff: 291 lines only in the layer, 1,169 only in the standalone)
+
+Layer-only (needed by the layer; the standalone has none of it):
+* sk2 PDL: `sk2_set_pdl(n)` / `g_sk2_pdl` (SK2_SRC), the kernel takes `pdl`, issues the first `P = min(pdl, NSTAGE, nst)`
+  weight stages before `griddepcontrol.wait`, every thread waits before touching x, `griddepcontrol.launch_dependents`
+  after its main loop; `launch_sk2` adds `cudaLaunchAttributeProgrammaticStreamSerialization`. Host: `bfp_SK2_PDL`
+  (new L12474), set per call by `_bfp_pdl(T)` (new L12871) to `BFP_PDL_N = 2`.
+* fused pooler + router (`FUSE` template flag, `sk2f` entry point, `bfp_fused_pooler_router` new L12454): after its pooler
+  stages every CTA streams one router piece (8 rows x quarter K, hi|lo) through the same ring; quarter partials to
+  `fused_part`, last-of-4 CTA (release/acquire counter `fused_cnt`) writes the fp32 router output. Only with the
+  `pooler` config (NT 4, WSK 8, UPW 1) at tokr 8/16; at T = 32 `PIN_PICK[(32,"pr")] = "bfp"` runs pooler32_r144 and
+  the 3-CTA-cluster router kernel separately.
+* bounded cross-CTA spins (`okc_spin_ge`, trap after 2^24 polls), L2 `evict_first` hints on weight loads
+  (`createpolicy`), `bulk_g2s` / `tma_load_3d` with `.L2::cache_hint`.
+* escape table entries carry the precomputed fp32 delta (`comp["delta"]`).
+
+Standalone-only (newer, v132-v141): escapes corrected from the original bf16 bits in the kernel (`esc_delta`, `wbits`);
+escape-balanced row permutation for qkv (`SK2_BALANCE`, v135/136); retimed sk2 configs `pooler16t_r192`,
+`unpooler16t_r72`, `qkv8t_r144`, `qkv16t_r200`, `o16t_r68` (-0.1..-0.6 us each at tokr 8/16); m = 1 GEMVs (`cgemv`
+12-bit, `sgemv`, `rgemv`: pooler -0.34 us); m 33..256 routes `gqx`, `rk` (router), `torchT`, CUTLASS pingpong (pooler
+m=256); router wide path via TMA'd hi|lo tiles + SS-wgmma; release/acquire counters in the wide kernel; selftest/tune
+prints on. None of these reach the layer today. **To take a newer proj into the layer, port sk2 PDL + sk2f onto it
+(the diff above is ~150 lines of SK2_SRC + 40 host lines) or port the standalone's gains into `proj_fork.py`.**
+
+### 1.2 Per-call launch sequence (kernel_fn new L14258, _after_attention new L14329)
+
+T <= 32 (decode 1/16/32 = T 1/16/32, verify 1 = T 8); every launch PDL (`_pdl(T)` true; Triton `launch_pdl`,
+sk2 `pdl=2`, attention `tma` bit 16, MoE `okc_set_pdl(1)`); single stream, no memset in the graph:
+
+| # | kernel (profile name) | source | notes |
+|---|---|---|---|
+| 1 | `sk2_kernel<1,8,3,1,4,2,6,...>` (qkv) | bfp sk2 `qkv8/16/32_r*` | `mm_pick[(T,"qkv")] = "bfp"` (tuner) |
+| 2 | `attn_kernel<L,FLAT,MODE>` | att | `_decode_attention7` -> `att__launch(pdl=True)`; plan per 1.3 |
+| 3 | `sk2_kernel<..,4,1,4,1,..>` (o) | bfp sk2 `o8h_r88`/`o32h_r100` | gate already applied in attention's epilogue |
+| 4 | `_boundary1` | Triton, one program per token, 16 warps | residual gate 1, rmsnorm, (1+w): s1, h |
+| 5 | `sk2_kernel<1,8,4,1,8,1,6,..>` = sk2f fused pooler+router (T 1/8/16); at T=32: `pooler32_r144` + `router` (CL 3) | bfp | `mm_pick[(T,"pr")]` = "bfpf" / "bfp" |
+| 6 | `_route_split` | Triton, one program per token | sigmoid(0.1768 logits)+bias, top-8, local ids, pre-expert rmsnorm -> xm |
+| 7 | `okc::moe_fused<false>` | moe TINY (T<=4) / TINY2 (<=8) / MID (<=16) / WGS main (17..) | one launch, self-resetting counters |
+| 8 | `sk2_kernel<1,8,1,1,8,2,4,..>` (unpooler slice, T<=8) / `unpooler16h_r100` / `unpooler32_r144` | bfp | T <= 8 uses the 1024-row slice |
+| 9 | `_boundary2` | Triton, one program per token | residual gate 2, post-ffn norm, next-layer norm: out, s2 |
+
+T > 32 (verify 16 = 128 tokens, verify 32 = 256): no PDL anywhere (`PDL_MAX_T`), cuBLAS for every dense GEMM:
+qkv `torch.mm` (`PIN_PICK` True) -> attention (flat kernel, no PDL) -> `_normgate` (Triton) -> o `torch.mm` fp32 out ->
+`_boundary1` -> pooler+router as ONE `torch.mm` on `st["pr"]` = cat(pooler, router_hi, router_lo) [4608 x 8192] ->
+`_route` -> `okc::moe_fused<true>` (WGS main build) -> unpooler `torch.mm` -> `_boundary2`. cuBLAS kernels in the
+profile: `nvjet_sm90_tss_128x64..TNT` x2 (qkv + unpooler), `..96x64..TNN` (pooler+router), `..splitK..` + `splitKreduce`
+(o) at T = 128; `128x128` x2, `80x128`, `96x64` at T = 256.
+
+Attention plan per scored shape (`att__plan` new L5078, `att__TUNED` L5057): sliding q1 B=1 -> plain split-KV + SPEC
+(`attn_kernel<1,false,13>`); full q1 B=1 -> coop 252 splits (`<1,false,11>`); sliding q1 B=16/32 -> plain
+(`<1,false,1>`); full q1 B=16/32 -> flat (`<1,true,0>`); verify sliding B=1 -> `<8,false,15>`, B=16/32 -> plain
+(`<8,false,3>`, OKC_PLAIN8); verify full B=1 -> `<8,false,11>`, B=16/32 -> flat `<8,true,0>`.
+
+Layer-specific kernels (all Triton, new L12979-13800): `_gemm_splitk`, `_gemm_splitk_ng`, `_normgate`, `_qk_prep`,
+`_attn_split`, `_attn_combine` (FA3-less fallback path only), `_gemm_o` + `_bnd1_apply`, `_route_a`/`_route_b`,
+`_bnd2_sums`/`_bnd2_apply` (the "v2" parallel variants: `state["gluev2"]` False at every T in practice), `_boundary1`,
+`_route`, `_route_split`, `_boundary2`, `_moe_align`/`_moe_w13`/`_moe_w2`/`_moe_combine` (dead), `_pexp_norm_sum`
+(Marlin path only), `_marlin_experts` (tuner candidate when sgl_kernel exists; loses to the moe kernel).
+
+prepare (new L14057): bfp prepare (compress 5 matrices, its own autotune), attention + 4 MoE builds in threads,
+`_ma_prepare` (moe_prepare + guarded scratch), `_tune` (per T in 1..256: dense backend per matrix via graph timing
+with a cold-L2 read sweep, marlin vs agent, gluev1/v2), `PIN_PICK` overrides, `_attn_selftest` (11 plan families),
+`_check_guards`. prepare prints nothing (the f662 log is empty).
+
+## 2. Per-shape time budget (profile of job f662ee18, GPU time per kernel in us; judged time is the median paired replay)
+
+Caveat: under PDL (T <= 32) "an overlapping kernel's time includes any wait for the one before it", so the kernel
+rows over-count; the judged time is BELOW the kernel sum on 10 of 12 shapes and the gaps are not resolvable from this
+profile. At T > 32 (no PDL) sum - judged = 3..16 us = profiler overhead over 9-10 launches: no launch gaps in the graph.
+
+| shape | judged | attention | MoE | dense GEMMs (qkv / o / pool+router / unpool) | glue (bnd1 / route / bnd2) | sum |
+|---|---|---|---|---|---|---|
+| d1 sliding | 77.1 | 4.9 | 36.7 | 39.3 (10.1 / 5.8 / 17.7f / 5.7) | 13.2 (4.5/4.3/4.4) | 94.1 |
+| d1 full | 83.1 | 11.0 | 29.0 | 38.9 (10.2 / 5.8 / 18.3f / 4.6) | 13.0 | 91.9 |
+| d16 sliding | 136.0 | 7.4 | 60.4 | 51.1 (10.3 / 6.1 / 18.8f / 15.9) | 12.8 | 131.7 |
+| d16 full | 214.8 | 88.1 | 77.2 | 50.6 (10.1 / 7.7 / 17.7f / 15.1) | 13.8 | 229.7 |
+| d32 sliding | 161.7 | 9.3 | 86.3 | 59.9 (11.6 / 6.7 / 16.3+5.4 / 19.9) | 13.3 | 168.8 |
+| d32 full | 291.8 | 169.8 | 85.6 | 61.1 (11.2 / 7.2 / 16.4+5.4 / 20.9) | 14.1 | 330.5 |
+| v1 sliding (T=8) | 109.1 | 7.0 | 37.9 | 40.8 (10.3 / 5.9 / 19.8f / 4.8) | 12.6 | 98.1 |
+| v1 full | 122.2 | 14.7 | 72.8 | 40.6 (10.2 / 6.3 / 18.6f / 5.5) | 12.7 | 140.9 |
+| v16 sliding (T=128) | 259.9 | 11.9 | 162.6 | 76.5 cuBLAS (30.8 x2-call / 16.1+3.1 / 26.5) | 16.3 (5.8/4.7/5.8) | 267.3 |
+| v16 full | 345.4 | 105.3 | 160.2 | 76.6 | 16.1 | 358.2 |
+| v32 sliding (T=256) | 331.2 | 15.4 | 198.3 | 96.6 cuBLAS (38.5 x2 / 34.0 / 24.1) | 25.6 (9.6/6.2/9.8) | 335.9 |
+| v32 full | 497.6 | 186.3 | 207.6 | 94.8 | 25.0 | 513.8 |
+
+(f = fused pooler+router sk2f launch.) Attention vs its board (same shapes): parity everywhere (4.9/5.0, 11.0/11.0,
+7.4/8.0, 88.1/87.0, 9.3/10.0, 169.8/165.8, 7.0/6.9, 14.7/14.0, 11.9/11.3, 105.3/101.5, 15.4/14.6, 186.3/~200).
+MoE vs its board is NOT comparable: the layer's routing (judge: ~1.6 local routes per token, busiest range) differs
+from the MoE board's inputs (bs16 board 99.3 vs 60-77 in-layer; bs1 board 24.9 vs 29-37).
+
+Largest gaps between in-layer component time and the standalone kernels' judged times:
+1. Dense GEMMs at T > 32 through cuBLAS: 76.5 vs 69.3 (standalone proj m=128 sum: qkv 14.9 + o 7.2 + pooler 22.3 +
+   un 18.7 + router 6.2) = ~7 us on both verify-16 shapes (2.7% / 2.0%); 96.6 / 94.8 vs 89.2 (m=256) = ~6-7 us on
+   verify-32 (2.0% / 1.4%). Needs the standalone's m >= 33 routes (gqx / rk / torchT / CUTLASS) in the layer.
+2. sk2 unpooler at T = 32: 19.9 / 20.9 vs 14.9 standalone (+5-6 us = 3-4% of d32 sliding); T = 16: 15.9 / 15.1 vs
+   13.8 (+1.3-2.1). Part is PDL accounting (the unpooler launches during the MoE tail and its time includes that
+   wait); the standalone's `unpooler16t_r72` config is -0.6 us. qkv/o/pool at T <= 32 are within +0.5..1.2 us of
+   the board (PDL wait included), un slice at T <= 8 +1.1..2.2.
+3. The three Triton glue kernels: 12.6-14.1 us per T <= 32 shape (8-17% of the judged time), 16 us at T = 128,
+   25 us at T = 256. Each is one program per token over 8192 (boundaries) or 4096 + 256 (route) columns: ~4.4 us
+   for a kernel that moves ~100 KB at T = 1 (latency floor ~2 us each).
+
+## 3. Layer-level opportunities (estimated us per shape)
+
+* Fuse / shrink the glue kernels (item 3 above): `_route_split` into the sk2f epilogue (the last-of-4 CTA already
+  reduces the router logits; top-8 of 256 + the pre-expert norm of the pooled row is a few hundred FLOPs per token)
+  and `_boundary2` into the unpooler sk2 epilogue / `_boundary1` into the o-projection epilogue (each needs one
+  row-wide sum of squares: last-CTA-per-row-block reduction, the sk2 kernels already have release/acquire grid
+  counters in the FUSE path): -2..-2.5 us per fused kernel, -6..-8 us per T <= 32 shape (5-9%), -10..-15 us at
+  T = 128/256 if the same is done on the cuBLAS path (a `torch.mm` cannot fuse: use the proj module's kernels there).
+  Cheaper first step: multi-CTA boundary kernels with the per-token sums done by a 2-stage (sums, apply) split only
+  where it wins (the v2 path exists, new L13321-13483, but adds a launch; the tuner rejected it at every T).
+* Dense GEMMs at T = 128/256 (item 1): adopt the standalone proj module's m 33..256 routes (-7 us each on the four
+  verify-16/32 shapes, 1.4-2.7%). Requires either porting sk2 PDL + sk2f into the standalone proj (preferred: then
+  `--proj muse_bf16_proj/submission.py` composes directly) or porting the routes into `proj_fork.py`.
+* MoE TINY build with `-DOKC_FINPF=1` (standalone, "bs1 +2.5% / +3.5%"): in the layer's d1/v1 shapes the MoE is
+  29-38 us -> -0.7..-1.3 us (check c8b5aab9 measures exactly this).
+* PDL at T > 32: off by the layer's measurement (-1% at T = 256 for the Triton glue); the sk2/MoE kernels' PDL would
+  only matter if the dense GEMMs left cuBLAS (nvjet kernels take no programmatic launch).
+* No redundant memsets in the T <= 32 graph (attention workspace and MoE scratch self-reset; sk2f counter is a
+  monotonic ticket); the v2 glue path's `torch.zeros` are never captured.
+* Attention build flags: the layer compiles the attention with QDIRECT=0 PK2=0 W0ENABLE=1 (ATT_BUILD_FLAGS, new
+  L14142); the board's 2.588x build uses the defaults. Worth one A/B check in the layer (q8 shapes only).
+
+## 4. Composition tool
+
+    python3 tools/compose_decode_layer.py --check            # regenerate muse_decode_layer/submission.py
+    python3 tools/compose_decode_layer.py --check --moe PATH --attn PATH --proj PATH -o OUT
+
+Inputs: `muse_attention_decode/submission.py` (prefix att_), `muse_moe_w4a16/submission.py` (moe_),
+`muse_decode_layer/proj_fork.py` (bfp_; the layer's proj fork, un-prefixed so it diffs against the standalone),
+`muse_decode_layer/layer_glue.py` (header + `# {{COMPONENT attn|moe|proj}}` markers + glue). Each component is
+embedded whole; every module-level name is prefixed by an AST walk with scope resolution (locals, parameters,
+attributes, keyword arguments, strings untouched; `global` statements and f-string expressions handled). Verified:
+re-prefixing the un-prefixed proj fork reproduces the judged file's bfp_ block byte-for-byte (97 names);
+`--check` compiles the output and lists module-level references that nothing binds (one pre-existing: `MID_SRC`
+in the proj module's dead `_mid_src`). The glue calls the components' own entry points: `att__build("w1",
+ATT_BUILD_FLAGS)`, `att__launch(..., pdl=)`, `att__supported`, guarded `att__workspace`/`att__cluster_bufs`
+(rebound, new L14198-14214); `moe_prepare` (+ guarded scratch), `moe__ext` prebuilt in threads, `moe_kernel_fn`
+with `okc_set_pdl` per call (`_ma_run`, new L12917); `bfp_prepare`, `bfp_kernel_fn`, `bfp_fused_pooler_router`,
+`bfp_SK2_PDL`. The attention CUDA/host and the MoE CUDA are byte-identical to the standalone files, so a newer
+standalone attention or MoE composes in with no edit as long as `_launch(data, pdl=)`, `_build(tag, flags)`,
+`_workspace`/`_cluster_bufs`/`_WS`/`_CL`, `prepare`/`kernel_fn`/`_ext`/`_EXTS`/`_main_defines`/the *_DEFINES
+names keep their meaning (`--check` flags a removed name).
+
+Validation runs: job 3e87d0e5862f4f29 = regenerated layer with the SAME component versions as f662ee18 (standalone
+attention; standalone MoE with the layer's TINY_DEFINES, i.e. no FINPF; proj fork); job c8b5aab94fd34546 = the
+regenerated layer with the standalone MoE as is (TINY FINPF=1). Results: see section 5 (filled in when they land).
+
+## 5. Results
