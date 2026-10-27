@@ -2342,9 +2342,15 @@ __device__ __forceinline__ int wsd_uid_read(const Smem& S, int q) {
 __device__ __forceinline__ void wsd_publish(Smem& S, int q, int pb, int v) {
   *reinterpret_cast<volatile int*>(&S.uid[q & 7]) = (q << 16) | (pb << 15) | v;
 }
+#ifndef OKC_WSDYNC
+#define OKC_WSDYNC 1  // pool units per claim
+#endif
+#ifndef OKC_WSDYNLATE
+#define OKC_WSDYNLATE 0  // dev: release the ring slot after the compute (as the static WSB loop) instead of after the loads
+#endif
 struct WsdSrc {       // the helper lane's claim state
   int ph;             // 0 static A, 1 pool A, 2 static B, 3 pool B, 4 done
-  int vnext, vend;    // static cursor
+  int vnext, vend;    // static cursor (also the current claimed chunk in the pool phases)
   int pend;           // pool claim in flight (-1: none)
   __device__ __forceinline__ bool next(const Params& p, const Smem& S, int& pb, int& v) {
     for (;;) {
@@ -2352,13 +2358,16 @@ struct WsdSrc {       // the helper lane's claim state
         if (vnext < vend) { pb = ph >> 1; v = vnext++; return true; }
         ++ph;
         pend = -1;
+        vnext = vend = 0;
       } else if (ph == 1 || ph == 3) {
+        if (vnext < vend) { pb = ph >> 1; v = vnext++; return true; }  // rest of the claimed chunk
         const int base = S.wsd[ph == 1 ? 0 : 2], end = S.wsd[ph == 1 ? 1 : 3];
         if (base < end) {
           int* ctr = p.ctr + (ph >> 1);
           const int cl = pend >= 0 ? pend : atomicAdd(ctr, 1);
-          pend = atomicAdd(ctr, 1);  // the next claim: its value is first needed one unit later
-          if (base + cl < end) { pb = ph >> 1; v = base + cl; return true; }
+          pend = atomicAdd(ctr, 1);  // the next claim: its value is first needed one chunk later
+          const int a = base + cl * OKC_WSDYNC;
+          if (a < end) { pb = ph >> 1; v = a; vnext = a + 1; vend = min(end, a + OKC_WSDYNC); return true; }
         }
         ++ph;
         if (ph == 2) { vnext = S.wsr[2]; vend = S.wsr[3]; }
@@ -2407,8 +2416,10 @@ __device__ void skinny_ring_wsd(const Params& p, Smem& S, unsigned char* ring) {
     uint4 wq[NCH];
 #pragma unroll
     for (int c = 0; c < NCH; ++c) wq[c] = *reinterpret_cast<const uint4*>(slot + (warp * NCH + c) * 512 + lane * 16);
+#if !OKC_WSDYNLATE
     __syncwarp();
     if (lane == 0) mbar_arrive1(S.wse + sl);  // codes and scales in registers: the helper may refill the slot
+#endif
     float acc[4] = {0.f, 0.f, 0.f, 0.f}, acc2[4] = {0.f, 0.f, 0.f, 0.f};
 #if OKC_NACC == 4
     float acc3[4] = {0.f, 0.f, 0.f, 0.f}, acc4[4] = {0.f, 0.f, 0.f, 0.f};
@@ -2442,6 +2453,10 @@ __device__ void skinny_ring_wsd(const Params& p, Smem& S, unsigned char* ring) {
     for (int k = 0; k < 4; ++k) acc[k] += acc2[k] + acc3[k] + acc4[k];
 #else
     acc[0] += acc2[0]; acc[1] += acc2[1]; acc[2] += acc2[2]; acc[3] += acc2[3];
+#endif
+#if OKC_WSDYNLATE
+    __syncwarp();
+    if (lane == 0) mbar_arrive1(S.wse + sl);  // this warp is done with the slot
 #endif
     const int bb = q % NRB;
     mbar_wait(S.wsre + bb, (uint32_t)(((q / NRB) & 1) ^ 1));  // the helper has consumed this buffer's previous unit
@@ -2580,7 +2595,13 @@ __device__ __forceinline__ void skinny_split(int nS, int nF, int G, int c, int& 
 #ifndef OKC_WGSNX
 #define OKC_WGSNX 3                             // x ring slots
 #endif
-constexpr int WGS_NS = 3;                       // weight ring slots (36 KB; freed as soon as the codes are in registers)
+#ifndef OKC_WGSNS
+#define OKC_WGSNS 3
+#endif
+#ifndef OKC_WGSEARLY
+#define OKC_WGSEARLY 0  // WGS: the producers start right after routing (+ ranges), not after the consumers' x gather
+#endif
+constexpr int WGS_NS = OKC_WGSNS;               // weight ring slots (36 KB; freed as soon as the codes are in registers)
 constexpr int WGS_NX = OKC_WGSNX;               // x ring slots (freed when the stage's last wgmma retired)
 constexpr int WGS_NT = FT_T / 8;                // max n-tiles of a job
 constexpr int WGS_PIECE = 9216;                 // one warpgroup's weights in a stage
@@ -2642,7 +2663,7 @@ __device__ __forceinline__ int wgs_cost(int pb, int cnt) {
 #endif
 #if OKC_WGSDYN
 #undef OKC_WGSDFIN
-#define OKC_WGSDFIN 0  // (dynamic shares arrive in no fixed order: the last arriver finishes)
+#define OKC_WGSDFIN 3  // (shares are claimed in stage order: the share holding the last stage finishes, both phases)
 #endif
 #ifndef OKC_WGSDFIN
 #define OKC_WGSDFIN 2  // WGS: stream-K split units finished by a designated share (see wgs_flush): bit0 phase A, bit1 phase B
@@ -2814,7 +2835,12 @@ __device__ __forceinline__ int wgs_piece(const Smem& S, int k) {
 // weights producer: walks the static ranges, then claims pool segments; publishes every (unit, s0, s1) piece before
 // issuing its stages
 __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
+#if OKC_WGSEARLY
+  asm volatile("bar.sync 7, %0;\n" ::"n"(NT + 64) : "memory");  // routing tables
+  asm volatile("bar.sync 8, 64;\n" ::: "memory");               // ranges (from the x producer warp)
+#else
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
+#endif
   if ((threadIdx.x & 31) != 0) return;
   int ws = 0, n = 0, k = 0;
   uint32_t wph = 0;
@@ -2874,7 +2900,12 @@ __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
 }
 #else
 __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
+#if OKC_WGSEARLY
+  asm volatile("bar.sync 7, %0;\n" ::"n"(NT + 64) : "memory");  // routing tables
+  asm volatile("bar.sync 8, 64;\n" ::: "memory");               // ranges (from the x producer warp)
+#else
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
+#endif
   if ((threadIdx.x & 31) != 0) return;
   int ws = 0, n = 0;
   uint32_t wph = 0;
@@ -2918,11 +2949,15 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
 #if OKC_WGSPR
   // the routing tables are ready (the consumers arrive on barrier 7 right after routing): this idle warp computes the
   // stage ranges while the consumers gather phase A's x
-  asm volatile("bar.sync 7, %0;\n" ::"n"(NT + 32) : "memory");
+  asm volatile("bar.sync 7, %0;\n" ::"n"(NT + (OKC_WGSEARLY ? 64 : 32)) : "memory");
   if ((threadIdx.x & 31) == 0) wgs_ranges(p, S);
   __syncwarp();
 #endif
+#if OKC_WGSEARLY
+  asm volatile("bar.sync 8, 64;\n" ::: "memory");  // ranges ready: both producers go (the x stages wait on xready)
+#else
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
+#endif
   if ((threadIdx.x & 31) != 0) return;
   unsigned char* xring = ring + WGS_NS * UNIT_BYTES;
   int xs = 0, n = 0;
@@ -3276,7 +3311,7 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
                    "f"(d[nt][2]), "f"(d[nt][3]) : "memory");
     // kind 3: this share finishes the unit (designated finisher, OKC_WGSDFIN): phase A the share holding stage 15,
     // phase B the one holding stage 0
-    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && (PB ? s0 == 0 : s1 == 16)) ? 3 : 2, u, slot, s1 - s0};
+    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && (OKC_WGSDYN ? s1 == 16 : (PB ? s0 == 0 : s1 == 16))) ? 3 : 2, u, slot, s1 - s0};
     return;
   }
   const int j = u >> UBL, r16 = (u & ((1 << UBL) - 1)) * 16 + wg * 4 + wp;
@@ -3389,6 +3424,22 @@ __device__ __noinline__ void wgs_ranges(const Params& p, Smem& S) {
     }
   }
 #endif
+}
+// padded-row base of every job in xA / xB (one warp: lanes = jobs)
+__device__ __forceinline__ void wgs_jrow(Smem& S) {
+  const int tid = threadIdx.x;
+  const int nj = S.njF + S.njS;
+  int carry = 0;
+  for (int j0 = 0; j0 < nj; j0 += 32) {
+    const int j = j0 + tid;
+    const int v = j < nj ? (((S.jC[j] + 7) >> 3) << 3) : 0;
+    int incl = v;
+#pragma unroll
+    for (int d = 1; d < 32; d <<= 1) { const int t = __shfl_up_sync(0xffffffffu, incl, d); if (tid >= d) incl += t; }
+    if (j < nj) S.jrow[j] = carry + incl - v;
+    carry += __shfl_sync(0xffffffffu, incl, 31);
+  }
+  if (tid == 0) S.jrow[nj] = carry;
 }
 // the CTA whose range holds stage s (the fixup slot of a split unit is the CTA holding its first stage)
 __device__ __forceinline__ int wgs_cta_of(const Smem& S, int pb, int s, int G) {
@@ -3643,7 +3694,13 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   for (int i = tid; i < JMAX; i += NT) S.dync[i] = 0;
 #endif
   route(p, S);
-#if OKC_WGS && OKC_WGSPR
+#if OKC_WGS && OKC_WGSEARLY
+  static_assert(OKC_WGSPR, "OKC_WGSEARLY: the x producer computes the ranges");
+  if (tid < 32) wgs_jrow(S);  // (the x producer needs jrow; the gather below needs it too)
+  CTA_SYNC();
+  __threadfence_block();
+  asm volatile("bar.arrive 7, %0;\n" ::"n"(NT + 64) : "memory");  // both producers start now: weights stream during the gather
+#elif OKC_WGS && OKC_WGSPR
   __threadfence_block();
   asm volatile("bar.arrive 7, %0;\n" ::"n"(NT + 32) : "memory");  // the x producer computes the stage ranges
 #endif
@@ -3671,23 +3728,12 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   WS_JOIN();
 #endif
 #if OKC_WGS
-  if (tid < 32) {  // padded-row base of every job in xA / xB (warp scan)
-    const int nj = S.njF + S.njS;
-    int carry = 0;
-    for (int j0 = 0; j0 < nj; j0 += 32) {
-      const int j = j0 + tid;
-      const int v = j < nj ? (((S.jC[j] + 7) >> 3) << 3) : 0;
-      int incl = v;
-#pragma unroll
-      for (int d = 1; d < 32; d <<= 1) { const int t = __shfl_up_sync(0xffffffffu, incl, d); if (tid >= d) incl += t; }
-      if (j < nj) S.jrow[j] = carry + incl - v;
-      carry += __shfl_sync(0xffffffffu, incl, 31);
-    }
-    if (tid == 0) S.jrow[nj] = carry;
-  }
+#if !OKC_WGSEARLY
+  if (tid < 32) wgs_jrow(S);
   CTA_SYNC();
+#endif
   // phase A's x into xA (this CTA's share of the rows), before the producers start: its x reads do not queue behind
-  // every CTA's first weight stages
+  // every CTA's first weight stages (OKC_WGSEARLY: the producers are already streaming)
   wgs_gather(p, S);
 #if !OKC_WGSFIT
   DBG(7);
@@ -3695,7 +3741,11 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #if !OKC_WGSPR
   if (tid == 0) wgs_ranges(p, S);
 #endif
+#if OKC_WGSEARLY
+  CTA_SYNC();
+#else
   WS_JOIN();
+#endif
 #if !OKC_WGSFIT
   DBG(6);
 #endif
@@ -4378,7 +4428,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "C"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "E"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 DIAG_VARIANT_SETS = {
@@ -4389,6 +4439,17 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "E": {  # WSDYN cause split (pool off / chunked claims / late slot release) + WGS early producer start
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_dyn_s30": {"defines": TINY_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_WSDYNS=30"), "shapes": [1]},
+        "mid": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_dyn_s30": {"defines": MID_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_WSDYNS=30"), "shapes": [16]},
+        "mid_dyn_c4": {"defines": MID_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_WSDYNC=4"), "shapes": [16]},
+        "mid_dyn_late": {"defines": MID_DEFINES + ("-DOKC_WSDYN=1", "-DOKC_WSDYNLATE=1"), "shapes": [16]},
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "wgs_early": {"defines": MAIN_DEFINES + ("-DOKC_WGSEARLY=1",), "shapes": _WGS_SHAPES},
+        "wgs_early_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSEARLY=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
     },
     "D": {  # WGS: dynamic stage claiming (WGSDYN) vs stream-K static ranges, pool size / segment length, timelines
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
@@ -4422,7 +4483,7 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else _WGS_SHAPES if DIAG_SET == "D" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else _WGS_SHAPES if DIAG_SET == "D" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
