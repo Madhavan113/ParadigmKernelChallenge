@@ -14771,7 +14771,10 @@ def _after_attention(data, state, o_in, gate, T):
         # FUSE_ROUTE its last CTA also does the routing and the pre-expert norm (no _route_split launch)
         _bfp_pdl(T)
         route = _fused_route(state, data, ids, lids, wts, xm) if (use_marlin or use_ma) else None
-        P, S = bfp_fused_pooler_router(h, state["bfp"], route), (-2 if route is not None else -1)
+        if route is None:   # (the standalone proj module's launch takes no route argument)
+            P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
+        else:
+            P, S = bfp_fused_pooler_router(h, state["bfp"], route), -2
     elif ppick == "bfp" and state.get("bfp") is not None:
         pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
         logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed
