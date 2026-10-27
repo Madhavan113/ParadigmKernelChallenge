@@ -125,7 +125,8 @@ def _bfp_gemm(st, name, x, m, n, k):
     return bfp_kernel_fn({"x": x, "config": {"layer": _BFP_LAYER[name], "m": m, "n": n, "k": k}}, st["bfp"])
 
 
-FUSE_ROUTE = True   # the fused pooler + router launch (sk2f) also does the routing and the pre-expert norm in its last
+FUSE_ROUTE = False  # OFF (d467a5c5: correct, but the single-CTA tail is latency-bound: fused+tail 29/35/43/64 us at T 1/8/16/32 vs
+                    # 27 for the separate launches + _route_split). The fused pooler + router launch (sk2f) also does the routing and the pre-expert norm in its last
                     # CTA, replacing the _route_split launch (T <= 32, agent/Marlin experts: plain xm layout)
 
 
@@ -141,7 +142,7 @@ def _fused_route(state, data, ids, lids, wts, xm, selftest=False):
     return (state["bias"], state["g_preexp"], ids, lids, wts, xm, ls)
 
 
-FUSE_BOUNDARY = True    # T <= 8: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
+FUSE_BOUNDARY = False   # OFF (d467a5c5: correct, same latency-bound tail; the tuner fell back to the v2 glue, d1 88 vs 75 us). T <= 8: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
                         # (proj_fork's sk2b); enabled only when the prepare-time self-test matches the Triton kernels
 
 
