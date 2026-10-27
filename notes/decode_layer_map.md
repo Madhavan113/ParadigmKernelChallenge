@@ -178,3 +178,25 @@ between runs on half the shapes (profiles: d1 full 22.6 vs 28.8 vs 29.0; v16 sli
 v32 sliding 236.0 vs 231.7 vs 198.3), i.e. the judge's fresh inputs route differently each run; a component change
 below ~3% on the MoE cannot be resolved by one layer check. Profiles: `muse_decode_layer/profiles/
 submission_samever.3e87d0e5862f4f29.txt` and `submission.c8b5aab94fd34546.txt`. Current `submission.py` = c8b5aab9.
+
+## 6. Round 2 (layer-level levers), judged A/Bs (all 13/13 unless noted; baseline c8b5aab9 2.0911)
+
+| job | change | speedup (CI) | verdict |
+|---|---|---|---|
+| 7d23a37c | ATT_BUILD_FLAGS = () (standalone defaults QDIRECT=1 PK2=1 W0ENABLE=0) | 2.0905 (2.059-2.122) | geomean noise; attention rows 0.3-3 us faster on 10/12 shapes (flat q1 87.3 vs 90.4, 169.3 vs 172.6) -> adopted |
+| e1500783 | "mm16": bf16-output cuBLAS candidate for qkv/o/un, tuned per T | 2.0983 (2.067-2.130) | best; verify-16/32 -6..-17 us vs c8b5 (noise-sized) |
+| 19ea8e60 | routing fused into sk2f's last CTA (v1) | 2.051 | REGRESSION: tuner bias (routing timed only in the bfp candidates) picked Triton split-K pr (21.6 + 6.0 us); tail's partial reduction was a 128-load chain |
+| 0ac3dcbb | route tail v2 (token-major partials, warp tree) + tuner consistency + pr pinned to bfp paths | 2.0975 (2.066-2.129) | separate pooler+router still won at every T (prB:27); fused tail never ran |
+| 91ec8f0a | standalone-proj composition (v1) | failed | glue passed route=None to the standalone's 2-arg fused_pooler_router |
+| 55cdc71f | standalone-proj composition (muse_bf16_proj with the sk2 PDL + sk2f port, CUTLASS off) | 2.0305 (2.000-2.061) | loses on every T<=32 shape (qkv sk2 picks 16-18 us vs the fork's 14-15, un 19-21 vs 18-19); T>32 unchanged (the layer never routes through the proj module above BFP_MAX_T). proj_fork.py stays |
+| d467a5c5 | route tail + boundary tails (sk2b: o->boundary1, unpooler slice->boundary2, T<=8) behind prepare-time self-tests | 2.011 | self-tests PASS (ids identical, wts/xm 1e-8) but the single-CTA tails are LATENCY-BOUND: fused+route 29/35/43/64 us at T 1/8/16/32 vs 27 separate; the boundary tails made the tuner pick the v2 glue (d1 88 vs 75 us). Both OFF (28fda91), code + self-tests kept |
+| fc83beb0 | clean: mm16 + ATT flags + tuner fixes, tails off (HEAD 28fda91) | 2.0765 (2.045-2.108) | picks as intended (prF T1-16, prB T32, mm16 qkv/o/un at T>=128); per shape vs e150: d16 -4/-7, d32 +4/+19 (attention/MoE noise), verify +-4 us. Best judged file stays e1500783 (commit e36a421, 2.0983); the three clean runs e150/0ac3/fc83 span 2.077-2.098 on near-identical code |
+
+Lessons: (1) a "last CTA finishes the glue" tail has one 16-B load in flight per thread per round (~0.7 us a round):
+T=32 x 4096 bf16 needs 64 rounds; the Triton per-token kernels issue a whole row at once. A tail would need all loads
+hoisted (8+ in flight per thread) and/or the last K CTAs cooperating; expected gain even then <= 1 us per shape at T=1.
+(2) The tuner must time exactly what dense()/the glue will run for a pick (bfp above BFP_MAX_T ran as fp32 cuBLAS;
+pr candidates must include their routing kernel). (3) At T=128/256 the o projection runs a cuBLAS split-K kernel
+(15.7+3.2 / 23.7 us) in the layer even as bf16 F.linear, while the proj module's isolated timing of the same call is
+10.6 / 12.5 us: unexplained, worth a dedicated look. (4) MoE and attention kernel times move 5-20 us run to run on
+identical code: judge component changes by their kernel rows, never by the geomean.

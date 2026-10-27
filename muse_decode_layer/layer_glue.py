@@ -54,7 +54,7 @@ QKV = 2304
 ROUTER_MULT = 0.1767766952966369
 LOG2E = 1.4426950408889634
 
-_TUNE_LOG = False
+_TUNE_LOG = True   # prepare() prints the tuner's candidate times and picks per token count (untimed; judge .log)
 FORCE_PBMAX = None
 # Programmatic Dependent Launch for this file's Triton glue: each kernel launches while its producer drains and
 # waits (griddepcontrol.wait) right before its first read of producer data; weights and older inputs load before.
@@ -73,8 +73,14 @@ TUNE_MARGIN = 0.95
 # qkv at T=128 cuBLAS 249.4 vs split-K 251.0 (16x8 sliding); qkv at T=256 cuBLAS 351.1 vs split-K 353.5 (32x8 sliding).
 # pr at T=32: separate bfp 166.8 / 318.7 vs fused bfpf 167.9 / 320.2 us (32x1 sliding / full). T=256 pr/un: 4-way tie.
 # un at T=1/8 (the 1024-row slice): bfp 80.7 / 80.1 / 116.7 / 138.2 vs split-K 81.9 / 81.2 / 118.8 / 140.1 us (1x1 s/f, 1x8 s/f).
-PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp", (32, "pr"): "bfp",
-            (128, "qkv"): True, (256, "qkv"): True}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
+PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (1, "o"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp",
+            (1, "pr"): ("bfpf", "bfp"), (8, "pr"): ("bfpf", "bfp"), (16, "pr"): ("bfpf", "bfp"), (32, "pr"): ("bfpf", "bfp"),
+            (128, "qkv"): (True, "mm16"), (256, "qkv"): (True, "mm16")}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
+# pr at T <= 32: the bf16_proj kernels (fused launch incl. the fused routing tail, or separate + _route_split), by the
+# tuner's times; never the Triton split-K / cuBLAS cat GEMM (check 19ea8e60: Triton pr picked by a biased timing cost
+# 6-8 us per decode shape)
+# a tuple pins the choice to the faster of those picks by the tuner's own times (here: cuBLAS fp32 out vs bf16 out,
+# never the Triton split-K the isolated tuner prefers)
 FORCE_MM = None
 FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boundary/router kernels      # None: the tuner's per-(T, matrix) dense choice; else force one backend everywhere   # set to 0/1/2 to override the tuner's megakernel threshold (pod experiments)
 
@@ -86,6 +92,10 @@ FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boun
 # {{COMPONENT moe}}
 
 # {{COMPONENT proj}}
+
+
+if "bfp_CUTLASS_LAYERS" in globals():   # standalone proj composition: no CUTLASS build inside this layer's 300 s prepare
+    bfp_CUTLASS_LAYERS = set()
 
 
 def _bfp_prepare(weights, st):
@@ -113,6 +123,124 @@ def _bfp_pdl(T):
 def _bfp_gemm(st, name, x, m, n, k):
     _bfp_pdl(m)
     return bfp_kernel_fn({"x": x, "config": {"layer": _BFP_LAYER[name], "m": m, "n": n, "k": k}}, st["bfp"])
+
+
+FUSE_ROUTE = False  # OFF (d467a5c5: correct, but the single-CTA tail is latency-bound: fused+tail 29/35/43/64 us at T 1/8/16/32 vs
+                    # 27 for the separate launches + _route_split). The fused pooler + router launch (sk2f) also does the routing and the pre-expert norm in its last
+                    # CTA, replacing the _route_split launch (T <= 32, agent/Marlin experts: plain xm layout)
+
+
+def _fused_route(state, data, ids, lids, wts, xm, selftest=False):
+    """The route tuple for bfp_fused_pooler_router, or None when the separate _route_split kernel must run (also
+    when the composed proj module's fused launch has no routing tail: the standalone muse_bf16_proj, or when the
+    prepare-time self-test of the tail failed)."""
+    ls = data["local_start"]
+    if (not FUSE_ROUTE or ls.dtype != torch.int32 or state["g_preexp"].dtype != torch.bfloat16
+            or "route" not in bfp_fused_pooler_router.__code__.co_varnames
+            or not (selftest or state.get("fuse_route_ok"))):
+        return None
+    return (state["bias"], state["g_preexp"], ids, lids, wts, xm, ls)
+
+
+FUSE_BOUNDARY = False   # OFF (d467a5c5: correct, same latency-bound tail; the tuner fell back to the v2 glue, d1 88 vs 75 us). T <= 8: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
+                        # (proj_fork's sk2b); enabled only when the prepare-time self-test matches the Triton kernels
+
+
+def _route_selftest(st):
+    """The fused routing tail against _route_split on synthetic activations (T = 1, 8, 16, 32): ids must match, the
+    weights and xm within rounding. Any mismatch or exception disables the tail (st["fuse_route_ok"]); printed."""
+    st["fuse_route_ok"] = False
+    if st.get("bfp") is None or not FUSE_ROUTE or "route" not in bfp_fused_pooler_router.__code__.co_varnames:
+        print("route tail: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    g = torch.Generator(device=dev).manual_seed(777)
+    ls = torch.zeros(1, dtype=torch.int32, device=dev)
+    worst = []
+    for T in (1, 8, 16, 32):
+        h = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        a = [torch.empty((T, 8), dtype=torch.int32, device=dev), torch.empty((T, 8), dtype=torch.int32, device=dev),
+             torch.empty((T, 8), dtype=torch.float32, device=dev), torch.empty((T, D_EXPERT), dtype=torch.bfloat16, device=dev)]
+        b = [torch.empty_like(t) for t in a]
+        rt = _fused_route(st, {"local_start": ls}, *a, selftest=True)
+        try:
+            _bfp_pdl(T)
+            pooled, logits = bfp_fused_pooler_router(h, st["bfp"], rt)
+            torch.cuda.synchronize()
+        except Exception as ex:  # noqa: BLE001
+            print(f"route tail T{T}: FAILED {repr(ex)[:300]}", flush=True)
+            return
+        _route_split[(T,)](pooled, logits, st["bias"], st["g_preexp"], b[0], b[2], b[3], ls, b[1], PERMUTED=False, num_warps=8)
+        torch.cuda.synchronize()
+        d_ids = int((a[0] != b[0]).sum()) + int((a[1] != b[1]).sum())
+        d_w = float((a[2] - b[2]).abs().max())
+        d_x = float((a[3].float() - b[3].float()).abs().max()) / max(1e-6, float(b[3].float().abs().max()))
+        worst.append((T, d_ids, d_w, d_x))
+        if d_ids or not d_w < 1e-4 or not d_x < 2e-2:
+            print(f"route tail T{T}: MISMATCH ids {d_ids} wts {d_w:.2e} xm {d_x:.2e}", flush=True)
+            return
+    print("route tail ok: " + " ".join(f"T{T} ids0 w{w:.1e} x{x:.1e}" for T, _, w, x in worst), flush=True)
+    st["fuse_route_ok"] = True
+
+
+def _boundary_selftest(st):
+    """The sk2b boundary tails (o projection -> _boundary1, unpooler slice -> _boundary2) against the Triton kernels
+    at T = 1, 8 on synthetic inputs; any mismatch or exception disables them (st["fuse_bnd_ok"]); printed."""
+    st["fuse_bnd_ok"] = False
+    if (st.get("bfp") is None or not FUSE_BOUNDARY or "bfp_run_sk2_tail" not in globals()
+            or "ab1" not in st):
+        print("boundary tails: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    g = torch.Generator(device=dev).manual_seed(778)
+    f32 = dict(device=dev, dtype=torch.float32)
+    report = []
+    for T in (1, 8):
+        stream = torch.randn(T, HIDDEN, generator=g, device=dev)
+        o_in = (torch.randn(T, 1024, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        m = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        try:
+            _bfp_pdl(T)
+            s1a, ha = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            P = globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, st["bfp"],
+                                              (st["ab1"][0], st["ab1"][1], stream, None, st["g_preffn"], s1a, ha))
+            s2a, outa = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            Pu = globals()["bfp_run_sk2_tail"](m, "unpooler", T, 1024, D_EXPERT, st["bfp"],
+                                               (st["ab2"][0], st["ab2"][1], s1a, st["g_postffn"], st["g_next"], s2a, outa))
+            torch.cuda.synchronize()
+        except Exception as ex:  # noqa: BLE001
+            print(f"boundary tails T{T}: FAILED {repr(ex)[:300]}", flush=True)
+            return
+        # the Triton kernels on the SAME GEMM outputs (P, Pu are the bf16 products the tails saw)
+        s1b, hb = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        _boundary1[(T,)](P.view(1, T, HIDDEN), 1, T, stream, st["gate1"], st["gate1"], st["g_preffn"], s1b, hb, num_warps=16)
+        s2b, outb = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        _boundary2[(T,)](Pu.view(1, T, 1024), 1, T, 1024, s1a, st["gate2"], st["gate2"], st["g_postffn"], st["g_next"],
+                         s2b, outb, num_warps=16)
+        torch.cuda.synchronize()
+        errs = []
+        for x, y in ((s1a, s1b), (ha, hb), (s2a, s2b), (outa, outb)):
+            errs.append(float((x.float() - y.float()).norm() / max(1e-6, float(y.float().norm()))))
+        report.append((T, errs))
+        if not all(e < 2e-3 for e in errs):
+            print(f"boundary tails T{T}: MISMATCH rel err s1 {errs[0]:.2e} h {errs[1]:.2e} s2 {errs[2]:.2e} out {errs[3]:.2e}", flush=True)
+            return
+    print("boundary tails ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
+    st["fuse_bnd_ok"] = True
+
+
+def _gate_coeffs(g):
+    """alpha, beta of a residual gate from its BF16 weight, exactly as _gate_ab forms them (prepare-time, fp32)."""
+    w = g.float() / 0.3
+    beta = torch.sigmoid(w)
+    alpha = torch.sqrt(torch.clamp(torch.sigmoid(-w) * (1.0 + beta), min=1e-3))
+    return alpha.contiguous(), beta.contiguous()
+
+
+def _bfp_tail_ok(state, T):
+    return (FUSE_BOUNDARY and T <= 8 and state.get("bfp") is not None and "bfp_run_sk2_tail" in globals()
+            and state.get("fuse_bnd_ok") and "ab1" in state and state["g_preffn"].dtype == torch.bfloat16
+            and state["g_postffn"].dtype == torch.bfloat16 and state["g_next"].dtype == torch.bfloat16)
 
 
 SCRATCH_GUARD = 1 << 16   # sentinel words after each buffer my glue allocates: wide enough for far overruns (v154m-style state ~4K words out)
@@ -321,6 +449,11 @@ def dense(x, w, T, state=None, name=None):
     if pick == "bfp" and T <= BFP_MAX_T and name in _BFP_LAYER and state.get("bfp") is not None:
         # bf16_proj's kernel (BF16 out, as SGLang's GEMM): the consumers read P as one [1, T, N] partial
         return _bfp_gemm(state, name, x, T, N, K).view(1, T, N), 1
+    if pick == "mm16":
+        # cuBLAS with BF16 output (SGLang's own bf16 GEMM call): a different kernel from the fp32-output call, which at
+        # T = 128/256 lands on a 19-24 us split-K kernel for the o projection (bf16 out: 8-10 us); the consumers read
+        # P in any dtype (the bf16_proj paths at T <= 32 already hand them bf16)
+        return torch.nn.functional.linear(x, w).view(1, T, N), 1
     if pick is True or pick == "bfp":       # above BFP_MAX_T a bfp pick runs as cuBLAS (measured in the chain)
         out = torch.mm(x, w.t(), out_dtype=torch.float32)
         return out.view(1, T, N), 1
@@ -1180,12 +1313,33 @@ def _tune(st, log=False):
         for name, w, K in (("qkv", st["qkv"], HIDDEN), ("o", st["o"], 1024), ("pr", st["pr"], HIDDEN),
                            ("un", st["unpool_slice"] if T <= 8 else st["unpool"], D_EXPERT)):
             xd = (torch.randn(T, K, generator=g, device=dev) * 0.1).to(torch.bfloat16)
-            if st.get("bfp") is not None:
+            # the pooler + router candidates are timed WITH the routing kernel / the fused routing tail they imply
+            r_ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
+            r_lids = torch.empty((T, 8), device=dev, dtype=torch.int32)
+            r_wts = torch.empty((T, 8), device=dev, dtype=torch.float32)
+            r_xm = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
+
+            def _pr_split(pooled, logits):
+                _route_split[(T,)](pooled, logits, st["bias"], st["g_preexp"], r_ids, r_wts, r_xm, data["local_start"],
+                                   r_lids, PERMUTED=False, num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+
+            def _pr_route(PS):   # the combined pooler+router GEMM output -> the routing kernel that consumes it
+                P_, S_ = PS
+                _route[(T,)](P_, S_, T, st["bias"], st["g_preexp"], r_ids, r_wts, r_xm, data["local_start"], r_lids,
+                             PERMUTED=False, num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+
+            def _dense_t(pick):   # time what dense() runs for this pick (+ the routing kernel for "pr")
+                st["mm_pick"][(T, name)] = pick
+                if name == "pr":
+                    return _graph_time(lambda: _pr_route(dense(xd, w, T, st, name)), flush, reps=5)
+                return _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+
+            if st.get("bfp") is not None and T <= BFP_MAX_T:   # above BFP_MAX_T a "bfp" pick runs as cuBLAS: not a candidate
                 st["mm_pick"][(T, name)] = "bfp"
                 try:
                     if name == "pr":
-                        t_bfp = _graph_time(lambda: (_bfp_gemm(st, "pool", xd, T, D_EXPERT, HIDDEN),
-                                                     _bfp_gemm(st, "router", xd, T, N_EXPERTS, HIDDEN)),
+                        t_bfp = _graph_time(lambda: _pr_split(_bfp_gemm(st, "pool", xd, T, D_EXPERT, HIDDEN),
+                                                              _bfp_gemm(st, "router", xd, T, N_EXPERTS, HIDDEN)),
                                             flush, reps=5)
                     else:
                         nn = w.shape[0]
@@ -1194,27 +1348,42 @@ def _tune(st, log=False):
                     t_bfp = 1e30
             else:
                 t_bfp = 1e30
-            st["mm_pick"][(T, name)] = False
             try:
-                t_tri = _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+                t_tri = _dense_t(False)
             except Exception:  # noqa: BLE001
                 t_tri = 1e30
-            st["mm_pick"][(T, name)] = True
             try:
-                t_mm = _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+                t_mm = _dense_t(True)
             except Exception:  # noqa: BLE001
                 t_mm = 1e30
             t_bfpf = 1e30
             if name == "pr" and T <= 32 and st.get("bfp") is not None and "bfp_fused_pooler_router" in globals():
                 try:
-                    t_bfpf = _graph_time(lambda: bfp_fused_pooler_router(xd, st["bfp"]), flush, reps=5)
-                except Exception:  # noqa: BLE001  (sm_80 or an older bf16_proj file: not offered)
+                    _bfp_pdl(T)
+                    rt = _fused_route(st, data, r_ids, r_lids, r_wts, r_xm)
+                    if rt is not None:
+                        t_bfpf = _graph_time(lambda: bfp_fused_pooler_router(xd, st["bfp"], rt), flush, reps=5)
+                    else:
+                        t_bfpf = _graph_time(lambda: _pr_split(*bfp_fused_pooler_router(xd, st["bfp"])), flush, reps=5)
+                except Exception as ex:  # noqa: BLE001  (sm_80 or an older bf16_proj file: not offered)
                     t_bfpf = 1e30
-            opts = {False: t_tri, True: t_mm, "bfp": t_bfp, "bfpf": t_bfpf}
+                    if log:
+                        msg.append(f"bfpfX:{repr(ex)[:120]}")
+            if log and name == "pr":
+                msg.append(f"pr[T{t_tri:.0f} M{t_mm:.0f} B{t_bfp:.0f} F{t_bfpf:.0f}]")
+            t_mm16 = 1e30
+            if name != "pr":   # the router logits stay fp32 (hi + lo rows); the other three may come out bf16 as SGLang's
+                st["mm_pick"][(T, name)] = "mm16"
+                try:
+                    t_mm16 = _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+                except Exception:  # noqa: BLE001
+                    t_mm16 = 1e30
+            opts = {False: t_tri, True: t_mm, "bfp": t_bfp, "bfpf": t_bfpf, "mm16": t_mm16}
+            st.setdefault("mm_times", {})[(T, name)] = opts
             bestp = min(opts, key=lambda p: opts[p])
             st["mm_pick"][(T, name)] = bestp
             if log:
-                msg.append(f"{name}{ {False: 'T', True: 'M', 'bfp': 'B', 'bfpf': 'F'}[bestp] }:{opts[bestp]:.0f}")
+                msg.append(f"{name}{ {False: 'T', True: 'M', 'bfp': 'B', 'bfpf': 'F', 'mm16': 'm'}[bestp] }:{opts[bestp]:.0f}")
         if st["bank"] is not None and T <= 384:
             xm = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
             raw = torch.randint(0, N_EXPERTS, (T, 8), generator=g, device=dev, dtype=torch.int32)
@@ -1305,6 +1474,8 @@ def prepare(weights):
     # precomputes (the post-expert effective weight) is stored exactly as SGLang stores it, in BF16.
     st["gate1"] = weights["attn_residual_gate"].contiguous()
     st["gate2"] = weights["ffn_residual_gate"].contiguous()
+    st["ab1"] = _gate_coeffs(st["gate1"])   # (alpha, beta) fp32 for the fused boundary tails (FUSE_BOUNDARY)
+    st["ab2"] = _gate_coeffs(st["gate2"])
     st["g_preffn"] = weights["pre_ffn_norm"].contiguous()
     st["g_preexp"] = weights["pre_expert_norm"].contiguous()
     st["g_postexp"] = weights["post_expert_norm"].contiguous()   # BF16 as given; _pexp_norm_sum forms 1 + w
@@ -1332,6 +1503,11 @@ def prepare(weights):
         raise errs[0]
     _ma_prepare(weights, st)
     _bfp_prepare(weights, st)
+    for selftest in (_route_selftest, _boundary_selftest):   # the fused tails, each enabled only when it matches
+        try:
+            selftest(st)
+        except Exception as ex:  # noqa: BLE001
+            print(f"{selftest.__name__} failed: {repr(ex)[:300]}", flush=True)
     st["nsm"] = torch.cuda.get_device_properties(dev).multi_processor_count
     st["fa3"] = None
     st["bank"] = None
@@ -1355,6 +1531,9 @@ def prepare(weights):
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
+        if isinstance(v, tuple):
+            times = st.get("mm_times", {}).get(k, {})
+            v = min(v, key=lambda p: times.get(p, 1e30))
         st.setdefault("mm_pick", {})[k] = v
     torch.cuda.synchronize()
     if st.get("att_ok"):
@@ -1374,7 +1553,8 @@ def _attn_cfg(B, L, sliding):
 
 # The attention module's extension, built once for this layer: its source with the layer's measured flags (the
 # standalone entry's defaults are QDIRECT=1, PK2=1, W0ENABLE=0; this build is their "v298w1").
-ATT_BUILD_FLAGS = ("-DOKC_QDIRECT=0", "-DOKC_PK2=0", "-DOKC_W0ENABLE=1")
+ATT_BUILD_FLAGS = ()   # A/B 7d23a37c vs c8b5aab9: the standalone defaults (QDIRECT=1 PK2=1 W0ENABLE=0) measured 0.3-3 us
+                       # faster per attention launch on 10 of 12 shapes than the layer's old build (0/0/1)
 
 
 def _att7():
@@ -1582,6 +1762,12 @@ def _after_attention(data, state, o_in, gate, T):
         BC1 = 2048
         _bnd1_apply[(T, HIDDEN // BC1)](a_out, sums, data["stream"], state["gate1"], state["gate1"], state["g_preffn"],
                                         s1, h, N=HIDDEN, BC=BC1, num_warps=8)
+    elif (gate is None and _bfp_tail_ok(state, T) and state.get("mm_pick", {}).get((T, "o")) == "bfp"
+          and data["stream"].dtype == torch.float32 and data["stream"].is_contiguous()):
+        # o projection whose last CTA also computes the post-attention boundary (s1, h): no _boundary1 launch
+        _bfp_pdl(T)
+        globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, state["bfp"],
+                         (state["ab1"][0], state["ab1"][1], data["stream"], None, state["g_preffn"], s1, h))
     else:
         if gate is None:
             P, S = dense(o_in, state["o"], T, state, "o")
@@ -1590,18 +1776,6 @@ def _after_attention(data, state, o_in, gate, T):
         _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
                          num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
     # 4. pooler + router (BF16 hi + lo rows, FP32 accumulation), routing, pre-expert norm
-    mmp = state.get("mm_pick", {})
-    ppick = mmp.get((T, "pr"), mmp.get((_bucket(T), "pr"), False))
-    if ppick == "bfpf" and T <= 32 and state.get("bfp") is not None:
-        # bf16_proj's fused pooler + router: one launch, both read h once (bf16 [T, 4096], fp32 [T, 256])
-        _bfp_pdl(T)
-        P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
-    elif ppick == "bfp" and state.get("bfp") is not None:
-        pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
-        logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed
-        P, S = (pooled, logits), -1
-    else:
-        P, S = dense(h, state["pr"], T, state, "pr")
     ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     lids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     wts = torch.empty((T, 8), **f32)
@@ -1617,7 +1791,26 @@ def _after_attention(data, state, o_in, gate, T):
     if not (use_marlin or use_ma):
         raise RuntimeError("no expert backend: neither the moe agent's kernel nor SGLang's Marlin is available")
     xm = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
-    if S == -1:  # pooler and router came from the bf16_proj kernels as two separate tensors
+    mmp = state.get("mm_pick", {})
+    ppick = mmp.get((T, "pr"), mmp.get((_bucket(T), "pr"), False))
+    if ppick == "bfpf" and T <= 32 and state.get("bfp") is not None:
+        # bf16_proj's fused pooler + router: one launch, both read h once (bf16 [T, 4096], fp32 [T, 256]); with
+        # FUSE_ROUTE its last CTA also does the routing and the pre-expert norm (no _route_split launch)
+        _bfp_pdl(T)
+        route = _fused_route(state, data, ids, lids, wts, xm) if (use_marlin or use_ma) else None
+        if route is None:   # (the standalone proj module's launch takes no route argument)
+            P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
+        else:
+            P, S = bfp_fused_pooler_router(h, state["bfp"], route), -2
+    elif ppick == "bfp" and state.get("bfp") is not None:
+        pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
+        logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed
+        P, S = (pooled, logits), -1
+    else:
+        P, S = dense(h, state["pr"], T, state, "pr")
+    if S == -2:  # the routing and xm were produced inside the fused pooler + router launch
+        pass
+    elif S == -1:  # pooler and router came from the bf16_proj kernels as two separate tensors
         pooled, logits = P
         _route_split[(T,)](pooled, logits, state["bias"], state["g_preexp"], ids, wts, xm,
                            data["local_start"], lids, PERMUTED=not (use_marlin or use_ma), num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
@@ -1639,10 +1832,16 @@ def _after_attention(data, state, o_in, gate, T):
         m = _marlin_experts(xm, wts, lids, state)
     # 6. unpooler + post-FFN boundary + next layer's norm
     wu = state["unpool_slice"] if T <= 8 else state["unpool"]
-    P, S = dense(m, wu, T, state, "un")
     nu = wu.shape[0]
     s2 = torch.empty((T, HIDDEN), **f32)
     out = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+    if not v2 and _bfp_tail_ok(state, T) and state.get("mm_pick", {}).get((T, "un")) == "bfp":
+        # unpooler slice whose last CTA also computes the post-FFN boundary (s2, out): no _boundary2 launch
+        _bfp_pdl(T)
+        globals()["bfp_run_sk2_tail"](m, "unpooler", T, nu, D_EXPERT, state["bfp"],
+                         (state["ab2"][0], state["ab2"][1], s1, state["g_postffn"], state["g_next"], s2, out))
+        return out, s2, ids
+    P, S = dense(m, wu, T, state, "un")
     if v2:
         fbuf = torch.zeros((T, HIDDEN), **f32)
         sums2 = torch.zeros((T, 4), **f32)
