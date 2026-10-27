@@ -2878,11 +2878,8 @@ void cgemv(at::Tensor L, at::Tensor C, at::Tensor x, at::Tensor etab, int64_t pm
   auto op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   const uint32_t b4 = (uint32_t)base4;
   const int pm = (int)pmax;
-  if (K == 8192 && rows == 2 && nth == 256) cgemv_kernel<2, 256, 8192><<<N / 2, 256 + 32, 0, st>>>(a0, a1, xp, tp, pm, op, b4);
-  else if (K == 1024 && rows == 2 && nth == 64) cgemv_kernel<2, 64, 1024><<<N / 2, 64 + 32, 0, st>>>(a0, a1, xp, tp, pm, op, b4);
-  else if (K == 4096 && rows == 2 && nth == 128) cgemv_kernel<2, 128, 4096><<<N / 2, 128 + 32, 0, st>>>(a0, a1, xp, tp, pm, op, b4);
-  else if (K == 8192 && rows == 2 && nth == 512) cgemv_kernel<2, 512, 8192><<<N / 2, 512 + 32, 0, st>>>(a0, a1, xp, tp, pm, op, b4);
-  else TORCH_CHECK(false, "cgemv: no instantiation for K=", K, " rows=", rows, " nth=", nth);
+  @@CG_DISPATCH@@
+  TORCH_CHECK(false, "cgemv: no instantiation for K=", K, " rows=", rows, " nth=", nth);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -3226,7 +3223,7 @@ def _get_ext():
         common = CUDA_SRC.replace("@@MBAR@@", MBAR_HELPERS).replace("@@BODY@@", WG_HELPERS if sm90 else "")
         defs = wgmma_defs([8, 16, 32, 64, 128]) if sm90 else ""
         cuda_src = (common + defs + _tma_srcs(sm90) + MAP_SRC + _gemm_src(sm90) + _wide_src(sm90) + _sk2_src(sm90)
-                    + _gq_src(sm90) + _gqx_src(sm90) + RGEMV_SRC + _rk_src(sm90))
+                    + _gq_src(sm90) + _gqx_src(sm90) + _rgemv_src() + _rk_src(sm90))
         _ext = load_inline(
             name=f"okc_bf16proj_v142_{arch}" + (f"_dly{_SK2_DELAY}" if _SK2_DELAY else ""),
             cpp_sources="#include <torch/extension.h>\n" + CPP_SRC,
@@ -3723,6 +3720,25 @@ def sk2_compress(w):
 
 CG_CONFIGS = {"qkv_gate": (2, 256), "o": (2, 64), "unpooler": (2, 128), "pooler": (2, 512)}   # layer -> (rows per CTA, threads); m = 1
 # (v137: pooler m=1 cgemv 2x512 measured -0.34 us vs sk2; 2x256 ties sk2, 4/8 rows or 1 row lose)
+# alternatives the autotuner times against CG_CONFIGS (m = 1): more rows per CTA = fewer CTAs and fewer x re-reads (o at
+# 2 x 64: 4096 CTAs of 3 KB each re-reading 2 KB of x: as many x bytes as weight bytes); K >= 16 threads per CTA
+CG_ALT = {"o": [(4, 64), (8, 64), (4, 32), (2, 32)], "unpooler": [(4, 128), (8, 128), (4, 256), (2, 256)],
+          "qkv_gate": [(4, 256), (2, 128), (4, 128)]}
+CG_K = {"qkv_gate": 8192, "o": 1024, "unpooler": 4096, "pooler": 8192}
+
+
+def _cg_configs(layer):
+    return [CG_CONFIGS[layer]] + list(CG_ALT.get(layer, ()))
+
+
+def _rgemv_src():
+    lines = []
+    for layer in CG_CONFIGS:
+        k = CG_K[layer]
+        for rows, nth in _cg_configs(layer):
+            lines.append(f"if (K == {k} && rows == {rows} && nth == {nth}) {{ cgemv_kernel<{rows}, {nth}, {k}><<<N / {rows}, {nth} + 32, 0, st>>>"
+                         f"(a0, a1, xp, tp, pm, op, b4); C10_CUDA_KERNEL_LAUNCH_CHECK(); return; }}")
+    return RGEMV_SRC.replace("@@CG_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
 
 
 def cg_compress(w, rows_per_cta):
@@ -3988,9 +4004,10 @@ def prepare(weights):
             state["raw"][name] = w
             if name in CG_CONFIGS:
                 wc = w[:1024] if name == "unpooler" else w   # the unpooler at m = 1 is the 1024-row slice
-                cg = cg_compress(wc.contiguous(), CG_CONFIGS[name][0])
-                if cg is not None:
-                    state.setdefault("cg", {})[name] = cg
+                for rows in sorted({r for r, _ in _cg_configs(name)}):   # one plane set per rows-per-CTA (its table)
+                    cg = cg_compress(wc.contiguous(), rows)
+                    if cg is not None:
+                        state.setdefault("cg", {})[(name, rows)] = cg
             if name in TORCHT_LAYERS and sm90_:
                 state.setdefault("rawT", {})[name] = w.t().contiguous()
             c = pack_compressed(w) if name in COMPRESS else None
@@ -4109,6 +4126,8 @@ def _cand_key(layer, m, ch):
         return ("skinny_alt", layer, m)
     if ch[0] == "gqx":
         return (layer, "gqx", _gqx_bn(m), ch[1])
+    if ch[0] == "cgemv" and len(ch) > 1:
+        return (layer, "cgemv", ch[1])
     if ch[0] == "sk2" and len(ch) > 1:
         return (layer, "sk2", ch[1], _sk2_tokr(m))
     return _route_key(layer, m, ch[0])
@@ -4230,8 +4249,8 @@ def _run(choice, x, layer, m, n, k, state):
     if kind == "gqx":
         return _run_gqx(x, layer, m, n, k, state, choice[1] if len(choice) > 1 else 0)
     if kind == "cgemv":   # m = 1: 12-bit compressed GEMV (qkv, o, unpooler slice, pooler)
-        cg = state["cg"][layer]
-        rows, nth = CG_CONFIGS[layer]
+        rows, nth = choice[1] if len(choice) > 1 else CG_CONFIGS[layer]
+        cg = state["cg"][(layer, rows)]
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
         _get_ext().cgemv(cg["L"], cg["C"], x, cg["tab"], cg["pmax"], out, cg["base4"], rows, nth)
         return out
@@ -4313,8 +4332,10 @@ def _candidates(layer, m, state):
         c.insert(0, ("rk",))
     if layer == "unpooler" and m == 1:
         c.insert(0, ("sgemv",))
-    if m == 1 and layer in state.get("cg", {}) and _route_key(layer, m, "cgemv") not in state["disabled"]:
-        c.insert(0, ("cgemv",))
+    if m == 1 and layer in CG_CONFIGS:
+        for cfg in _cg_configs(layer):
+            if (layer, cfg[0]) in state.get("cg", {}) and _cand_key(layer, m, ("cgemv", cfg)) not in state["disabled"]:
+                c.insert(0, ("cgemv", cfg))
     if layer in TORCHT_LAYERS and 32 < m <= 256 and layer in state.get("rawT", {}):
         c.append(("torchT",))
     if (128 < m <= 256 and layer in state.get("cut_layers", ()) and _cut_ext is not None
@@ -4401,6 +4422,8 @@ def _cand_name(c):
         return f"gqx[{c[1]}]"
     if c[0] == "sk2" and len(c) > 1:
         return f"sk2/{c[1]}"
+    if c[0] == "cgemv" and len(c) > 1:
+        return f"cgemv/{c[1][0]}x{c[1][1]}"
     return c[0]
 
 

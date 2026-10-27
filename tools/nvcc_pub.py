@@ -35,10 +35,10 @@ if "--sk2-alt-only" in sys.argv:   # instantiate only the SK2_ALT configs (the p
     sys.argv.remove("--sk2-alt-only"); S.SK2_PICK = {}
 if only is None:
     cuda_src = (common + defs + S._tma_srcs(sm90) + S.MAP_SRC + S._gemm_src(sm90) + S._wide_src(sm90) + S._sk2_src(sm90)
-                + S._gq_src(sm90) + S._gqx_src(sm90) + S.RGEMV_SRC + S._rk_src(sm90))
+                + S._gq_src(sm90) + S._gqx_src(sm90) + S._rgemv_src() + S._rk_src(sm90))
 else:
     parts = {"sk2": S._sk2_src, "gq": S._gq_src, "gqx": S._gqx_src, "rk": S._rk_src, "wide": S._wide_src,
-             "gemm": S._gemm_src, "tma": S._tma_srcs, "rgemv": lambda sm: S.RGEMV_SRC}
+             "gemm": S._gemm_src, "tma": S._tma_srcs, "rgemv": lambda sm: S._rgemv_src()}
     cuda_src = common + defs + S.wgmma_ss_defs([64, 128, 256]) + S.MAP_SRC + "".join(parts[k](sm90) for k in only)
 import torch.utils.cpp_extension as E
 src = "#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + cuda_src
