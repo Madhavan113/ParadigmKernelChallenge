@@ -1750,8 +1750,8 @@ def _moe_forward_cuda(x, ids, tw, local_start: int, I: int, state) -> torch.Tens
 WT_DEFAULT = {8: (1, 1, 1, 8, 1), 16: (1, 1, 1, 4, 1), 64: (1, 2, 1, 4, 1), 128: (2, 2, 1, 4, 1), 100000: (4, 2, 1, 2, 1)}
 WT_SAFE = (1, 1, 1, 4, 1)
 # bulk-copy weight path (6th tuple element = 1): policy by token count, used when WT_USE_BULK and the self-test passed
-WT_BULK = {8: (1, 1, 1, 2, 1, 4), 16: (1, 1, 1, 2, 1, 4), 64: (1, 2, 1, 2, 1, 4)}   # 6th element = chunks per bulk copy (32 KB stages)
-WT_USE_BULK = False
+WT_BULK = {8: (2, 2, 1, 2, 1, 4)}   # 6th element = chunks per bulk copy: 2 super-stages x 32 KB, 2 CTAs/SM; bench (check c5cd1373): bs1 47.2 vs 51.9, bs8 80.2 vs 85.8; bs16 ties -> WT_DEFAULT
+WT_USE_BULK = True
 PART_SPLIT_MAX = 4      # fp32 partial slices for split-K
 PART_ROWS = 1024        # padded rows the partial buffer holds (split-K is a small-batch tool)
 _WT_OVERRIDE = None
@@ -2150,7 +2150,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
@@ -2332,7 +2332,7 @@ def _timeit_cold(fn, dev, reps=8):
 
 
 WT_TEST_VARIANTS = ((1, 1, 1, 4, 1), (1, 1, 1, 8, 1), (1, 2, 1, 4, 1), (2, 2, 1, 4, 1), (2, 2, 1, 3, 1), (4, 2, 1, 2, 1),
-                    (1, 1, 1, 8, 1, 1), (1, 1, 1, 2, 1, 4), (1, 1, 1, 4, 1, 2), (1, 2, 1, 2, 1, 4), (1, 1, 1, 3, 1, 4))
+                    (1, 1, 1, 2, 1, 4), (2, 2, 1, 2, 1, 4), (1, 2, 1, 2, 1, 4))
 
 
 def _selftest_wt(state):
