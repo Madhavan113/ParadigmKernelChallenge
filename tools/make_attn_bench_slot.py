@@ -19,16 +19,18 @@ attn = open(f"{ROOT}/muse_attention_decode/submission.py").read()
 attn = attn.replace("OKC_BENCH = 1      # 1:", "OKC_BENCH = 0      # 1:")
 assert "OKC_BENCH = 0" in attn
 
-anchor = '''                print("SELFTEST", fn.__name__, "failed:", repr(exc), flush=True)
-    return st
+# the bench runs FIRST in prepare() (the prefill's own tuning takes a variable share of the 300 s window; a late
+# bench got killed in slots 2 / 3), with line-buffered stdout so every row survives a timeout
+anchor = '''def prepare(weights):
+    dev = weights["qkv_gate"].device
 '''
 assert pre.count(anchor) == 1
-pre = pre.replace(anchor, '''                print("SELFTEST", fn.__name__, "failed:", repr(exc), flush=True)
+pre = pre.replace(anchor, '''def prepare(weights):
+    dev = weights["qkv_gate"].device
     try:
         _attn_bench_slot(dev)
     except Exception as exc:  # noqa: BLE001
         print("ATTNBENCH failed:", repr(exc)[:400], flush=True)
-    return st
 ''')
 tail = f'''
 
@@ -46,6 +48,10 @@ ATTN_FLAT_BASE = {flat_base}
 def _attn_bench_slot(dev):
     import time
     t0 = time.time()
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except Exception:  # noqa: BLE001
+        pass
     ns = {{"__name__": "okc_attn_slot", "__file__": __file__}}
     exec(compile(ATTN_SRC, "okc_attn_slot.py", "exec"), ns)
     ns["BENCH_VARIANTS"] = ATTN_BENCH_VARIANTS
