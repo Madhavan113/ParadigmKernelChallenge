@@ -107,6 +107,10 @@ namespace {
 #ifndef OKC_CPHINT
 #define OKC_CPHINT 0    // flat producer: K/V copies with an L2 evict_first cache hint (the rows are read once)
 #endif
+#ifndef OKC_EXH8F
+#define OKC_EXH8F 0     // flat q8 (PK2 path): the softmax exponentials as f16x2 pairs (half the MUFU ops; the P bytes are e4m3
+                        // anyway); the lazy-offset byte test, the split PV and the late sync are unchanged
+#endif
 #ifndef OKC_PIPE8
 #define OKC_PIPE8 0     // flat q8: the next tile's stage wait + QK^T wgmma issued right after this tile's PV wgmma (both in
                         // flight across the loop edge: the QK^T latency and the PV end-of-tile wait leave the chain)
@@ -1019,6 +1023,12 @@ __device__ __forceinline__ uint32_t ex2_e4m3x4_h(float x0, float x1, float x2, f
   asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(hi) : "r"(eb));
   return (uint32_t)lo | ((uint32_t)hi << 16);
 }
+// (OKC_EXH8F) four exponentials packed to e4m3: f16x2 pairs or fp32 (the PK2 pack)
+#if OKC_EXH8F
+#define PKX(a, b, c, d) ex2_e4m3x4_h(a, b, c, d)
+#else
+#define PKX(a, b, c, d) e4m3x4f(ex2(a), ex2(b), ex2(c), ex2(d))
+#endif
 // sigmoid for the output gate: 0.5 + 0.5 tanh(x / 2) with the hardware tanh (3 instructions; abs error ~2^-12,
 // below the BF16 output's rounding) or exp + fast reciprocal
 __device__ __forceinline__ float sigm(float x) {
@@ -3287,10 +3297,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
           for (int kk = 0; kk < 2; ++kk) {
             const float* sv = s + 16 * kk;
-            pa[kk][0] = e4m3x4f(ex2(fmaf(sv[0], ssc, -dlo)), ex2(fmaf(sv[1], ssc, -dlo)), ex2(fmaf(sv[4], ssc, -dlo)), ex2(fmaf(sv[5], ssc, -dlo)));
-            pa[kk][1] = e4m3x4f(ex2(fmaf(sv[2], ssc, -dhi)), ex2(fmaf(sv[3], ssc, -dhi)), ex2(fmaf(sv[6], ssc, -dhi)), ex2(fmaf(sv[7], ssc, -dhi)));
-            pa[kk][2] = e4m3x4f(ex2(fmaf(sv[8], ssc, -dlo)), ex2(fmaf(sv[9], ssc, -dlo)), ex2(fmaf(sv[12], ssc, -dlo)), ex2(fmaf(sv[13], ssc, -dlo)));
-            pa[kk][3] = e4m3x4f(ex2(fmaf(sv[10], ssc, -dhi)), ex2(fmaf(sv[11], ssc, -dhi)), ex2(fmaf(sv[14], ssc, -dhi)), ex2(fmaf(sv[15], ssc, -dhi)));
+            pa[kk][0] = PKX(fmaf(sv[0], ssc, -dlo), fmaf(sv[1], ssc, -dlo), fmaf(sv[4], ssc, -dlo), fmaf(sv[5], ssc, -dlo));
+            pa[kk][1] = PKX(fmaf(sv[2], ssc, -dhi), fmaf(sv[3], ssc, -dhi), fmaf(sv[6], ssc, -dhi), fmaf(sv[7], ssc, -dhi));
+            pa[kk][2] = PKX(fmaf(sv[8], ssc, -dlo), fmaf(sv[9], ssc, -dlo), fmaf(sv[12], ssc, -dlo), fmaf(sv[13], ssc, -dlo));
+            pa[kk][3] = PKX(fmaf(sv[10], ssc, -dhi), fmaf(sv[11], ssc, -dhi), fmaf(sv[14], ssc, -dhi), fmaf(sv[15], ssc, -dhi));
           }
         };
         pack2();
