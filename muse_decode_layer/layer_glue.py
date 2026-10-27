@@ -109,6 +109,7 @@ def _bfp_prepare(weights, st):
 
 
 _BFP_LAYER = {"qkv": "qkv_gate", "o": "o", "un": "unpooler", "pool": "pooler", "router": "router"}
+_T_COPY = {"qkv": "qkvT", "o": "oT", "pr": "prT", "un": "unpoolT"}   # dense name -> state key of the K-major weight copy
 
 
 BFP_PDL_N = 2   # bf16_proj's sk2 / fused kernels: weight stages issued before griddepcontrol.wait (0 = off)
@@ -450,10 +451,21 @@ def dense(x, w, T, state=None, name=None):
         # bf16_proj's kernel (BF16 out, as SGLang's GEMM): the consumers read P as one [1, T, N] partial
         return _bfp_gemm(state, name, x, T, N, K).view(1, T, N), 1
     if pick == "mm16":
-        # cuBLAS with BF16 output (SGLang's own bf16 GEMM call): a different kernel from the fp32-output call, which at
-        # T = 128/256 lands on a 19-24 us split-K kernel for the o projection (bf16 out: 8-10 us); the consumers read
-        # P in any dtype (the bf16_proj paths at T <= 32 already hand them bf16)
+        # cuBLAS with BF16 output (SGLang's own bf16 GEMM call), a different kernel choice from the fp32-output call;
+        # the consumers read P in any dtype (the bf16_proj paths at T <= 32 already hand them bf16). (At T = 128 the
+        # judge profile's split-K kernel is the qkv GEMM: N = 2304 is 24 tiles of 96 x 64; o and unpooler share the
+        # 128 x 64 kernel at ~10.6 / ~19 us, the same as the proj module's isolated timings.)
         return torch.nn.functional.linear(x, w).view(1, T, N), 1
+    if pick == "torchT" and name in _T_COPY and _T_COPY[name] in state and not (name == "un" and T <= 8):
+        # cuBLAS on a K-major copy of W (x [T, K] @ W^T stored [K, N]): a different kernel choice again (the proj
+        # module measured it faster for the unpooler at m = 128); fp32 out only for the router logits ("pr")
+        wT = state[_T_COPY[name]]
+        if name == "pr":
+            return torch.mm(x, wT, out_dtype=torch.float32).view(1, T, N), 1
+        return torch.mm(x, wT).view(1, T, N), 1
+    if pick == "bfq" and name in _BFP_LAYER and state.get("bfp") is not None:
+        # the proj module's own autotuned route at this token count (gq / torch / ... at m >= 33), any T
+        return _bfp_gemm(state, name, x, T, N, K).view(1, T, N), 1
     if pick is True or pick == "bfp":       # above BFP_MAX_T a bfp pick runs as cuBLAS (measured in the chain)
         out = torch.mm(x, w.t(), out_dtype=torch.float32)
         return out.view(1, T, N), 1
@@ -1373,17 +1385,37 @@ def _tune(st, log=False):
                 msg.append(f"pr[T{t_tri:.0f} M{t_mm:.0f} B{t_bfp:.0f} F{t_bfpf:.0f}]")
             t_mm16 = 1e30
             if name != "pr":   # the router logits stay fp32 (hi + lo rows); the other three may come out bf16 as SGLang's
-                st["mm_pick"][(T, name)] = "mm16"
                 try:
-                    t_mm16 = _graph_time(lambda: dense(xd, w, T, st, name), flush, reps=5)
+                    t_mm16 = _dense_t("mm16")
                 except Exception:  # noqa: BLE001
                     t_mm16 = 1e30
-            opts = {False: t_tri, True: t_mm, "bfp": t_bfp, "bfpf": t_bfpf, "mm16": t_mm16}
+            t_torchT = t_bfq = 1e30
+            if T > 32:   # the T > 32 candidates: cuBLAS on the K-major copy, and the proj module's own tuned route
+                try:
+                    t_torchT = _dense_t("torchT")
+                except Exception:  # noqa: BLE001
+                    t_torchT = 1e30
+                if st.get("bfp") is not None:
+                    try:
+                        if name == "pr":
+                            t_bfq = _graph_time(lambda: _pr_split(_bfp_gemm(st, "pool", xd, T, D_EXPERT, HIDDEN),
+                                                                  _bfp_gemm(st, "router", xd, T, N_EXPERTS, HIDDEN)),
+                                                flush, reps=5)
+                        else:
+                            t_bfq = _dense_t("bfq")
+                    except Exception as ex:  # noqa: BLE001
+                        t_bfq = 1e30
+                        if log:
+                            msg.append(f"bfqX:{repr(ex)[:100]}")
+            opts = {False: t_tri, True: t_mm, "bfp": t_bfp, "bfpf": t_bfpf, "mm16": t_mm16, "torchT": t_torchT, "bfq": t_bfq}
             st.setdefault("mm_times", {})[(T, name)] = opts
             bestp = min(opts, key=lambda p: opts[p])
             st["mm_pick"][(T, name)] = bestp
             if log:
-                msg.append(f"{name}{ {False: 'T', True: 'M', 'bfp': 'B', 'bfpf': 'F', 'mm16': 'm'}[bestp] }:{opts[bestp]:.0f}")
+                letters = {False: 'T', True: 'M', 'bfp': 'B', 'bfpf': 'F', 'mm16': 'm', 'torchT': 't', 'bfq': 'q'}
+                msg.append(f"{name}{letters[bestp]}:{opts[bestp]:.0f}")
+                if T >= 128:   # DIAG: every candidate's graph time (us) for the T > 32 dense GEMMs
+                    msg.append(f"{name}[" + " ".join(f"{letters[p]}{v:.1f}" for p, v in opts.items() if v < 1e29) + "]")
         if st["bank"] is not None and T <= 384:
             xm = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
             raw = torch.randint(0, N_EXPERTS, (T, 8), generator=g, device=dev, dtype=torch.int32)
@@ -1469,6 +1501,8 @@ def prepare(weights):
     st["pr"] = torch.cat([weights["pooler"], hi, lo], 0).contiguous()
     st["unpool"] = weights["unpooler"].contiguous()
     st["unpool_slice"] = weights["unpooler"][:1024].contiguous()
+    for name, key in _T_COPY.items():   # K-major copies for the "torchT" cuBLAS candidate at T > 32 (~200 MB)
+        st[key] = st[{"qkv": "qkv", "o": "o", "pr": "pr", "un": "unpool"}[name]].t().contiguous()
     # Weight storage, to the letter of TASK.md: every BF16 checkpoint weight stays BF16. The norms are
     # applied as (1 + w), which my kernels now form in FP32 at use; the one tensor SGLang itself
     # precomputes (the post-expert effective weight) is stored exactly as SGLang stores it, in BF16.
@@ -1802,7 +1836,7 @@ def _after_attention(data, state, o_in, gate, T):
             P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
         else:
             P, S = bfp_fused_pooler_router(h, state["bfp"], route), -2
-    elif ppick == "bfp" and state.get("bfp") is not None:
+    elif ppick in ("bfp", "bfq") and state.get("bfp") is not None:   # ("bfq": the proj module's m >= 33 routes)
         pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
         logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed
         P, S = (pooled, logits), -1
