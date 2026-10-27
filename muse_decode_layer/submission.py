@@ -2,18 +2,21 @@
 # Derived work. Base: https://github.com/vjeux/okc-2026 (muse_decode_layer.py), Copyright (c) 2026 vjeux,
 # licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
 # Modifications Copyright (c) 2026 Madhavan113, same license. See NOTICE in the repository root.
-"""Muse Spark decode layer (team vjeux): one CUDA-graph-capturable kernel_fn built from four kernel sources.
+"""Muse Spark decode layer: one CUDA-graph-capturable kernel_fn composed from three kernel modules and this glue.
 
-Provenance: every kernel here is our own team's work, copied (not imported) from our entries on this
-challenge's component boards:
-  * attention: the muse_attention_decode entry's fused kernel (QK-norm, RoPE, FP8 cache write, split-KV
-    attention, merge, per-head RMSNorm * sigmoid(gate)), driven by that entry's own launcher, plan and
-    workspace allocator, lifted verbatim (_launch7, _plan7, _workspace7, _supported7, _inv_freq7);
-  * experts: the muse_moe_w4a16 entry's NVFP4 MoE kernel in its three builds (M <= 8, 9..63, 64+), with that
-    entry's own scratch allocator (_ma_make_scratch) and build check (_ma_scales_prmt_exact: the PRMT scale
-    decode only when every local block-scale byte is a normal e4m3, else the LUT build) lifted verbatim;
-  * dense projections: the muse_bf16_proj entry's module (every name prefixed bfp_), incl. its fused
-    pooler + router launch;
+GENERATED FILE: tools/compose_decode_layer.py embeds the three component files whole (every module-level name of a
+component prefixed att_ / moe_ / bfp_) into muse_decode_layer/layer_glue.py. Edit those sources, not this file.
+
+Provenance (all derived from vjeux/okc-2026, Apache-2.0; see the headers of the component sections):
+  * attention (prefix att_, from muse_attention_decode/submission.py): the fused decode kernel (QK-norm, RoPE, FP8
+    cache write, split-KV attention, merge, per-head RMSNorm * sigmoid(gate)), driven by its own launcher, plan and
+    workspace allocator (att__launch, att__plan, att__workspace, att__supported); this layer builds it with
+    ATT_BUILD_FLAGS (the layer's measured variant of the same source) and guards its buffers;
+  * experts (prefix moe_, from muse_moe_w4a16/submission.py): the NVFP4 MoE kernel in its builds (TINY M <= 4,
+    TINY2 <= 8, MID <= 16, WGS main), through its own prepare (weight packing, PRMT-scale build check) and
+    kernel_fn (build choice per token count); its scratch is guarded here;
+  * dense projections (prefix bfp_, from muse_decode_layer/proj_fork.py): the layer's fork of the muse_bf16_proj
+    module, incl. the sk2 PDL prologue and the fused pooler + router launch (sk2f);
   * this file's glue: residual/norm boundaries, routing (top-8 of biased sigmoid scores; router weights as
     BF16 hi + lo with FP32 accumulation; pre-expert RMSNorm), Triton split-K GEMMs, and SGLang's own FA3,
     Marlin and cuBLAS paths from the judge image.
@@ -77,7 +80,62 @@ FORCE_GLUEV2 = None  # None: tuner's choice; True/False: force the parallel boun
 
 # Fused decode attention (QK-norm, RoPE, FP8 cache write, split-KV FP8 attention, merge, rmsnorm * sigmoid(gate)):
 # copied from our muse_attention_decode entry (same author), compiled as its own extension.
-ATT7_CUDA_SRC = r"""
+
+# ==============================================================================================================
+# component: attn (muse_attention_decode/submission.py); every module-level name of that file carries the prefix `att_`
+# ==============================================================================================================
+# Derived work. Base: https://github.com/vjeux/okc-2026 (muse_attention_decode.py), Copyright (c) 2026 vjeux,
+# licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+# Modifications Copyright (c) 2026 Madhavan113, same license. See NOTICE in the repository root.
+"""Gated attention decode for Muse Spark Open: one fused CUDA kernel per call.
+
+Each CTA takes one request, one pair of KV heads (its 16 query heads) and one contiguous range of
+cached positions (split-KV). It normalizes the queries (and RoPE on sliding layers), builds the
+block's new keys/values (normalized, RoPE, FP8) and writes them to the cache, streams its range of
+the paged FP8 cache through shared memory (cp.async, 4 stages), computes QK^T with FP8 tensor-core
+MMAs (queries rounded to E4M3, as FA3 does) and PV with FP16 MMAs (P in FP16, V exact in FP16), with
+an online softmax. Splits are merged with FP32 atomics after rescaling to a fixed reference (QK-norm
+bounds the logits); the last CTA of each (request, KV pair) normalizes, applies rmsnorm *
+sigmoid(gate) and writes the output, then zeroes the workspace for the next call.
+"""
+
+import math
+from typing import TypedDict
+
+import torch
+
+
+class att_Config(TypedDict):
+    batch: int
+    q_len: int
+    num_q_heads: int
+    num_kv_heads: int
+    head_dim: int
+    page_size: int
+    window: int
+    rope_theta: float
+    qk_scale_factor: float
+    sm_scale: float
+    kv_scale: float
+
+
+class att_Inputs(TypedDict):
+    qkv: torch.Tensor
+    positions: torch.Tensor
+    cache_loc: torch.Tensor
+    cache_seqlens: torch.Tensor
+    cu_seqlens_q: torch.Tensor
+    scheduler_metadata: torch.Tensor | None
+    k_cache: torch.Tensor
+    v_cache: torch.Tensor
+    k_scale: torch.Tensor
+    v_scale: torch.Tensor
+    page_table: torch.Tensor
+    seq_lens: torch.Tensor
+    config: att_Config
+
+
+att_CUDA_SRC = r"""
 #include <torch/extension.h>
 #include <ATen/cuda/CUDAContext.h>
 #include <type_traits>
@@ -4923,7 +4981,8 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
   else launch<8>(p, grid, stream, (int)cs, major >= 9, pdl);
 }
 """
-ATT7_CPP_SRC = r"""
+
+att_CPP_SRC = r"""
 void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, torch::Tensor k_cache,
          torch::Tensor v_cache, torch::Tensor page_table, torch::Tensor k_scale, torch::Tensor v_scale,
          torch::Tensor inv_freq, torch::Tensor out, torch::Tensor ws_acc, torch::Tensor ws_l,
@@ -4932,36 +4991,22 @@ void run(torch::Tensor qkv, torch::Tensor seq_lens, torch::Tensor cache_loc, tor
          std::optional<torch::Tensor> dbg, int64_t cs, int64_t ncl, torch::Tensor scratch, torch::Tensor bar,
          int64_t tma);
 """
-_ATT7 = None
+
+att__MOD = None
+att__INV_FREQ = {}
+att__WS = {}
+att__NUM_SMS = {}
+att_LOG2E = 1.4426950408889634
 
 
-def _att7():
-    global _ATT7
-    if _ATT7 is None:
-        import os
-        from torch.utils.cpp_extension import load_inline
-        major, minor = torch.cuda.get_device_capability()
-        arch = f"{major}{minor}" + ("a" if major >= 9 else "")
-        os.environ["TORCH_CUDA_ARCH_LIST"] = f"{major}.{minor}" + ("a" if major == 9 else "")
-        _ATT7 = load_inline(name=f"muse_att_v298w1_{arch}", cpp_sources=ATT7_CPP_SRC, cuda_sources=ATT7_CUDA_SRC,
-                            functions=["run"], extra_cuda_cflags=["-DOKC_QDIRECT=0", "-DOKC_PK2=0", "-DOKC_W0ENABLE=1", "-O3", f"-DOKC_SM90={1 if major >= 9 else 0}", "--expt-relaxed-constexpr"],
-                            verbose=False)
-    return _ATT7
-
-
-_WS7 = {}
-_NUM_SMS7 = {}
-LOG2E = 1.4426950408889634
-
-
-def _build(tag="", flags=()):
+def att__build(tag="", flags=()):
     from torch.utils.cpp_extension import load_inline
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
     return load_inline(
         name=f"okc_attn_v298{tag}_{arch}",
-        cpp_sources=CPP_SRC,
-        cuda_sources=CUDA_SRC,
+        cpp_sources=att_CPP_SRC,
+        cuda_sources=att_CUDA_SRC,
         functions=["run"],
         extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}", f"-DOKC_SM90={1 if major >= 9 else 0}",
                            "--expt-relaxed-constexpr", *flags],
@@ -4969,47 +5014,47 @@ def _build(tag="", flags=()):
     )
 
 
-def _module():
-    global _MOD
-    if _MOD is None:
-        _MOD = _build()
-    return _MOD
+def att__module():
+    global att__MOD
+    if att__MOD is None:
+        att__MOD = att__build()
+    return att__MOD
 
 
-def _inv_freq(theta, device):
+def att__inv_freq(theta, device):
     key = (float(theta), str(device))
-    t = _INV_FREQ.get(key)
+    t = att__INV_FREQ.get(key)
     if t is None:
         if theta:
             t = 1.0 / (theta ** (torch.arange(0, 64, 2, device=device).float() / 64))
         else:
             t = torch.zeros(32, device=device)
-        _INV_FREQ[key] = t.float().contiguous()
+        att__INV_FREQ[key] = t.float().contiguous()
     return t
 
 
-def _workspace7(n_rows, device):
+def att__workspace(n_rows, device):
     """Persistent FP32 accumulators (zero between calls: the last CTA resets them)."""
     key = str(device)
-    ws = _WS7.get(key)
+    ws = att__WS.get(key)
     if ws is None or ws[0].numel() < n_rows * 64:
         n = max(n_rows, 1 << 15)
         ws = (torch.zeros(n * 64, dtype=torch.float32, device=device),
               torch.zeros(n, dtype=torch.float32, device=device),
               torch.zeros(n, dtype=torch.int32, device=device))
-        _WS7[key] = ws
+        att__WS[key] = ws
     return ws
 
 
-def _num_sms7(device):
+def att__num_sms(device):
     key = str(device)
-    if key not in _NUM_SMS7:
-        _NUM_SMS7[key] = torch.cuda.get_device_properties(device).multi_processor_count
-    return _NUM_SMS7[key]
+    if key not in att__NUM_SMS:
+        att__NUM_SMS[key] = torch.cuda.get_device_properties(device).multi_processor_count
+    return att__NUM_SMS[key]
 
 
 # per-shape launch overrides measured on the judge's H200: (batch, q_len, sliding, kv pairs) -> plan fields
-_TUNED7 = {
+att__TUNED = {
     # (Oct 26 14:16-14:21, podbench_multi 15 rounds x2: b32 q8 sliding at 4 splits per request -- 128 CTAs, one per SM --
     # 16.10 -> 15.50 us; 3 splits +13%, 5 +10.6%, 6 +3.1%: since the faster per-request q8 loop (LATESYNCN, QKFIRST))
     (32, 8, True, 1): dict(n_splits=4, nc=1, coop=1),
@@ -5019,36 +5064,36 @@ _TUNED7 = {
 }
 
 
-OKC_FLATCOOP = 1
-OKC_PDL = 0      # launch with programmatic dependent launch (for a fused layer: overlaps the qkv GEMM's tail)
-OKC_FLAT1B = 0   # q_len 1, one full-layer request: flat kernel (Oct 26 00:14: the per-request coop plan, 264 splits, 4 copies, is now faster: f1 13.2 -> 12.6 us)
-OKC_PLAIN8 = 1   # q_len 8 sliding, >= 16 requests: plain split-KV, ~1 CTA per SM
-OKC_F2 = 0   # must match the CUDA macro OKC_F2 (q_len 8 flat: 1 CTA per SM, two streams)
-OKC_S2 = 0   # must match the CUDA macro OKC_S2 (q_len 8 per-request kernels: 2 streams, 1 CTA per SM)
-OKC_W0_L1 = 1024   # flat: first CTA's share on each SM, /1024 (uneven shares measured slower: the faster CTA is not always the first)
-OKC_W0_PR = 1024   # per-request coop grids, one request, more splits than SMs: first-wave tile weight /1024
-OKC_W0_L8 = 1135   # q_len 8 flat: the lower-blockIdx CTA of each SM takes 1135/2048 (Oct 25 re-sweeps: bottom 1130-1140; 1180 overloads it)
+att_OKC_FLATCOOP = 1
+att_OKC_PDL = 0      # launch with programmatic dependent launch (for a fused layer: overlaps the qkv GEMM's tail)
+att_OKC_FLAT1B = 0   # q_len 1, one full-layer request: flat kernel (Oct 26 00:14: the per-request coop plan, 264 splits, 4 copies, is now faster: f1 13.2 -> 12.6 us)
+att_OKC_PLAIN8 = 1   # q_len 8 sliding, >= 16 requests: plain split-KV, ~1 CTA per SM
+att_OKC_F2 = 0   # must match the CUDA macro OKC_F2 (q_len 8 flat: 1 CTA per SM, two streams)
+att_OKC_S2 = 0   # must match the CUDA macro OKC_S2 (q_len 8 per-request kernels: 2 streams, 1 CTA per SM)
+att_OKC_W0_L1 = 1024   # flat: first CTA's share on each SM, /1024 (uneven shares measured slower: the faster CTA is not always the first)
+att_OKC_W0_PR = 1024   # per-request coop grids, one request, more splits than SMs: first-wave tile weight /1024
+att_OKC_W0_L8 = 1135   # q_len 8 flat: the lower-blockIdx CTA of each SM takes 1135/2048 (Oct 25 re-sweeps: bottom 1130-1140; 1180 overloads it)
 
 
-def _plan7(B, pairs, L, window, max_pages, P, device):
+def att__plan(B, pairs, L, window, max_pages, P, device):
     """Launch plan for a shape: n_splits CTAs per (request, KV pair) or, flat, per KV pair over all
     requests; clusters of cs CTAs reduce through DSMEM (ncl clusters per request); nc workspace copies."""
-    sms = _num_sms7(device)
+    sms = att__num_sms(device)
     target = 2 * sms
     if not window and 1 < B <= 512:
         # full layer, several requests: equal shares of all requests' keys, one CTA pass per SM pair;
         # several workspace copies spread the end-of-run atomics (H200: b32 L1 206 us with 8 vs 237 with 1)
-        ft = sms if (L == 8 and OKC_F2 and torch.cuda.get_device_capability(device)[0] >= 9) else target
+        ft = sms if (L == 8 and att_OKC_F2 and torch.cuda.get_device_capability(device)[0] >= 9) else target
         # one workspace copy since the 16-byte merge atomics and the parity barriers (v101: q_len 1 b16 91.4 -> 90.0,
         # b32 167.7 -> 166.1 with 264 CTAs; q_len 8 b32 199.6 -> 198.0); single requests keep their copies (contention)
         return dict(n_splits=max(1, ft // pairs), flat=1, cs=0, ncl=1, nc=1)
     keys_max = min(window + L - 1, max_pages * P) if window else max_pages * P
     tiles = max(1, (keys_max + 63) // 64)
     reqs = B * pairs
-    if L == 8 and OKC_S2 and torch.cuda.get_device_capability(device)[0] >= 9:
+    if L == 8 and att_OKC_S2 and torch.cuda.get_device_capability(device)[0] >= 9:
         target = sms   # two tile streams per CTA, one CTA per SM (the kernel's OKC_S2)
     if not window:
-        if L == 1 and B == 1 and OKC_FLAT1B:
+        if L == 1 and B == 1 and att_OKC_FLAT1B:
             # one long request, q_len 1: the flat kernel (producer warps) over 2 CTAs per SM (H200: 14.4 -> 13.9 us)
             return dict(n_splits=max(1, ((target * 21) // 22) // pairs), flat=1, cs=0, ncl=1, nc=4)
         # one long request: plain split-KV over 2 CTAs per SM (clusters measured slower here); q_len 8: 252 CTAs
@@ -5066,12 +5111,12 @@ def _plan7(B, pairs, L, window, max_pages, P, device):
         # 9.4 -> 9.2 us vs 12)
         n = max(1, min(tiles, target // reqs))
         return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1)
-    if L == 8 and reqs < 16 and OKC_PLAIN8:
+    if L == 8 and reqs < 16 and att_OKC_PLAIN8:
         # q_len 8, few requests: plain split-KV with one tile per CTA and the cooperative finalize (every CTA
         # normalizes a slice of the 128 rows) beats clusters since the inlined finalizes (H200 b1: 13.0 -> 10.2 us)
         n = max(1, min(tiles, target // reqs))
         return dict(n_splits=n, flat=0, cs=0, ncl=1, nc=1, coop=1)   # (one copy since v101: b1 9.8 -> 9.6 us)
-    if L == 8 and reqs >= 16 and OKC_PLAIN8:
+    if L == 8 and reqs >= 16 and att_OKC_PLAIN8:
         # q_len 8, many requests: plain split-KV with about one CTA per SM (H200 since the inlined last-CTA
         # finalize: b16 19.0 -> 17.2 us vs clusters of 8, b32 22.0 -> 21.1 us vs two CTAs per SM); the cooperative
         # finalize helps at 8 splits per request (b16 16.2 -> 15.85 us), and at 4 (b32) since the parity barriers
@@ -5102,26 +5147,192 @@ def _plan7(B, pairs, L, window, max_pages, P, device):
     return dict(n_splits=cs * ncl, flat=0, cs=cs, ncl=ncl, nc=max(1, min(ncl, 4)))
 
 
-_CL7 = {}
+att__CL = {}
 
 
-def _cluster_bufs7(n_ctas, L, device):
+def att__cluster_bufs(n_ctas, L, device):
     """sm_80 emulation buffers for the cluster path (unused on sm_90 beyond a pointer)."""
     key = str(device)
     need = n_ctas * (L * 16 * 64 + 1024)
-    cur = _CL7.get(key)
+    cur = att__CL.get(key)
     if cur is None or cur[0].numel() < need or cur[1].numel() < n_ctas:
         cur = (torch.zeros(max(need, 1 << 20), dtype=torch.float32, device=device),
                torch.zeros(max(n_ctas, 1 << 12), dtype=torch.int32, device=device))
-        _CL7[key] = cur
+        att__CL[key] = cur
     return cur
 
 
+def att__launch(data, dbg=None, _mod=None, pdl=None, **override):
+    cfg = data["config"]
+    B, L = cfg["batch"], cfg["q_len"]
+    hq, hkv, d, P = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"], cfg["page_size"]
+    qkv = data["qkv"]
+    device = qkv.device
+    pairs = hkv // 2
+    window = cfg["window"]
+    page_table = data["page_table"]
+    out = torch.empty((B, L, hq * d), dtype=torch.bfloat16, device=device)
+    plan = att__plan(B, pairs, L, window, page_table.shape[1], P, device)
+    tuned = att__TUNED.get((B, L, bool(window), pairs))
+    if tuned and not override:
+        override = tuned
+    if override:
+        plan = dict(plan, **override)
+        if "cs" in override and override["cs"] > 1:
+            plan["flat"] = 0
+            if "ncl" not in override:
+                plan["ncl"] = max(1, plan["n_splits"] // override["cs"])
+            plan["n_splits"] = plan["cs"] * plan["ncl"]
+            if "nc" not in override:
+                plan["nc"] = max(1, min(plan["ncl"], 4))
+        elif "n_splits" in override and "nc" not in override:
+            plan["nc"] = 1 if plan["flat"] else max(1, min(plan["n_splits"], 4))
+    n_splits, flat, cs, ncl, nc = plan["n_splits"], plan["flat"], plan["cs"], plan["ncl"], plan["nc"]
+    # bit 0: TMA loads (compiled out by default); bit 1: cooperative finalize (all CTAs resident)
+    # cooperative finalize: only for the long single-request grids (their last-CTA finalize reads and zeroes
+    # tens of KB from one SM); the short sliding grids finalize faster in one CTA (measured on H200)
+    if flat:   # grid-wide finalize after all segments (the kernel re-checks residency)
+        coop = int(plan.get("coop", int(att_OKC_FLATCOOP and L == 8 and
+                                        n_splits * pairs <= 2 * att__num_sms(device))))
+    else:
+        coop = int(plan.get("coop", 0 if (cs > 1 or n_splits < 64) else
+                            int(n_splits * B * pairs <= 2 * att__num_sms(device))))
+    w0 = int(plan.get("w0", (att_OKC_W0_L1 if L == 1 else att_OKC_W0_L8) if (flat and (coop or L == 1)) else
+                      (att_OKC_W0_PR if (coop and not flat and B * pairs == 1) else 1024)))
+    use_pdl = att_OKC_PDL if pdl is None else bool(pdl)
+    tma = int(plan.get("tma", 0)) | (coop << 1) | (min(max(w0, 0), 4095) << 2) | (int(use_pdl) << 16)
+    if flat or cs <= 1:
+        cs, ncl = 0, 1
+    ws_acc, ws_l, ws_cnt = att__workspace(B * pairs * nc * L * 16, device)
+    n_ctas = n_splits * (1 if flat else B) * pairs
+    scratch, bar = att__cluster_bufs(n_ctas if cs > 1 else 1, L, device)
+    scale_log2 = cfg["sm_scale"] * cfg["qk_scale_factor"] * att_LOG2E
+    (_mod or att__module()).run(qkv, data["seq_lens"], data["cache_loc"], data["k_cache"], data["v_cache"], page_table,
+                  data["k_scale"], data["v_scale"], att__inv_freq(cfg["rope_theta"], device), out, ws_acc, ws_l,
+                  ws_cnt, B, L, hq, hkv, P, window, 1 if cfg["rope_theta"] else 0, n_splits, flat, nc, scale_log2,
+                  dbg, cs, ncl, scratch, bar, tma)
+    return out
 
 
+def att__supported(cfg):
+    P = cfg["page_size"]
+    return (cfg["head_dim"] == 64 and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"] and cfg["num_kv_heads"] % 2 == 0
+            and cfg["q_len"] in (1, 8) and cfg["batch"] <= 512 and P > 0 and (P & (P - 1)) == 0
+            and cfg["batch"] * (cfg["num_kv_heads"] // 2) <= 4096)
 
-# Routed-experts kernel for T > 32: copied from our muse_moe_w4a16 entry (same author), own extension.
-MOE_CUDA_SRC = r"""
+
+def att__rms(x, eps=1e-5):
+    x = x.float()
+    return x * torch.rsqrt(x.pow(2).mean(-1, keepdim=True) + eps)
+
+
+def att__rope(x, pos, theta):
+    d = x.shape[-1]
+    inv_freq = 1.0 / (theta ** (torch.arange(0, d, 2, device=x.device).float() / d))
+    ang = pos.float()[..., None] * inv_freq
+    cos, sin = ang.cos().unsqueeze(-2), ang.sin().unsqueeze(-2)
+    even, odd = x[..., 0::2], x[..., 1::2]
+    return torch.stack([even * cos - odd * sin, even * sin + odd * cos], -1).flatten(-2)
+
+
+def att__fallback(data):
+    """Plain PyTorch path for shapes the CUDA kernel does not cover (other q_len / head layouts)."""
+    cfg = data["config"]
+    batch, length = cfg["batch"], cfg["q_len"]
+    hq, hkv, d, page = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"], cfg["page_size"]
+    q_in, k_in, v_in, gate = data["qkv"].split([hq * d, hkv * d, hkv * d, hq * d], -1)
+    pos = data["positions"].view(batch, length)
+    q = att__rms(q_in.reshape(batch, length, hq, d)) * cfg["qk_scale_factor"]
+    k = att__rms(k_in.reshape(batch, length, hkv, d))
+    if cfg["rope_theta"]:
+        q, k = att__rope(q, pos, cfg["rope_theta"]), att__rope(k, pos, cfg["rope_theta"])
+    q = q.to(torch.bfloat16)
+    table = data["page_table"].long()
+    slots = data["cache_loc"].view(batch, length)
+    k_cache = data["k_cache"].view(-1, hkv, d)
+    v_cache = data["v_cache"].view(-1, hkv, d)
+    k_scale, v_scale = data["k_scale"], data["v_scale"]
+    k_cache[slots] = (k / k_scale).to(torch.float8_e4m3fn)
+    v_cache[slots] = (v_in.reshape(batch, length, hkv, d).float() / v_scale).to(torch.float8_e4m3fn)
+    t = torch.arange(table.shape[1] * page, device=q.device)
+    out = torch.empty((batch, length, hq, d), dtype=torch.bfloat16, device=q.device)
+    for b in range(batch):
+        rows = table[b].clamp(min=0)[t // page] * page + t % page
+        keys = k_cache[rows].float() * k_scale
+        vals = v_cache[rows].float() * v_scale
+        visible = t[None, :] <= pos[b][:, None]
+        if cfg["window"]:
+            visible &= t[None, :] > pos[b][:, None] - cfg["window"]
+        att = torch.einsum("lkgd,skd->lkgs", q[b].view(length, hkv, hq // hkv, d).float(), keys) * cfg["sm_scale"]
+        att = att.masked_fill(~visible[:, None, None, :], float("-inf")).softmax(-1)
+        out[b] = torch.einsum("lkgs,skd->lkgd", att, vals).reshape(length, hq, d)
+    out = att__rms(out) * torch.sigmoid(gate.float()).view(batch, length, hq, d)
+    return out.reshape(batch, length, hq * d).to(torch.bfloat16)
+
+
+def att__fits(data):
+    """Sizes the CUDA path's 32-bit indexing covers (caches of any size are fine: 64-bit offsets past 4 GB)."""
+    cfg = data["config"]
+    out_elems = cfg["batch"] * cfg["q_len"] * cfg["num_q_heads"] * cfg["head_dim"]
+    return (data["qkv"].numel() < (1 << 31) and data["page_table"].numel() < (1 << 31) and out_elems < (1 << 31))
+
+
+def att_kernel_fn(data: att_Inputs) -> torch.Tensor:
+    if not att__supported(data["config"]) or not att__fits(data):
+        return att__fallback(data)
+    return att__launch(data)
+# ---- end of component: attn ----
+
+
+# ==============================================================================================================
+# component: moe (muse_moe_w4a16/submission.py); every module-level name of that file carries the prefix `moe_`
+# ==============================================================================================================
+# Derived work. Base: https://github.com/vjeux/okc-2026 (muse_moe_w4a16.py), Copyright (c) 2026 vjeux,
+# licensed under the Apache License, Version 2.0 (http://www.apache.org/licenses/LICENSE-2.0).
+# Modifications Copyright (c) 2026 Madhavan113, same license. See NOTICE in the repository root.
+"""Routed experts (NVFP4 W4A16 MoE) as one persistent CUDA kernel plus two tiny ones.
+
+route_kernel builds the per-expert token lists on device; moe_main streams each touched expert's
+prepacked NVFP4 weights once (GEMM1 + SwiGLU, then GEMM2 + scaled output + sum of squares for the
+post-expert RMSNorm); final_kernel applies the norm and the routing weights and sums per token.
+Weights are only repacked (bit/byte permutations), never requantized.
+"""
+
+from typing import TypedDict
+
+import torch
+from torch.utils.cpp_extension import load_inline
+
+
+class moe_Weights(TypedDict):
+    w13: torch.Tensor
+    w13_sf: torch.Tensor
+    w13_gs: torch.Tensor
+    w2: torch.Tensor
+    w2_sf: torch.Tensor
+    w2_gs: torch.Tensor
+    post_norm_w: torch.Tensor
+
+
+class moe_Config(TypedDict):
+    bs: int
+    d_hidden: int
+    d_expert: int
+    n_experts: int
+    local_start: int
+    local_count: int
+    top_k: int
+    sharding: str
+
+
+class moe_Inputs(TypedDict):
+    hidden_states: torch.Tensor
+    topk_ids: torch.Tensor
+    topk_weights: torch.Tensor
+    config: moe_Config
+
+
+moe_CUDA_SRC = r'''
 // muse_moe_w4a16 v2: one persistent kernel: routing prologue, GEMM1+SwiGLU, GEMM2+norm stats, final norm/sum.
 #include <cuda_bf16.h>
 #include <type_traits>
@@ -8623,151 +8834,436 @@ void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, t
 }
 
 
-"""
-MOE_CPP_SRC = r"""
+'''
+
+moe_BW_SRC = r'''
+// H200 memory-pipeline microbenchmarks (diagnostics only).
+#include <cuda_runtime.h>
+#include <stdint.h>
+
+namespace bw {
+
+__device__ __forceinline__ uint4 ldg_stream(const uint4* p) {
+  uint4 r;
+  asm volatile("ld.global.nc.L1::no_allocate.v4.u32 {%0,%1,%2,%3}, [%4];\n"
+               : "=r"(r.x), "=r"(r.y), "=r"(r.z), "=r"(r.w) : "l"(p));
+  return r;
+}
+
+// per-warp contiguous streaming with a register ring of PF 512-byte chunks (like the MoE kernel)
+template <int PF>
+__global__ void __launch_bounds__(256, 1) ring_kernel(const uint4* __restrict__ src, size_t n16, unsigned* out) {
+  const int lane = threadIdx.x & 31;
+  const size_t warps = (size_t)gridDim.x * 8;
+  const size_t wid = (size_t)blockIdx.x * 8 + (threadIdx.x >> 5);
+  const size_t chunks = n16 / 32;                // 512-byte chunks
+  const size_t per = (chunks + warps - 1) / warps;
+  const size_t c0 = wid * per, c1 = c0 + per < chunks ? c0 + per : chunks;
+  unsigned acc = 0;
+  uint4 ring[PF];
+#pragma unroll
+  for (int r = 0; r < PF; ++r) ring[r] = (c0 + r < c1) ? ldg_stream(src + (c0 + r) * 32 + lane) : make_uint4(0, 0, 0, 0);
+  for (size_t c = c0; c < c1; c += PF) {
+#pragma unroll
+    for (int r = 0; r < PF; ++r) {
+      uint4 v = ring[r];
+      if (c + PF + r < c1) ring[r] = ldg_stream(src + (c + PF + r) * 32 + lane);
+      acc ^= v.x ^ v.y ^ v.z ^ v.w;
+    }
+  }
+  if (acc == 0x12345678u) out[0] = acc;
+}
+
+// high occupancy grid-stride copy-like reader
+__global__ void __launch_bounds__(256) occ_kernel(const uint4* __restrict__ src, size_t n16, unsigned* out) {
+  unsigned acc = 0;
+  const size_t stride = (size_t)gridDim.x * blockDim.x;
+  size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  for (; i + 3 * stride < n16; i += 4 * stride) {
+    uint4 a = ldg_stream(src + i), b = ldg_stream(src + i + stride), c = ldg_stream(src + i + 2 * stride),
+          d = ldg_stream(src + i + 3 * stride);
+    acc ^= a.x ^ b.y ^ c.z ^ d.w ^ a.w ^ b.x ^ c.y ^ d.z;
+  }
+  for (; i < n16; i += stride) { uint4 a = ldg_stream(src + i); acc ^= a.x ^ a.w; }
+  if (acc == 0x12345678u) out[0] = acc;
+}
+
+// cp.async (LDGSTS) ring into shared memory: 1 CTA/SM, NS stages of 16 KB (each thread copies 64 B per stage)
+template <int NS>
+__global__ void __launch_bounds__(256, 1) cpasync_kernel(const uint4* __restrict__ src, size_t n16, unsigned* out) {
+  extern __shared__ __align__(16) uint4 sm[];
+  const int tid = threadIdx.x;
+  constexpr int ST16 = 1024;  // 16 KB per stage
+  const size_t stages = n16 / ST16;
+  const size_t per = (stages + gridDim.x - 1) / gridDim.x;
+  const size_t s0 = blockIdx.x * per, s1 = s0 + per < stages ? s0 + per : stages;
+  unsigned acc = 0;
+  auto issue = [&](size_t s, int slot) {
+    if (s < s1) {
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        uint32_t d = (uint32_t)__cvta_generic_to_shared(sm + slot * ST16 + k * 256 + tid);
+        asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src + s * ST16 + k * 256 + tid));
+      }
+    }
+    asm volatile("cp.async.commit_group;\n" ::);
+  };
+#pragma unroll
+  for (int k = 0; k < NS - 1; ++k) issue(s0 + k, k);
+  for (size_t s = s0; s < s1; ++s) {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(NS - 2));
+    __syncthreads();
+    issue(s + NS - 1, (int)((s - s0 + NS - 1) % NS));
+    const uint4* st = sm + ((s - s0) % NS) * ST16;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { uint4 v = st[k * 256 + tid]; acc ^= v.x ^ v.y ^ v.z ^ v.w; }
+  }
+  if (acc == 0x12345678u) out[0] = acc;
+}
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#define BW_HAS_TMA 1
+#endif
+
+// TMA bulk (cp.async.bulk) ring: thread 0 issues 16 KB bulk copies into NS stages, full/empty mbarriers.
+template <int NS>
+__global__ void __launch_bounds__(256, 1) tma_kernel(const uint4* __restrict__ src, size_t n16, unsigned* out) {
+#ifdef BW_HAS_TMA
+  extern __shared__ __align__(128) uint4 sm[];
+  __shared__ __align__(8) uint64_t full[NS];
+  const int tid = threadIdx.x;
+  constexpr int ST16 = 1024;
+  const size_t stages = n16 / ST16;
+  const size_t per = (stages + gridDim.x - 1) / gridDim.x;
+  const size_t s0 = blockIdx.x * per, s1 = s0 + per < stages ? s0 + per : stages;
+  if (tid == 0) {
+    for (int k = 0; k < NS; ++k) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[k]);
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], 1;\n" ::"r"(b));
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::);
+  }
+  __syncthreads();
+  auto issue = [&](size_t s, int slot) {
+    if (s < s1) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[slot]);
+      uint32_t d = (uint32_t)__cvta_generic_to_shared(sm + slot * ST16);
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(b), "r"(16384));
+      asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                   ::"r"(d), "l"(src + s * ST16), "r"(16384), "r"(b) : "memory");
+    }
+  };
+  if (tid == 0)
+    for (int k = 0; k < NS; ++k) issue(s0 + k, k);
+  unsigned acc = 0;
+  for (size_t s = s0; s < s1; ++s) {
+    const int slot = (int)((s - s0) % NS);
+    const uint32_t phase = (uint32_t)(((s - s0) / NS) & 1);
+    uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[slot]);
+    asm volatile(
+        "{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+        ::"r"(b), "r"(phase));
+    const uint4* st = sm + slot * ST16;
+#pragma unroll
+    for (int k = 0; k < 4; ++k) { uint4 v = st[k * 256 + tid]; acc ^= v.x ^ v.y ^ v.z ^ v.w; }
+    __syncthreads();
+    if (tid == 0) issue(s + NS, slot);
+  }
+  if (acc == 0x12345678u) out[0] = acc;
+#endif
+}
+
+
+template <int SB, int NS, int P, bool MIX>
+__global__ void __launch_bounds__(256) tma2_kernel(const uint4* __restrict__ src, size_t n16, unsigned* out) {
+#ifdef BW_HAS_TMA
+  extern __shared__ __align__(128) uint4 sm[];
+  __shared__ __align__(8) uint64_t full[NS];
+  const int tid = threadIdx.x;
+  constexpr int ST16 = SB / 16;
+  const size_t stages = n16 / ST16;
+  const size_t per = (stages + gridDim.x - 1) / gridDim.x;
+  const size_t s0 = blockIdx.x * per, s1 = s0 + per < stages ? s0 + per : stages;
+  if (tid == 0) {
+    for (int k = 0; k < NS; ++k) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[k]);
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(b), "r"(MIX ? 257 : 1));
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::);
+  }
+  __syncthreads();
+  auto issue = [&](size_t s, int slot) {
+    if (s < s1) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[slot]);
+      constexpr int TB = MIX ? SB / 2 : SB;  // bytes via TMA
+      if (tid == 0) {
+        asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(b), "r"(TB));
+        for (int k = 0; k < P; ++k) {
+          uint32_t d = (uint32_t)__cvta_generic_to_shared(sm + slot * ST16 + k * (TB / 16 / P));
+          asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                       ::"r"(d), "l"(src + s * ST16 + k * (TB / 16 / P)), "r"(TB / P), "r"(b) : "memory");
+        }
+      }
+      if (MIX) {
+        for (int i = tid; i < (SB - TB) / 16; i += 256) {
+          uint32_t d = (uint32_t)__cvta_generic_to_shared(sm + slot * ST16 + TB / 16 + i);
+          asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(d), "l"(src + s * ST16 + TB / 16 + i));
+        }
+        asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(b) : "memory");
+      }
+    } else if (MIX) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[slot]);
+      (void)b;
+    }
+  };
+  for (int k = 0; k < NS; ++k) issue(s0 + k, k);
+  unsigned acc = 0;
+  for (size_t s = s0; s < s1; ++s) {
+    const int slot = (int)((s - s0) % NS);
+    const uint32_t phase = (uint32_t)(((s - s0) / NS) & 1);
+    uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[slot]);
+    asm volatile(
+        "{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+        ::"r"(b), "r"(phase));
+    const uint4* st = sm + slot * ST16;
+    for (int k = tid; k < ST16; k += 256) { uint4 v = st[k]; acc ^= v.x ^ v.y ^ v.z ^ v.w; }
+    __syncthreads();
+    issue(s + NS, slot);
+  }
+  if (acc == 0x12345678u) out[0] = acc;
+#endif
+}
+
+
+template <int SB, int NS, int PD>
+__global__ void __launch_bounds__(256) tmapf_kernel(const uint4* __restrict__ src, size_t n16, unsigned* out) {
+#ifdef BW_HAS_TMA
+  extern __shared__ __align__(128) uint4 sm[];
+  __shared__ __align__(8) uint64_t full[NS];
+  const int tid = threadIdx.x;
+  constexpr int ST16 = SB / 16;
+  const size_t stages = n16 / ST16;
+  const size_t per = (stages + gridDim.x - 1) / gridDim.x;
+  const size_t s0 = blockIdx.x * per, s1 = s0 + per < stages ? s0 + per : stages;
+  if (tid == 0) {
+    for (int k = 0; k < NS; ++k) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[k]);
+      asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" ::"r"(b), "r"(1));
+    }
+    asm volatile("fence.mbarrier_init.release.cluster;\n" ::);
+  }
+  __syncthreads();
+  auto issue = [&](size_t s, int slot) {
+    if (tid == 0 && s < s1) {
+      uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[slot]);
+      uint32_t d = (uint32_t)__cvta_generic_to_shared(sm + slot * ST16);
+      asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(b), "r"(SB));
+      asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                   ::"r"(d), "l"(src + s * ST16), "r"(SB), "r"(b) : "memory");
+      if (s + PD < s1) asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(src + (s + PD) * ST16), "r"(SB) : "memory");
+    }
+  };
+  if (tid == 0) for (size_t s = s0 + NS; s < s0 + PD && s < s1; ++s)
+    asm volatile("cp.async.bulk.prefetch.L2.global [%0], %1;\n" ::"l"(src + s * ST16), "r"(SB) : "memory");
+  for (int k = 0; k < NS; ++k) issue(s0 + k, k);
+  unsigned acc = 0;
+  for (size_t s = s0; s < s1; ++s) {
+    const int slot = (int)((s - s0) % NS);
+    const uint32_t phase = (uint32_t)(((s - s0) / NS) & 1);
+    uint32_t b = (uint32_t)__cvta_generic_to_shared(&full[slot]);
+    asm volatile(
+        "{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+        ::"r"(b), "r"(phase));
+    const uint4* st = sm + slot * ST16;
+    for (int k = tid; k < ST16; k += 256) { uint4 v = st[k]; acc ^= v.x ^ v.y ^ v.z ^ v.w; }
+    __syncthreads();
+    issue(s + NS, slot);
+  }
+  if (acc == 0x12345678u) out[0] = acc;
+#endif
+}
+
+}  // namespace bw
+
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+
+void bw_run(torch::Tensor src, torch::Tensor out, int64_t mode, int64_t grid) {
+  const uint4* p = (const uint4*)src.data_ptr();
+  size_t n16 = src.numel() * src.element_size() / 16;
+  unsigned* o = (unsigned*)out.data_ptr();
+  cudaStream_t st = at::cuda::getCurrentCUDAStream();
+  switch (mode) {
+    case 0: bw::ring_kernel<16><<<(int)grid, 256, 0, st>>>(p, n16, o); break;
+    case 1: bw::ring_kernel<32><<<(int)grid, 256, 0, st>>>(p, n16, o); break;
+    case 2: bw::occ_kernel<<<(int)grid * 8, 256, 0, st>>>(p, n16, o); break;
+    case 3: {
+      size_t sm = 6 * 16384;
+      cudaFuncSetAttribute(bw::cpasync_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::cpasync_kernel<6><<<(int)grid, 256, sm, st>>>(p, n16, o); break;
+    }
+    case 4: {
+      size_t sm = 10 * 16384;
+      cudaFuncSetAttribute(bw::cpasync_kernel<10>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::cpasync_kernel<10><<<(int)grid, 256, sm, st>>>(p, n16, o); break;
+    }
+    case 5: {
+      size_t sm = 6 * 16384;
+      cudaFuncSetAttribute(bw::tma_kernel<6>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma_kernel<6><<<(int)grid, 256, sm, st>>>(p, n16, o); break;
+    }
+    case 6: {
+      size_t sm = 12 * 16384;
+      cudaFuncSetAttribute(bw::tma_kernel<12>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma_kernel<12><<<(int)grid, 256, sm, st>>>(p, n16, o); break;
+    }
+    case 7: bw::ring_kernel<8><<<(int)grid * 2, 256, 0, st>>>(p, n16, o); break;
+
+    case 8: { constexpr int SB = 32768, NS = 4; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 9: { constexpr int SB = 8192, NS = 12; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 10: { constexpr int SB = 16384, NS = 6; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 16, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 16, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 11: { constexpr int SB = 32768, NS = 4; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, true><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 12: { constexpr int SB = 16384, NS = 4; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid * 2, 256, sm, st>>>(p, n16, o); break; }
+    case 14: { constexpr int SB = 16384, NS = 6; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tmapf_kernel<SB, NS, 12>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tmapf_kernel<SB, NS, 12><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 15: { constexpr int SB = 36864, NS = 5; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tmapf_kernel<SB, NS, 9>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tmapf_kernel<SB, NS, 9><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 16: { constexpr int SB = 36864, NS = 5; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 17: { constexpr int SB = 36864, NS = 4; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 18: { constexpr int SB = 36864, NS = 4; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 2, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 2, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 19: { constexpr int SB = 36864, NS = 3; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 20: { constexpr int SB = 32768, NS = 5; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 21: { constexpr int SB = 16384, NS = 8; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 22: { constexpr int SB = 16384, NS = 4; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 23: { constexpr int SB = 16384, NS = 6; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+    case 24: { constexpr int SB = 36864, NS = 2; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, false>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, false><<<(int)grid * 2, 256, sm, st>>>(p, n16, o); break; }
+    case 13: { constexpr int SB = 36864, NS = 3; size_t sm = (size_t)SB * NS;
+      cudaFuncSetAttribute(bw::tma2_kernel<SB, NS, 1, true>, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)sm);
+      bw::tma2_kernel<SB, NS, 1, true><<<(int)grid, 256, sm, st>>>(p, n16, o); break; }
+  }
+}
+
+'''
+
+moe_CPP_SRC = r'''
 #include <torch/extension.h>
 void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor ids,
              torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid);
 void okc_set_pdl(int64_t on);
-"""
-_MOE = None
+'''
+# Programmatic dependent launch for embedders whose graph runs this kernel right after other kernels (the kernel
+# waits on griddepcontrol.wait before touching their outputs). Off here: one launch per call gains nothing.
+moe_PDL = False
+# Scale decode with PRMT + IMAD instead of the smem LUT; exact only when every block-scale byte of the local experts
+# is a positive normal e4m3 value (0x08..0x7E). prepare() checks the actual weights and keeps the LUT build otherwise.
+moe_PRMT_SCALES = True
 
 
-_MOE_TINY = None
-_MOE_TINY2 = None
-_MOE_MID = None
-MOE_DEFINES = ("-DOKC_NW=16", "-DOKC_FAST1=0", "-DOKC_EPI4=0", "-DOKC_WGS=1")              # the moe agent's MAIN_DEFINES
-MOE_TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_L2H=0", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2")    # their small-M build ( () = absent )
-MOE_TINY_MAX_M = 4
-MOE_TINY2_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=1', '-DOKC_FINPF=1')  # their second small-M build ( () = absent )
-MOE_TINY2_MAX_M = 8
-MOE_MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')      # their mid-M build ( () = absent )
-MOE_MID_MAX_M = 16
-
-
-_MA_PRMT_SCALES = True
-_MA_SFX_IF_PRMT = ("-DOKC_PRMTSC=1",)
-
-
-def _ma_scales_prmt_exact(*sfs):
+def moe__scales_prmt_exact(*sfs):
     for sf in sfs:
         b = sf.contiguous().view(torch.uint8)
         if bool(((b < 0x08) | (b > 0x7E)).any()):
             return False
     return True
 
+moe__EXTS = {}
+moe_MAIN_DEFINES = ("-DOKC_NW=16", "-DOKC_FAST1=0", "-DOKC_EPI4=0", "-DOKC_WGS=1")          # compile-time variant used by kernel_fn
+# M <= TINY_MAX_M runs a skinny-only build with 16 warps per CTA (a job never has more than M tokens, so no fat units)
+moe_TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_L2H=0", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2", "-DOKC_FINPF=1")  # bf16 WSB at NW=8 + WSBL tail (Oct 26: bs1 +2.5% / +3.5%)
+moe_TINY_MAX_M = 4
+# TINY_MAX_M < M <= TINY2_MAX_M runs a second skinny-only build (empty: skipped); TINY2_MAX_M must stay <= 8
+moe_TINY2_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=1', '-DOKC_FINPF=1')  # bf16 WSB (Oct 26: bs8 +2.0..2.5%)
+moe_TINY2_MAX_M = 8
+# TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
+moe_MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
+moe_MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
+moe_DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
+moe_DIAG_VARIANTS = {}         # name -> defines, timed in diag mode
+moe_DIAG_BW = False            # also run the bandwidth microbenchmarks
+moe_DIAG_BW_MODES = (5, 8, 12, 16) + tuple(range(17, 25))
 
-MOE_HAS_PDL = True   # their extension exports okc_set_pdl (programmatic stream serialization)
+
+moe_ALT_SRCS = {}
+moe_MAIN_NS = 3
 
 
-_MA_SFX = ()   # set in prepare() from the weights' block-scale bytes, before any moe build starts
-
-
-_MA_EXTS = {}
-_MA_ALT_SRCS = {}
-_MA_MAIN_NS = 3
-_MA_PDL = False   # set per call (okc_set_pdl)
-
-
-def _ma_ext(defines=None):
-    defines = tuple(MOE_DEFINES if defines is None else defines)
-    if DQ7 and "-DOKC_DQ7=1" not in defines:
+def moe__ext(defines=None):
+    defines = tuple(moe_MAIN_DEFINES if defines is None else defines)
+    if moe_DQ7 and "-DOKC_DQ7=1" not in defines:
         defines = defines + ("-DOKC_DQ7=1",)
-    if defines not in _MA_EXTS:
-        src = MOE_CUDA_SRC
+    if defines not in moe__EXTS:
+        src = moe_CUDA_SRC
         defs = [d for d in defines if not d.startswith("@")]
         if torch.cuda.get_device_capability()[0] < 9:  # small-smem dev GPUs: keep the ring at 1 slot
             defs = [d for d in defs if not d.startswith("-DOKC_NS=") and not d.startswith("-DOKC_NSF=")]
         for d in defines:
             if d.startswith("@"):
-                src = _MA_ALT_SRCS[d[1:]]
+                src = moe_ALT_SRCS[d[1:]]
         major, minor = torch.cuda.get_device_capability()
         arch = f"{major}{minor}" + ("a" if major == 9 else "")
         tag = "_".join(d.replace("=", "").replace("-D", "").replace("@", "src").lower() for d in defines) or "main"
-        _MA_EXTS[defines] = load_inline(
-            name=f"dl_okc_moe_w4a16_v216x_{tag}_sm{arch}",
-            cpp_sources=MOE_CPP_SRC,
+        moe__EXTS[defines] = load_inline(
+            name=f"okc_moe_w4a16_v216x_{tag}_sm{arch}",
+            cpp_sources=moe_CPP_SRC,
             cuda_sources=src,
             functions=["okc_run", "okc_set_pdl"],
             extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}", "-lineinfo",
-                               *([] if any(d.startswith("-DOKC_NS=") for d in defs) else [f"-DOKC_NS={_MA_MAIN_NS if major >= 9 else 1}"]),
+                               *([] if any(d.startswith("-DOKC_NS=") for d in defs) else [f"-DOKC_NS={moe_MAIN_NS if major >= 9 else 1}"]),
                                f"-DOKC_FNST={4 if major >= 9 else 3}",
                                *([] if any(d.startswith("-DOKC_NSF=") for d in defs) else [f"-DOKC_NSF={3 if major >= 9 else 1}"]), *defs],
             verbose=False,
         )
-        _MA_EXTS[defines].okc_set_pdl(1 if _MA_PDL else 0)
-    return _MA_EXTS[defines]
+        moe__EXTS[defines].okc_set_pdl(1 if moe_PDL else 0)
+    return moe__EXTS[defines]
 
 
-def _moe_build(defines):
-    """Their own extension builder (lifted verbatim as _ma_ext: flags, DQ7 define, module name), called with the
-    build's defines + the weights' suffix, exactly as their kernel_fn calls _ext."""
-    ext = _ma_ext(tuple(defines) + tuple(_MA_SFX))
-    if MOE_HAS_PDL:
-        ext.okc_set_pdl(0)
-    return ext
-
-
-def _moe(M=None):
-    """Their kernel, in the build their kernel_fn would pick for this token count."""
-    global _MOE, _MOE_TINY, _MOE_TINY2, _MOE_MID
-    if M is not None and MOE_TINY_DEFINES and M <= MOE_TINY_MAX_M:
-        if _MOE_TINY is None:
-            _MOE_TINY = _moe_build(MOE_TINY_DEFINES)
-        return _MOE_TINY
-    if M is not None and _moe_tiny2_ok() and M <= MOE_TINY2_MAX_M:
-        if _MOE_TINY2 is None:
-            _MOE_TINY2 = _moe_build(MOE_TINY2_DEFINES)
-        return _MOE_TINY2
-    if M is not None and MOE_MID_DEFINES and M <= MOE_MID_MAX_M:
-        if _MOE_MID is None:
-            _MOE_MID = _moe_build(MOE_MID_DEFINES)
-        return _MOE_MID
-    if _MOE is None:   # their M >= 64 rule: _main_defines(sfx) (the WGS build needs the PRMT decode, else fallback)
-        _MOE = _moe_build(_main_defines(_MA_SFX) if "_main_defines" in globals() else MOE_DEFINES)
-    return _MOE
-
-
-def _moe_mid():
-    global _MOE_MID
-    if MOE_MID_DEFINES and _MOE_MID is None:
-        _MOE_MID = _moe_build(MOE_MID_DEFINES)
-    return _MOE_MID
-
-
-def _moe_tiny2_ok():
-    """Their kernel_fn's rule: the TINY2 build only with the PRMT scale decode when it is a WGS build."""
-    return bool(MOE_TINY2_DEFINES) and (bool(_MA_SFX) or "-DOKC_WGS=1" not in tuple(MOE_TINY2_DEFINES))
-
-
-def _moe_tiny2():
-    global _MOE_TINY2
-    if _moe_tiny2_ok() and _MOE_TINY2 is None:
-        _MOE_TINY2 = _moe_build(MOE_TINY2_DEFINES)
-    return _MOE_TINY2
-
-
-def _moe_tiny():
-    global _MOE_TINY
-    if MOE_TINY_DEFINES and _MOE_TINY is None:
-        _MOE_TINY = _moe_build(MOE_TINY_DEFINES)
-    return _MOE_TINY
-
-
-_REG_HJ = [(0, 0), (1, 0), (0, 2), (1, 2)]
+# Bit layout of a 32-bit word holding 8 E2M1 codes for one MMA k-step of one lane: register R (0..3) is
+# (h, j0) = (0,0) (1,0) (0,2) (1,2): rows g+8h, k = base + 4s + j0 (+1 for the upper bf16). Code bits (m, e0, e1, s)
+# land at output bits (6, 7, 8, 15) (+16 for the upper half) after the per-register rotation used by dq4().
+moe__REG_HJ = [(0, 0), (1, 0), (0, 2), (1, 2)]
 
 
 # DQ7: a bit layout whose decode is 7 ALU ops + 2 IMAD.SHL per 8 weights (the kernel gets -DOKC_DQ7=1)
-DQ7 = True
+moe_DQ7 = True
 
 
-def _stored_pos():
+def moe__stored_pos():
     pos = {}
     for R in range(4):
         for up in range(2):
             outb = {0: 6 + 16 * up, 1: 7 + 16 * up, 2: 8 + 16 * up, 3: 15 + 16 * up}  # code bit -> output bit
             for b, o in outb.items():
-                if DQ7:
+                if moe_DQ7:
                     # register R reads source bit (o + d) mod 32: r0 as stored, r1 = word << 4, r2 = rotl 10,
                     # r3 = word << 6 except the e1 bits (output 8 / 24), which come from rotl 14
                     d = (0, 28, 22, 18 if b == 2 else 26)[R]
@@ -8784,10 +9280,10 @@ def _stored_pos():
     return pos
 
 
-_POS = _stored_pos()
+moe__POS = moe__stored_pos()
 
 
-def _pack_codes(codes, rows):
+def moe__pack_codes(codes, rows):
     """codes uint8 [R0, K/2] (one expert), rows: LongTensor row order (R). Returns int32 words
     laid out [rb][w][c][g][t][s] (uint4 per lane per chunk)."""
     c = codes.index_select(0, rows)
@@ -8797,16 +9293,16 @@ def _pack_codes(codes, rows):
     n = nib.view(nb, 2, 8, 8, 8, 4, 4, 4)  # rb, h, g, w, c, t, s, j
     n = n.permute(0, 3, 4, 2, 5, 6, 1, 7).to(torch.int64)  # rb, w, c, g, t, s, h, j
     word = torch.zeros(n.shape[:-2], dtype=torch.int64, device=codes.device)
-    for Rg, (h, j0) in enumerate(_REG_HJ):
+    for Rg, (h, j0) in enumerate(moe__REG_HJ):
         for up in range(2):
             code = n[..., h, j0 + up]
             for b in range(4):
-                word |= ((code >> b) & 1) << _POS[(Rg, up, b)]
+                word |= ((code >> b) & 1) << moe__POS[(Rg, up, b)]
     word = torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
     return word.contiguous().view(-1)
 
 
-def _pack_scales(sf, rows):
+def moe__pack_scales(sf, rows):
     """sf fp8 [R0, K/16] -> bytes [rb][w][g][t][c][h]."""
     s = sf.view(torch.uint8).index_select(0, rows)
     R = s.shape[0]
@@ -8816,7 +9312,7 @@ def _pack_scales(sf, rows):
     return s.contiguous().view(-1)
 
 
-def _fat_order(codes, scales):
+def moe__fat_order(codes, scales):
     """Packed per-expert codes (int32 [rb][w][c][lane][4]) and scales (uint8 [rb][w][lane][c][h]) -> fat order:
     [ub (256-row unit)][ks (16 k-stages of 256)][32 KB codes [rb16][cc][lane][16 B] + 4 KB scales [rb16][lane][cc][h]]."""
     nub = codes.numel() // (16 * 8 * 8 * 32 * 4)
@@ -8826,7 +9322,7 @@ def _fat_order(codes, scales):
     return torch.cat([c, s], dim=2).contiguous().view(-1)
 
 
-def _unit_order(codes, scales):
+def moe__unit_order(codes, scales):
     """Per 16-row block: its 32 KB of codes followed by its 4 KB of scales (one TMA copy per skinny unit)."""
     nblk = codes.numel() // (8 * 8 * 32 * 4)
     c = codes.contiguous().view(torch.uint8).view(nblk, 32768)
@@ -8834,7 +9330,7 @@ def _unit_order(codes, scales):
     return torch.cat([c, s], dim=1).contiguous().view(-1)
 
 
-def _pack_codes_nat(codes, rows):
+def moe__pack_codes_nat(codes, rows):
     """Like _pack_codes but with the natural mma k order inside each 16-k step (for the wgmma fat path):
     word (rb, w, c, g, t, s) holds k = 64c + 16s + 8q + 2t + e of rows g (h=0) / g+8 (h=1)."""
     c = codes.index_select(0, rows)
@@ -8848,16 +9344,16 @@ def _pack_codes_nat(codes, rows):
         for up in range(2):
             code = n[..., h, q, up]
             for b in range(4):
-                word |= ((code >> b) & 1) << _POS[(Rg, up, b)]
+                word |= ((code >> b) & 1) << moe__POS[(Rg, up, b)]
     word = torch.where(word >= 2**31, word - 2**32, word).to(torch.int32)
     return word.contiguous().view(-1)
 
 
-def _wgs_copy(codes, sf, rows):
+def moe__wgs_copy(codes, sf, rows):
     """WGS copy (RS-wgmma tiny band, moe -DOKC_WGS=1): [256-row unit][stage (16)][warpgroup q (4)][9216 B]. Warpgroup q
     owns rows 64q..64q+63 of the unit; stage st holds k16 steps st*16 + (0..15): codes [grp (4)][warp (4)][lane (32)]
     [4 words] (word (grp, j) = k16 step st*16 + grp*4 + j, natural mma k order), then scales [grp][warp][g][j][h] (the kernel's OKC_WGSSC2 layout)."""
-    wn = _pack_codes_nat(codes, rows)
+    wn = moe__pack_codes_nat(codes, rows)
     R = rows.numel()
     nb, nub = R // 16, R // 256
     w = wn.view(nb, 8, 8, 8, 4, 4)                                    # rb16, w8, c8, g, t, s
@@ -8872,27 +9368,259 @@ def _wgs_copy(codes, sf, rows):
 
 
 # the M >= 64 build when the scale bytes rule out the PRMT decode (the WGS kernel needs it): the mma.sync kernel
-MAIN_FALLBACK_DEFINES = ("-DOKC_CPF=0", "-DOKC_CPFF=0", "-DOKC_DYNK=7", "-DOKC_EARLYN=2", "-DOKC_EPI4=0", "-DOKC_FCOSTB=35",
+moe_MAIN_FALLBACK_DEFINES = ("-DOKC_CPF=0", "-DOKC_CPFF=0", "-DOKC_DYNK=7", "-DOKC_EARLYN=2", "-DOKC_EPI4=0", "-DOKC_FCOSTB=35",
                          "-DOKC_FCOSTBB=36", "-DOKC_FINCOL=0", "-DOKC_FPF=5")
 
 
-def _main_defines(sfx):
-    if not sfx and "-DOKC_WGS=1" in tuple(MOE_DEFINES):
-        return MAIN_FALLBACK_DEFINES
-    return MOE_DEFINES
+def moe__main_defines(sfx):
+    if not sfx and "-DOKC_WGS=1" in tuple(moe_MAIN_DEFINES):
+        return moe_MAIN_FALLBACK_DEFINES
+    return moe_MAIN_DEFINES
 
 
-def _wgs_on():
-    return any("-DOKC_WGS=1" in tuple(d) for d in (MOE_DEFINES, MOE_TINY_DEFINES, MOE_TINY2_DEFINES, MOE_MID_DEFINES))
+def moe__wgs_on():
+    return any("-DOKC_WGS=1" in tuple(d) for d in (moe_MAIN_DEFINES, moe_TINY_DEFINES, moe_TINY2_DEFINES, moe_MID_DEFINES))
 
 
+def moe_prepare(weights):
+    dev = weights["w13"].device
+    lo, cnt = 0, 32
+    I = weights["w13"].shape[1] // 2
+    H = weights["w2"].shape[1]
+    assert I == 4096 and H == 4096
+    assert weights["post_norm_w"].dtype == torch.bfloat16  # kept as given (TASK.md: BF16 weights stay BF16)
+    assert weights["w13_gs"].dtype == torch.float32 and weights["w2_gs"].dtype == torch.float32  # stored as given
+    rb = torch.arange(I // 8, device=dev)
+    g = torch.arange(8, device=dev)
+    rowsA = torch.stack((8 * rb[:, None] + g[None, :], I + 8 * rb[:, None] + g[None, :]), 1).reshape(-1)
+    rowsB = torch.arange(H, device=dev)
+    wA, sA, wB, sB = [], [], [], []
+    for e in range(lo, lo + cnt):
+        wA.append(moe__pack_codes(weights["w13"][e], rowsA))
+        sA.append(moe__pack_scales(weights["w13_sf"][e], rowsA))
+        wB.append(moe__pack_codes(weights["w2"][e], rowsB))
+        sB.append(moe__pack_scales(weights["w2_sf"][e], rowsB))
+    lut = (torch.arange(256, dtype=torch.int32, device=dev).to(torch.uint8).view(torch.float8_e4m3fn).float()
+           * 2.0**64).to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
+    lut = (lut | (lut << 16)).to(torch.int32)
+    state = {
+        "w": [torch.cat(wA), torch.cat(sA), weights["w13_gs"][lo:lo + cnt].contiguous(),
+              torch.cat(wB), torch.cat(sB), weights["w2_gs"][lo:lo + cnt].contiguous(),
+              lut.contiguous(), weights["post_norm_w"].contiguous(),  # bf16 as given; the kernel forms 1 + w in FP32
+              torch.cat([moe__fat_order(a, b) for a, b in zip(wA, sA)]), torch.cat([moe__fat_order(a, b) for a, b in zip(wB, sB)]),
+              torch.cat([moe__unit_order(a, b) for a, b in zip(wA, sA)]), torch.cat([moe__unit_order(a, b) for a, b in zip(wB, sB)])],
+        "lo": lo, "cnt": cnt, "scratch": moe__make_scratch(dev),
+        "grid": torch.cuda.get_device_properties(dev).multi_processor_count,
+    }
+    if moe__wgs_on():  # w[12], w[13]: the WGS copies (one more copy of the weights, laid out per 64-row unit)
+        state["w"].append(torch.cat([moe__wgs_copy(weights["w13"][e], weights["w13_sf"][e], rowsA) for e in range(lo, lo + cnt)]))
+        state["w"].append(torch.cat([moe__wgs_copy(weights["w2"][e], weights["w2_sf"][e], rowsB) for e in range(lo, lo + cnt)]))
+    prmt = moe_PRMT_SCALES and moe__scales_prmt_exact(weights["w13_sf"][lo:lo + cnt], weights["w2_sf"][lo:lo + cnt])
+    state["sfx"] = ("-DOKC_PRMTSC=1",) if prmt else ()
+    mods = [tuple(moe__main_defines(state["sfx"])) + state["sfx"]]
+    for d in (moe_TINY_DEFINES, moe_TINY2_DEFINES, moe_MID_DEFINES):
+        if d and (state["sfx"] or "-DOKC_WGS=1" not in tuple(d)):  # the WGS build needs the PRMT scale decode
+            mods.append(tuple(d) + state["sfx"])
+    for d in mods:
+        moe__ext(d)
+    torch.cuda.synchronize()
+    if moe_DIAG:
+        moe__diag(state, weights)
+    return state
 
 
-# ---------------------------------------------------------------------------------------------------
-# The bf16_proj agent's dense kernels (copied from our muse_bf16_proj entry; every top-level name prefixed
-# bfp_). Used for the projections where the tuner finds them faster than cuBLAS or my Triton split-K.
-# ---------------------------------------------------------------------------------------------------
-# okc: problem=muse_bf16_proj
+moe_MMAX = 384
+moe_EMAX = moe_MMAX * 8
+moe_JMAX = 32 + moe_EMAX // 64 + 8
+
+
+moe_WGS_FIXF = 2 * 160 * 4 * 4096 + 2 * 160 * 4 + 136 * 16   # moe WGS_FIXF: stream-K fixups + doneAs after ybuf (zero between calls)
+moe_WGS_XROWS = moe_EMAX + 8 * (32 + moe_EMAX // 32 + 8)  # >= moe WGS_XROWS for FT_T >= 32
+
+
+def moe__make_scratch(dev):
+    return [torch.zeros(8 + 1024 + moe_EMAX, dtype=torch.int32, device=dev),  # counters + doneA (>= any build's JMAX) + ss copy 1
+            torch.zeros(moe_EMAX + moe_EMAX * 4096 + moe_WGS_FIXF, dtype=torch.float32, device=dev),
+            torch.zeros((moe_EMAX + 2 * moe_WGS_XROWS) * 4096, dtype=torch.bfloat16, device=dev)]  # inter, then WGS xA / xB
+
+
+def moe_kernel_fn(data, state):
+    cfg = data["config"]
+    x = data["hidden_states"].contiguous()
+    M = x.shape[0]
+    assert cfg["local_start"] == state["lo"] and cfg["local_count"] == state["cnt"]
+    ids = data["topk_ids"].to(torch.int32).contiguous()
+    if ids.data_ptr() & 15:  # the WGS routing loads topk_ids 16 B at a time (an offset view gets an aligned copy)
+        ids = ids.clone()
+    tw = data["topk_weights"].to(torch.float32).contiguous()
+    out = torch.empty((M, 4096), dtype=torch.bfloat16, device=x.device)
+    sfx = state.get("sfx", ())
+    if moe_TINY_DEFINES and M <= moe_TINY_MAX_M:
+        ext = moe__ext(tuple(moe_TINY_DEFINES) + sfx)
+    elif moe_TINY2_DEFINES and M <= moe_TINY2_MAX_M and (sfx or "-DOKC_WGS=1" not in tuple(moe_TINY2_DEFINES)):
+        ext = moe__ext(tuple(moe_TINY2_DEFINES) + sfx)  # (the WGS build needs the PRMT scale decode: else MID/MAIN)
+    elif moe_MID_DEFINES and M <= moe_MID_MAX_M:
+        ext = moe__ext(tuple(moe_MID_DEFINES) + sfx)
+    else:
+        ext = moe__ext(tuple(moe__main_defines(sfx)) + sfx)
+    for m0 in range(0, M, moe_MMAX):
+        m1 = min(M, m0 + moe_MMAX)
+        ext.okc_run(state["w"], state["scratch"], x[m0:m1], ids[m0:m1], tw[m0:m1], out[m0:m1],
+                    state["lo"], state["cnt"], state["grid"])
+    return out
+
+
+# ---------------------------------------------------------------------------------------------- diagnostics
+def moe__gen_input(bs, seed, dev):
+    """Same distribution as the task's generate_input (normal dist, busiest-GPU relabel), written here."""
+    gen = torch.Generator(device=dev).manual_seed(seed)
+    x = torch.randn((bs, 4096), generator=gen, device=dev).to(torch.bfloat16)
+    scores = torch.rand((bs, 256), generator=gen, device=dev)
+    z = torch.randn((256,), generator=gen, device=dev)
+    u = torch.rand((256,), generator=gen, device=dev).clamp(min=1e-12)
+    scores = scores + 0.03 * z / (-u.log()).sqrt()
+    routed = scores.topk(8, dim=-1)
+    ids = routed.indices
+    pairs = torch.bincount((ids // 32).flatten(), minlength=8)
+    ids = (ids - 32 * pairs.argmax()) % 256
+    return {"hidden_states": x, "topk_ids": ids.to(torch.int32),
+            "topk_weights": (routed.values / routed.values.sum(-1, keepdim=True)).float(),
+            "config": {"bs": bs, "d_hidden": 4096, "d_expert": 4096, "n_experts": 256, "local_start": 0,
+                       "local_count": 32, "top_k": 8, "sharding": "ep8"}}
+
+
+def moe__time_graph(fn, reps=40):
+    dev = torch.device("cuda")
+    flush = torch.empty(64 * 1024 * 1024, dtype=torch.int32, device=dev)
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        for _ in range(3):
+            fn()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    ts = []
+    for _ in range(reps):
+        flush.add_(1)
+        e0 = torch.cuda.Event(enable_timing=True)
+        e1 = torch.cuda.Event(enable_timing=True)
+        e0.record()
+        g.replay()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) * 1000.0)
+    ts.sort()
+    del g
+    return ts[len(ts) // 2], ts[0]
+
+
+def moe__diag_bw(state):
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"{major}{minor}" + ("a" if major == 9 else "")
+    ext = load_inline(name=f"okc_bw_v216x_sm{arch}", cpp_sources="#include <torch/extension.h>\nvoid bw_run(torch::Tensor src, torch::Tensor out, int64_t mode, int64_t grid);",
+                      cuda_sources=moe_BW_SRC, functions=["bw_run"],
+                      extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}"], verbose=False)
+    src = state["w"][0]
+    nbytes = src.numel() * src.element_size()
+    out = torch.zeros(4, dtype=torch.int32, device=src.device)
+    flush = torch.empty(64 * 1024 * 1024, dtype=torch.int32, device=src.device)
+    names = {0: "ring16 1cta/sm", 1: "ring32 1cta/sm", 2: "occ 8cta/sm", 3: "cp.async 6x16KB", 4: "cp.async 10x16KB",
+             5: "tma 6x16KB", 6: "tma 12x16KB", 7: "ring8 2cta/sm", 8: "tma 4x32KB", 9: "tma 12x8KB",
+             10: "tma 6x16KB as 16x1KB", 11: "mix 4x32KB half tma", 12: "tma 4x16KB 2cta/sm", 13: "mix 3x36KB half tma",
+             14: "tma 6x16KB + L2 pf 12 ahead", 15: "tma 5x36KB + L2 pf 9 ahead", 16: "tma 5x36KB",
+             17: "tma 4x36KB", 18: "tma 4x36KB as 2x18KB", 19: "tma 3x36KB", 20: "tma 5x32KB", 21: "tma2 8x16KB",
+             22: "tma2 4x16KB", 23: "tma2 6x16KB", 24: "tma 2x36KB 2cta/sm"}
+    for mode in moe_DIAG_BW_MODES:
+        if mode >= 5 and mode != 7 and major < 9:
+            continue
+        ts = []
+        for _ in range(5):
+            flush.add_(1)
+            e0 = torch.cuda.Event(enable_timing=True)
+            e1 = torch.cuda.Event(enable_timing=True)
+            e0.record()
+            ext.bw_run(src, out, mode, state["grid"])
+            e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1) * 1000.0)
+        ts.sort()
+        print(f"[diag-bw] {names[mode]:18s}: {ts[2]:8.1f} us  {nbytes / ts[2] / 1e6:6.2f} TB/s", flush=True)
+
+
+def moe__diag(state, weights):
+    import time
+    dev = weights["w13"].device
+    t0 = time.time()
+    if moe_DIAG_BW:
+        try:
+            moe__diag_bw(state)
+        except Exception as ex:  # diagnostics must never break the run
+            print(f"[diag-bw] failed: {ex}", flush=True)
+    shapes = [1, 16, 32, 8, 128, 256]
+    variants = {"main": tuple(moe_MAIN_DEFINES)}
+    variants.update(moe_DIAG_VARIANTS)
+    # compile the variants concurrently (separate extension dirs; nvcc runs in subprocesses)
+    import concurrent.futures
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        list(ex.map(moe__ext, [d for d in variants.values() if tuple(d) not in moe__EXTS]))
+    print(f"[diag] compiled {len(variants)} variants in {time.time() - t0:.0f}s", flush=True)
+    lines = []
+    for bs in shapes:
+        d = moe__gen_input(bs, 1234 + bs, dev)
+        ids = d["topk_ids"]
+        touched = int(torch.unique(ids[(ids >= 0) & (ids < 32)]).numel())
+        row = [f"bs={bs:3d} touched={touched:2d}"]
+        for name, defs in variants.items():
+            ext = moe__ext(defs)
+            x = d["hidden_states"]
+            idt = ids.to(torch.int32).contiguous()
+            tw = d["topk_weights"].float().contiguous()
+            out = torch.empty((bs, 4096), dtype=torch.bfloat16, device=dev)
+
+            def fn():
+                ext.okc_run(state["w"], state["scratch"], x, idt, tw, out, 0, 32, state["grid"])
+
+            med, mn = moe__time_graph(fn)
+            row.append(f"{name}: {med:7.1f}us ({touched * 28.31 / med:4.2f} TB/s)")
+        lines.append("  ".join(row))
+        print("[diag] " + lines[-1], flush=True)
+    # timeline of the main variant with debug timestamps
+    for dbgname in [k for k, v in variants.items() if "-DOKC_DEBUG=1" in v]:
+        ext = moe__ext(variants[dbgname])
+        G = state["grid"]
+        dbg = torch.zeros(G * 8 + G * 8 * 4, dtype=torch.int64, device=dev)
+        sc = list(state["scratch"]) + [dbg]
+        names = ["start", "routed", "A done", "B done", "barrier", "final"]
+        for bs in shapes:
+            d = moe__gen_input(bs, 1234 + bs, dev)
+            x = d["hidden_states"]
+            idt = d["topk_ids"].to(torch.int32).contiguous()
+            tw = d["topk_weights"].float().contiguous()
+            out = torch.empty((bs, 4096), dtype=torch.bfloat16, device=dev)
+            flush = torch.empty(64 * 1024 * 1024, dtype=torch.int32, device=dev)
+            for _ in range(3):
+                flush.add_(1)
+                dbg.zero_()
+                torch.cuda.synchronize()
+                ext.okc_run(state["w"], sc, x, idt, tw, out, 0, 32, G)
+                torch.cuda.synchronize()
+            tt = dbg[:G * 8].view(G, 8).cpu().double()
+            t00 = tt[:, 0][tt[:, 0] > 0].min()
+            parts = []
+            for k, n in enumerate(names):
+                col = tt[:, k][tt[:, k] > 0]
+                if col.numel():
+                    parts.append(f"{n} {(col.min() - t00) / 1000:.1f}-{(col.max() - t00) / 1000:.1f}")
+            print(f"[diag] timeline {dbgname} bs={bs}: " + "  ".join(parts), flush=True)
+    print(f"[diag] total {time.time() - t0:.0f}s", flush=True)
+# ---- end of component: moe ----
+
+
+# ==============================================================================================================
+# component: proj (muse_decode_layer/proj_fork.py); every module-level name of that file carries the prefix `bfp_`
+# ==============================================================================================================
 """Dense projections for Muse Spark Open: skinny swap-AB tensor-core GEMV/GEMM with
 losslessly compressed BF16 weights.
 
@@ -12121,6 +12849,7 @@ def bfp__diag(x, layer, m, n, k, state, choice):
     if choice[0] == "skinny" and m == 1 and layer in ("o", "unpooler") and state["comp"][layer]:
         for dg in (1, 2, 3):   # same kernel without epilogue / x loads / compute
             bfp__run_skinny(x, layer, m, n, k, state, choice[1], choice[2], dg)
+# ---- end of component: proj ----
 
 
 
@@ -12151,56 +12880,48 @@ def _bfp_gemm(st, name, x, m, n, k):
     return bfp_kernel_fn({"x": x, "config": {"layer": _BFP_LAYER[name], "m": m, "n": n, "k": k}}, st["bfp"])
 
 
-_MA_MMAX = 384
-_MA_EMAX = _MA_MMAX * 8
-_MA_JMAX = 32 + _MA_EMAX // 64 + 8
-
-
-WGS_FIXF = 2 * 160 * 4 * 4096 + 2 * 160 * 4 + 136 * 16   # moe WGS_FIXF: stream-K fixups + doneAs after ybuf (zero between calls)
-WGS_XROWS = _MA_EMAX + 8 * (32 + _MA_EMAX // 32 + 8)  # >= moe WGS_XROWS for FT_T >= 32
-
-
-def _ma_make_scratch(dev):
-    return [torch.zeros(8 + 1024 + _MA_EMAX, dtype=torch.int32, device=dev),  # counters + doneA (>= any build's _MA_JMAX) + ss copy 1
-            torch.zeros(_MA_EMAX + _MA_EMAX * 4096 + WGS_FIXF, dtype=torch.float32, device=dev),
-            torch.zeros((_MA_EMAX + 2 * WGS_XROWS) * 4096, dtype=torch.bfloat16, device=dev)]  # inter, then WGS xA / xB
-
 SCRATCH_GUARD = 1 << 16   # sentinel words after each buffer my glue allocates: wide enough for far overruns (v154m-style state ~4K words out)
 SCRATCH_SENTINEL = 0x5EADBEEF
 
 
+def _moe_weights(weights):
+    """The expert weights in the moe module's own Weights layout (uint8 codes, e4m3 block scales, fp32 global
+    scales, post_norm_w = this layer's post_expert_norm)."""
+    return {"w13": weights["w13"].view(torch.uint8), "w13_sf": weights["w13_sf"], "w13_gs": weights["w13_gs"].float(),
+            "w2": weights["w2"].view(torch.uint8), "w2_sf": weights["w2_sf"], "w2_gs": weights["w2_gs"].float(),
+            "post_norm_w": weights["post_expert_norm"]}
+
+
+def _moe_sfx(weights):
+    """The moe module's build suffix (its prepare() computes the same): the PRMT scale decode only when every local
+    block-scale byte is a positive normal e4m3."""
+    return ("-DOKC_PRMTSC=1",) if (moe_PRMT_SCALES and moe__scales_prmt_exact(weights["w13_sf"], weights["w2_sf"])) else ()
+
+
+def _moe_builds(sfx):
+    """The builds the moe module's prepare() will ask for (its rule), so prepare() here can run them in parallel."""
+    mods = [tuple(moe__main_defines(sfx)) + sfx]
+    for d in (moe_TINY_DEFINES, moe_TINY2_DEFINES, moe_MID_DEFINES):
+        if d and (sfx or "-DOKC_WGS=1" not in tuple(d)):   # the WGS build needs the PRMT scale decode
+            mods.append(tuple(d) + sfx)
+    return mods
+
+
 def _ma_prepare(weights, st):
-    dev = weights["w13"].device
-    I = H = 4096
-    rb = torch.arange(I // 8, device=dev)
-    g = torch.arange(8, device=dev)
-    rowsA = torch.stack((8 * rb[:, None] + g[None, :], I + 8 * rb[:, None] + g[None, :]), 1).reshape(-1)
-    rowsB = torch.arange(H, device=dev)
-    wA, sA, wB, sB = [], [], [], []
-    for e in range(32):
-        wA.append(_pack_codes(weights["w13"][e].view(torch.uint8), rowsA))
-        sA.append(_pack_scales(weights["w13_sf"][e], rowsA))
-        wB.append(_pack_codes(weights["w2"][e].view(torch.uint8), rowsB))
-        sB.append(_pack_scales(weights["w2_sf"][e], rowsB))
-    lut = (torch.arange(256, dtype=torch.int32, device=dev).to(torch.uint8).view(torch.float8_e4m3fn).float()
-           * 2.0**64).to(torch.bfloat16).view(torch.int16).to(torch.int32) & 0xFFFF
-    lut = (lut | (lut << 16)).to(torch.int32)
-    st["ma_w"] = [torch.cat(wA), torch.cat(sA), weights["w13_gs"].float().contiguous(),
-                  torch.cat(wB), torch.cat(sB), weights["w2_gs"].float().contiguous(),
-                  lut.contiguous(), weights["post_expert_norm"].contiguous(),  # bf16; kernel forms 1 + w
-                  torch.cat([_fat_order(x, y) for x, y in zip(wA, sA)]),
-                  torch.cat([_fat_order(x, y) for x, y in zip(wB, sB)]),
-                  torch.cat([_unit_order(x, y) for x, y in zip(wA, sA)]),
-                  torch.cat([_unit_order(x, y) for x, y in zip(wB, sB)])]
-    if "_wgs_on" in globals() and _wgs_on():   # their prepare(): w[12], w[13] = the WGS copies (per 256-row unit)
-        st["ma_w"].append(torch.cat([_wgs_copy(weights["w13"][e].view(torch.uint8), weights["w13_sf"][e], rowsA)
-                                     for e in range(32)]))
-        st["ma_w"].append(torch.cat([_wgs_copy(weights["w2"][e].view(torch.uint8), weights["w2_sf"][e], rowsB)
-                                     for e in range(32)]))
-    # Their scratch layout, built by their own _make_scratch (lifted verbatim by mkversion): its size depends on
-    # every build their kernel_fn may pick (JMAX = 32 + EMAX / FT_T + 8 per build). v75/v78 sized it from the
-    # 64-token formula and the 32-token MID build wrote 48 ints past the end.
-    st["ma_scratch"] = [_guarded(t) for t in _ma_make_scratch(dev)]
+    """The moe module's own prepare() (weight packing in its layouts, build check, scratch), its scratch guarded:
+    the scratch size depends on every build its kernel_fn may pick, so only its allocator is trusted to size it."""
+    st["ma"] = moe_prepare(_moe_weights(weights))
+    st["ma"]["scratch"] = [_guarded(t) for t in st["ma"]["scratch"]]
+
+
+def _ma_run(state, x, lids, wts, T):
+    """Their kernel_fn: the build for this token count, at most moe_MMAX tokens per launch. PDL as this call's rule
+    (their extensions keep one flag each, set at every call; capture-time Python only)."""
+    pdl = 1 if _pdl(T) else 0
+    for ext in moe__EXTS.values():
+        ext.okc_set_pdl(pdl)
+    return moe_kernel_fn({"hidden_states": x, "topk_ids": lids, "topk_weights": wts,
+                          "config": {"local_start": 0, "local_count": LOCAL_EXPERTS}}, state["ma"])
 
 
 
@@ -13355,13 +14076,6 @@ def prepare(weights):
     st["g_postffn"] = weights["post_ffn_norm"].contiguous()
     st["g_next"] = weights["next_pre_attn_norm"].contiguous()
     st["bias"] = weights["router_bias"].float().contiguous()
-    st["w13q"] = _repack_q(weights["w13"].view(torch.uint8), True)
-    st["w13s"] = _repack_s(weights["w13_sf"].view(torch.uint8), True)
-    st["gs13"] = weights["w13_gs"].float().contiguous()
-    st["w2q"] = _repack_q(weights["w2"].view(torch.uint8), False)
-    st["w2s"] = _repack_s(weights["w2_sf"].view(torch.uint8), False)
-    st["gs2"] = weights["w2_gs"].float().contiguous()
-    st["invf0"] = torch.zeros(32, device=dev)
     st["invf"] = (1.0 / (500000.0 ** (torch.arange(0, 64, 2, device=dev).float() / 64))).contiguous()
     import threading
     errs = []
@@ -13372,9 +14086,9 @@ def prepare(weights):
         except Exception as ex:  # noqa: BLE001
             errs.append(ex)
 
-    global _MA_SFX
-    _MA_SFX = _MA_SFX_IF_PRMT if (_MA_PRMT_SCALES and _ma_scales_prmt_exact(weights["w13_sf"], weights["w2_sf"])) else ()
-    ths = [threading.Thread(target=_build, args=(f,)) for f in (_att7, _moe, _moe_tiny, _moe_tiny2, _moe_mid)]  # ~85 s of nvcc, in parallel
+    sfx = _moe_sfx(weights)
+    builds = [_att7] + [(lambda d=d: moe__ext(d)) for d in _moe_builds(sfx)]
+    ths = [threading.Thread(target=_build, args=(f,)) for f in builds]  # ~85 s of nvcc, in parallel
     for th in ths:
         th.start()
     for th in ths:
@@ -13423,89 +14137,28 @@ def _attn_cfg(B, L, sliding):
     return BM, nsplit
 
 
-_INV_FREQ7 = {}
+# The attention module's extension, built once for this layer: its source with the layer's measured flags (the
+# standalone entry's defaults are QDIRECT=1, PK2=1, W0ENABLE=0; this build is their "v298w1").
+ATT_BUILD_FLAGS = ("-DOKC_QDIRECT=0", "-DOKC_PK2=0", "-DOKC_W0ENABLE=1")
 
 
-def _inv_freq7(theta, device):
-    key = (float(theta), str(device))
-    t = _INV_FREQ7.get(key)
-    if t is None:
-        if theta:
-            t = 1.0 / (theta ** (torch.arange(0, 64, 2, device=device).float() / 64))
-        else:
-            t = torch.zeros(32, device=device)
-        _INV_FREQ7[key] = t.float().contiguous()
-    return t
+def _att7():
+    global att__MOD
+    if att__MOD is None:
+        att__MOD = att__build("w1", ATT_BUILD_FLAGS)
+    return att__MOD
 
-
-def _launch7(data, dbg=None, _mod=None, pdl=None, **override):
-    cfg = data["config"]
-    B, L = cfg["batch"], cfg["q_len"]
-    hq, hkv, d, P = cfg["num_q_heads"], cfg["num_kv_heads"], cfg["head_dim"], cfg["page_size"]
-    qkv = data["qkv"]
-    device = qkv.device
-    pairs = hkv // 2
-    window = cfg["window"]
-    page_table = data["page_table"]
-    out = torch.empty((B, L, hq * d), dtype=torch.bfloat16, device=device)
-    plan = _plan7(B, pairs, L, window, page_table.shape[1], P, device)
-    tuned = _TUNED7.get((B, L, bool(window), pairs))
-    if tuned and not override:
-        override = tuned
-    if override:
-        plan = dict(plan, **override)
-        if "cs" in override and override["cs"] > 1:
-            plan["flat"] = 0
-            if "ncl" not in override:
-                plan["ncl"] = max(1, plan["n_splits"] // override["cs"])
-            plan["n_splits"] = plan["cs"] * plan["ncl"]
-            if "nc" not in override:
-                plan["nc"] = max(1, min(plan["ncl"], 4))
-        elif "n_splits" in override and "nc" not in override:
-            plan["nc"] = 1 if plan["flat"] else max(1, min(plan["n_splits"], 4))
-    n_splits, flat, cs, ncl, nc = plan["n_splits"], plan["flat"], plan["cs"], plan["ncl"], plan["nc"]
-    # bit 0: TMA loads (compiled out by default); bit 1: cooperative finalize (all CTAs resident)
-    # cooperative finalize: only for the long single-request grids (their last-CTA finalize reads and zeroes
-    # tens of KB from one SM); the short sliding grids finalize faster in one CTA (measured on H200)
-    if flat:   # grid-wide finalize after all segments (the kernel re-checks residency)
-        coop = int(plan.get("coop", int(OKC_FLATCOOP and L == 8 and
-                                        n_splits * pairs <= 2 * _num_sms7(device))))
-    else:
-        coop = int(plan.get("coop", 0 if (cs > 1 or n_splits < 64) else
-                            int(n_splits * B * pairs <= 2 * _num_sms7(device))))
-    w0 = int(plan.get("w0", (OKC_W0_L1 if L == 1 else OKC_W0_L8) if (flat and (coop or L == 1)) else
-                      (OKC_W0_PR if (coop and not flat and B * pairs == 1) else 1024)))
-    use_pdl = OKC_PDL if pdl is None else bool(pdl)
-    tma = int(plan.get("tma", 0)) | (coop << 1) | (min(max(w0, 0), 4095) << 2) | (int(use_pdl) << 16)
-    if flat or cs <= 1:
-        cs, ncl = 0, 1
-    ws_acc, ws_l, ws_cnt = _workspace7(B * pairs * nc * L * 16, device)
-    n_ctas = n_splits * (1 if flat else B) * pairs
-    scratch, bar = _cluster_bufs7(n_ctas if cs > 1 else 1, L, device)
-    scale_log2 = cfg["sm_scale"] * cfg["qk_scale_factor"] * LOG2E
-    (_mod or _att7()).run(qkv, data["seq_lens"], data["cache_loc"], data["k_cache"], data["v_cache"], page_table,
-                  data["k_scale"], data["v_scale"], _inv_freq7(cfg["rope_theta"], device), out, ws_acc, ws_l,
-                  ws_cnt, B, L, hq, hkv, P, window, 1 if cfg["rope_theta"] else 0, n_splits, flat, nc, scale_log2,
-                  dbg, cs, ncl, scratch, bar, tma)
-    return out
-
-
-def _supported7(cfg):
-    P = cfg["page_size"]
-    return (cfg["head_dim"] == 64 and cfg["num_q_heads"] == 8 * cfg["num_kv_heads"] and cfg["num_kv_heads"] % 2 == 0
-            and cfg["q_len"] in (1, 8) and cfg["batch"] <= 512 and P > 0 and (P & (P - 1)) == 0
-            and cfg["batch"] * (cfg["num_kv_heads"] // 2) <= 4096)
 
 ATT_HAS_PDL = True   # does the embedded attention launcher take pdl= (their v63+)?
 
 
 def _decode_attention7(data, state, qkv):
-    """The attention agent's own launcher, lifted verbatim as _launch7: plan, workspace sizes and the coop / w0
-    bits always match the kernel version embedded here (v82: my hand copy had drifted -- w0 = 0, no flat coop).
-    This layer's config already carries their keys (heads, head_dim, page_size, window, rope_theta, scales)."""
+    """The attention module's own launcher (att__launch): plan, workspace sizes and the coop / w0 bits always match
+    the kernel version composed in. This layer's config already carries their keys (heads, head_dim, page_size,
+    window, rope_theta, scales)."""
     cfg = data["config"]
     pdl = {"pdl": _pdl(cfg["batch"] * cfg["q_len"])} if ATT_HAS_PDL else {}   # their launcher's PDL switch
-    out = _launch7({"config": cfg, "qkv": qkv, "seq_lens": data["seq_lens"], "cache_loc": data["cache_loc"],
+    out = att__launch({"config": cfg, "qkv": qkv, "seq_lens": data["seq_lens"], "cache_loc": data["cache_loc"],
                     "k_cache": data["k_cache"], "v_cache": data["v_cache"], "page_table": data["page_table"],
                     "k_scale": data["k_scale"], "v_scale": data["v_scale"]}, **pdl)
     return out.view(cfg["batch"] * cfg["q_len"], 1024)
@@ -13538,22 +14191,24 @@ def _check_guards():
             raise RuntimeError(f"a component kernel wrote {bad} words past a {words * 4}-byte buffer")
 
 
-_workspace7_raw, _cluster_bufs7_raw = _workspace7, _cluster_bufs7
+# The attention module's allocators are rebound (its launcher looks them up by name at every call) so that whatever
+# they newly allocate is guarded and cached back into their own dictionaries.
+_att_workspace_raw, _att_cluster_bufs_raw = att__workspace, att__cluster_bufs
 
 
-def _workspace7(n_rows, device):          # their allocator, then guard whatever it newly allocated
-    ws = _workspace7_raw(n_rows, device)
+def att__workspace(n_rows, device):          # their allocator, then guard whatever it newly allocated
+    ws = _att_workspace_raw(n_rows, device)
     if id(ws[0]) not in _GUARDED_IDS:
         ws = tuple(_guarded(t) for t in ws)
-        _WS7[str(device)] = ws
+        att__WS[str(device)] = ws
     return ws
 
 
-def _cluster_bufs7(n_ctas, L, device):
-    cb = _cluster_bufs7_raw(n_ctas, L, device)
+def att__cluster_bufs(n_ctas, L, device):
+    cb = _att_cluster_bufs_raw(n_ctas, L, device)
     if id(cb[0]) not in _GUARDED_IDS:
         cb = tuple(_guarded(t) for t in cb)
-        _CL7[str(device)] = cb
+        att__CL[str(device)] = cb
     return cb
 
 
@@ -13569,7 +14224,7 @@ def _attn_selftest(st):
                                  (2048, 1, 4, 3000, 64), (0, 8, 4, 3000, 64)):
         cfg = dict(batch=B, q_len=L, num_q_heads=16, num_kv_heads=2, head_dim=64, page_size=P, window=window,
                    rope_theta=500000.0 if window else 0.0, qk_scale_factor=5.4730064863875, sm_scale=0.125)
-        if not _supported7(cfg):
+        if not att__supported(cfg):
             continue
         seq = torch.full((B,), ctx, dtype=torch.int32, device=dev)
         per = (ctx + L + P - 1) // P
@@ -13608,7 +14263,7 @@ def kernel_fn(data, state):
     # q_len 8: their kernel on full layers, and on sliding only for a single request, where fusing QK-norm, RoPE,
     # the cache write and the norm-gate into one launch beats FA3 + my two glue kernels by 5.6% in-layer;
     # at B >= 16 sliding FA3 still matches or wins (16x8 -1.2%, 32x8 +0.8%), below my 4% bar for q_len 8.
-    agent_attn = (state["att_ok"] and _supported7(cfg) and _att_fits7(data, cfg)
+    agent_attn = (state["att_ok"] and att__supported(cfg) and _att_fits7(data, cfg)
                  )
     if agent_attn:
         # fused decode attention (QK-norm, RoPE, cache write, split-KV, merge, rmsnorm * sigmoid(gate))
@@ -13744,14 +14399,7 @@ def _after_attention(data, state, o_in, gate, T):
                      PERMUTED=not (use_marlin or use_ma), num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
     # 5. experts
     if use_ma:
-        m = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
-        ext = _moe(T)   # the build their kernel_fn picks for this M, then at most MMAX tokens per launch, as theirs
-        if MOE_HAS_PDL:
-            ext.okc_set_pdl(1 if _pdl(T) else 0)
-        for m0 in range(0, T, _MA_MMAX):      # (their scratch is sized for MMAX: T > 384 would overrun it)
-            m1 = min(T, m0 + _MA_MMAX)
-            ext.okc_run(state["ma_w"], state["ma_scratch"], xm[m0:m1], lids[m0:m1], wts[m0:m1], m[m0:m1], 0, 32,
-                        state["nsm"])     # lids: local expert index, -1 = another GPU's expert
+        m = _ma_run(state, xm, lids, wts, T)   # lids: local expert index, -1 = another GPU's expert
     elif use_marlin:
         m = _marlin_experts(xm, wts, lids, state)
     # 6. unpooler + post-FFN boundary + next layer's norm
