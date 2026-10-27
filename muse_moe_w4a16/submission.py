@@ -522,13 +522,9 @@ __device__ __forceinline__ float sigmoid_tl(float x) { return div_full(1.f, 1.f 
 // on ties; butterfly max over the lanes keeping value desc, index asc; the winner masked to -inf). Writes S.eid (local
 // ids) for this CTA; CTA 0 also writes the global ids and the renormalized weights (read by the final pass of every
 // CTA after the grid barrier).
-__device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, int lo) {
+__device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, int lo, const float4 (&lq)[2], const float (&bv)[8]) {
   const int lane = threadIdx.x & 31;
-  const float4* lg = reinterpret_cast<const float4*>(p.logits + (size_t)t * 256 + lane * 8);
-  const float4* bb = reinterpret_cast<const float4*>(p.rbias + lane * 8);
-  const float4 l0 = __ldg(lg), l1 = __ldg(lg + 1), b0 = __ldg(bb), b1 = __ldg(bb + 1);
-  const float lv[8] = {l0.x, l0.y, l0.z, l0.w, l1.x, l1.y, l1.z, l1.w};
-  const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+  const float lv[8] = {lq[0].x, lq[0].y, lq[0].z, lq[0].w, lq[1].x, lq[1].y, lq[1].z, lq[1].w};
   float sc[8], sel[8];
 #pragma unroll
   for (int k = 0; k < 8; ++k) { sc[k] = sigmoid_tl(lv[k] * 0.1767766952966369f); sel[k] = sc[k] + bv[k]; }
@@ -3738,9 +3734,27 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   }
 #endif
 #if OKC_ROUTE_LOGITS
-  {  // the top-8 selection, one warp per token (every CTA, identical result): S.eid for the routing below
+  {  // the top-8 selection, one warp per token (every CTA, identical result): S.eid for the routing below; the
+     // logits of the warp's next two tokens are kept in flight (L2 latency overlaps the selection)
     const int lo = p.lsp ? __ldg(p.lsp) : p.lo;
-    for (int t = tid >> 5; t < p.M; t += NW) route_select(p, S, t, lo);
+    const int lane = tid & 31, warp = tid >> 5;
+    const float4* bb = reinterpret_cast<const float4*>(p.rbias + lane * 8);
+    const float4 b0 = __ldg(bb), b1 = __ldg(bb + 1);
+    const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+    float4 q0[2], q1[2], q2[2];
+    auto ld = [&](int t, float4 (&q)[2]) {
+      if (t < p.M) {
+        const float4* lg = reinterpret_cast<const float4*>(p.logits + (size_t)t * 256 + lane * 8);
+        q[0] = __ldg(lg); q[1] = __ldg(lg + 1);
+      }
+    };
+    ld(warp, q0);
+    ld(warp + NW, q1);
+    for (int t = warp; t < p.M; t += NW) {
+      ld(t + 2 * NW, q2);
+      route_select(p, S, t, lo, q0, bv);
+      q0[0] = q1[0]; q0[1] = q1[1]; q1[0] = q2[0]; q1[1] = q2[1];
+    }
     CTA_SYNC();
   }
 #endif
