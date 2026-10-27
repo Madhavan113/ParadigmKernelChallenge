@@ -78,7 +78,7 @@ def _bench_stream(state):
     t_empty = timeit(lambda: tiny.fill_(0))
     print(f"BENCH stream (judge protocol; replay fixed cost {t_empty:.1f} us subtracted): us (TB/s)")
     combos = [(4, 16384), (2, 32768), (6, 32768)]
-    for bs in (1, 8):
+    for bs in ():
         x, ids, tw = _judge_inputs(bs, dev, seed=10 + bs)
         experts = sorted(set(int(v) for v in ids[(ids >= 0) & (ids < LOCAL)].flatten().tolist()))
         nt, mw2, ks, ns, ksp = _wt_variant(bs, state)
@@ -139,7 +139,7 @@ def _bench_stream(state):
             rows.append(f"current {_timeit_cold(lambda: _moe_forward_wt(x, ids, tw, 0, 4096, state), dev):6.1f}")
         except Exception as e:
             rows.append(f"current fail {str(e)[:40]}")
-        for v in ((1, 1, 1, 8, 1, 1), (1, 1, 1, 6, 1, 1), (1, 1, 1, 4, 1, 1), (1, 2, 1, 4, 1, 1), (1, 2, 1, 6, 1, 1), (2, 2, 1, 4, 1, 1), (1, 1, 1, 8, 1, 0)):
+        for v in ((1, 1, 1, 2, 1, 4), (1, 1, 1, 3, 1, 4), (1, 1, 1, 4, 1, 2), (1, 1, 1, 3, 1, 2), (1, 2, 1, 2, 1, 4), (1, 2, 1, 3, 1, 2), (2, 2, 1, 2, 1, 4), (1, 1, 1, 8, 1, 1), (1, 1, 1, 8, 1, 0)):
             if bs > 8 * v[0]:
                 continue
             _WT_OVERRIDE = v

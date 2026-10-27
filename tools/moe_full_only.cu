@@ -377,7 +377,7 @@ __host__ __device__ constexpr int wt_stage_bytes(int tpw, int nt) {
     return tpw * WT_NWARPS * 1024 + tpw * WT_NWARPS * 128 + 8 * nt * A_STRIDE * 2;
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, int ABL, bool BULK = false>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, int ABL, bool BULK = false, int CPC = 1>
 __global__ void __launch_bounds__(128 * KS)
 moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                     const int* __restrict__ sorted_tok,
@@ -393,9 +393,11 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     // counters[(y, x)] sums the slices and writes the output (the counter resets itself).
     constexpr int TPW = (GATED ? 2 : 1) * MW;        // m16 weight tiles per warp
     constexpr int TPC = TPW * WT_NWARPS;              // per CTA
-    constexpr int W_STAGE = TPC * 1024;
-    constexpr int S_STAGE = TPC * 128;
-    constexpr int STAGE_BYTES = wt_stage_bytes(TPW, NT);
+    static_assert(BULK || CPC == 1, "CPC > 1 needs the bulk path");
+    constexpr int W_CH = TPC * 1024, S_CH = TPC * 128, X_CH = 8 * NT * A_STRIDE * 2;   // per K chunk
+    constexpr int W_STAGE = CPC * W_CH;                 // a stage holds CPC consecutive chunks: [W x CPC][S x CPC][X x CPC]
+    constexpr int S_STAGE = CPC * S_CH;
+    constexpr int STAGE_BYTES = CPC * wt_stage_bytes(TPW, NT);
     constexpr int NTHR = 128 * KS;
     constexpr int CH = NT == 1 ? 2 : 1;               // accumulator chains per tile (latency)
     extern __shared__ __align__(16) uint8_t wt_smem[];
@@ -414,8 +416,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     const int g = lane >> 2, t = lane & 3;
     const int KSPLIT = SPLITK ? (int)gridDim.z : 1;
     const int NC_ALL = K / KC;
-    const int NC = NC_ALL / KSPLIT;                   // chunks of this CTA
-    const int c0 = SPLITK ? (int)blockIdx.z * NC : 0;
+    const int NC = NC_ALL / KSPLIT / CPC;             // stages (CPC chunks each) of this CTA
+    const int c0 = SPLITK ? (int)blockIdx.z * NC * CPC : 0;
 
     // CTA tile ti (0..TPC-1) -> global m16 tile index
     auto tile_of = [&](int ti) {
@@ -450,8 +452,8 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     const uint32_t smem_base = smem_u32(wt_smem);
     // BULK: the CTA's TPC tiles are one contiguous T KB block per chunk in the grouped layout [e][n_x][chunk][TPC][1 KB]
     // (scales [e][n_x][chunk][TPC][128 B]), in the kernel's own tile order tile_of(ti): one bulk copy each per chunk
-    const uint8_t* wgrp = Wr + (((size_t)e * gridDim.x + blockIdx.x) * NC_ALL + c0) * W_STAGE;
-    const uint8_t* sgrp = Sr + (((size_t)e * gridDim.x + blockIdx.x) * NC_ALL + c0) * S_STAGE;
+    const uint8_t* wgrp = Wr + (((size_t)e * gridDim.x + blockIdx.x) * NC_ALL + c0) * W_CH;
+    const uint8_t* sgrp = Sr + (((size_t)e * gridDim.x + blockIdx.x) * NC_ALL + c0) * S_CH;
     if constexpr (BULK) {
         if (tid == 0) {
             #pragma unroll
@@ -480,13 +482,17 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
             cp_async16(ws + (tid + i * NTHR) * 16, wsrc[i] + c * 1024, 16);
         if (tid < TPC * 8) cp_async16(ss + tid * 16, ssrc + c * 128, 16);
     };
+    // (bulk: wgrp + c * W_STAGE covers the CPC consecutive chunks of stage c in the grouped layout)
     auto issue_x = [&](int c, int stage) {
         const uint32_t xs = smem_base + stage * STAGE_BYTES + W_STAGE + S_STAGE;
         #pragma unroll
-        for (int i = 0; i < XSEG; ++i) {
-            const int sidx = tid + i * NTHR;
-            if (sidx < NT * 128)
-                cp_async16(xs + ((sidx >> 4) * A_STRIDE + (sidx & 15) * 8) * 2, xsrc[i] + c * KC, xbytes[i]);
+        for (int k = 0; k < CPC; ++k) {
+            #pragma unroll
+            for (int i = 0; i < XSEG; ++i) {
+                const int sidx = tid + i * NTHR;
+                if (sidx < NT * 128)
+                    cp_async16(xs + k * X_CH + ((sidx >> 4) * A_STRIDE + (sidx & 15) * 8) * 2, xsrc[i] + (c * CPC + k) * KC, xbytes[i]);
+            }
         }
     };
     auto issue = [&](int c, int stage) { issue_w(c, stage); issue_x(c, stage); };
@@ -534,16 +540,19 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
         if constexpr (BULK) mbar_wait(smem_u32(&wfull[stage]), (uint32_t)((c / NSTAGE) & 1));   // this chunk's weights landed
         stage = stage + 1 == NSTAGE ? 0 : stage + 1;
         stage_n = stage_n + 1 == NSTAGE ? 0 : stage_n + 1;
-        const uint8_t* ss = ws + W_STAGE;
-        const __half* xs = reinterpret_cast<const __half*>(ss + S_STAGE);
         if (ABL == 3) continue;                                      // bench ablation: the cp.async ring only
+        #pragma unroll
+        for (int kc = 0; kc < CPC; ++kc) {
+        const uint8_t* wsk = ws + kc * W_CH;
+        const uint8_t* ss = ws + W_STAGE + kc * S_CH;
+        const __half* xs = reinterpret_cast<const __half*>(ws + W_STAGE + S_STAGE + kc * X_CH);
         #pragma unroll
         for (int hh = 0; hh < 2 / KS; ++hh) {
             const int h = KS == 1 ? hh : gidx;                       // half chunk: k16 steps 4h..4h+3
             uint4 wq[TPW]; uint2 sq[TPW];
             #pragma unroll
             for (int i = 0; i < TPW; ++i) {
-                wq[i] = *reinterpret_cast<const uint4*>(ws + ((warp * TPW + i) * 2 + h) * 512 + lane * 16);
+                wq[i] = *reinterpret_cast<const uint4*>(wsk + ((warp * TPW + i) * 2 + h) * 512 + lane * 16);
                 sq[i] = *reinterpret_cast<const uint2*>(ss + (warp * TPW + i) * 128 + g * 16 + h * 8);
             }
             #pragma unroll
@@ -594,6 +603,7 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
                 }
             }
         }
+        }   // kc
     }
     pdl_trigger();                                    // main loop done: the next kernel may start launching
     cp_async_wait<0>();
@@ -692,17 +702,17 @@ moe_w4a16_wt_kernel(const __half* __restrict__ X, int ldx,
     }
 }
 
-template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, int ABL, bool BULK = false>
+template <bool GATED, int MW, int NT, int KS, int NSTAGE, bool SPLITK, int ABL, bool BULK = false, int CPC = 1>
 void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int* br, const int* bend, const int* nb, const int* bbm,
                const uint8_t* Wr, const uint8_t* Sr, const float* gs, __half* o16, __nv_bfloat16* obf, int ldo,
                float* part, int ldp, int part_rows, int* counters, int ksplit,
                int K, int ntiles, int max_blocks, float gs_mul, bool pdl, bool l2pf, cudaStream_t stream)
 {
     constexpr int TPW = (GATED ? 2 : 1) * MW;
-    constexpr int smem = NSTAGE * wt_stage_bytes(TPW, NT);
+    constexpr int smem = NSTAGE * CPC * wt_stage_bytes(TPW, NT);
     static bool attr_set = false;
     if (!attr_set) {
-        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, ABL, BULK>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
+        cudaFuncSetAttribute(moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, ABL, BULK, CPC>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem);
         attr_set = true;
     }
     const int n_x = (GATED ? ntiles / 2 : ntiles) / (WT_NWARPS * MW);
@@ -716,7 +726,7 @@ void launch_wt(const __half* X, int ldx, const int* st, const int* be, const int
     attr[0].val.programmaticStreamSerializationAllowed = 1;
     cfg.attrs = attr;
     cfg.numAttrs = pdl ? 1 : 0;
-    const cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, ABL, BULK>,
+    const cudaError_t err = cudaLaunchKernelEx(&cfg, moe_w4a16_wt_kernel<GATED, MW, NT, KS, NSTAGE, SPLITK, ABL, BULK, CPC>,
         X, ldx, st, be, br, bend, nb, bbm, Wr, Sr, gs, o16, obf, ldo, part, ldp, part_rows, counters, K, ntiles, gs_mul, (int)l2pf);
     TORCH_CHECK(err == cudaSuccess, "wt launch failed: ", cudaGetErrorString(err));
 }
@@ -989,7 +999,7 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
                   torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor blk_bm, torch::Tensor Wr, torch::Tensor Sr, torch::Tensor gs,
                   torch::Tensor out, torch::Tensor part, torch::Tensor counters, int64_t ksplit, int64_t K, int64_t ntiles,
                   int64_t max_blocks, bool gated, int64_t mw, int64_t nt, int64_t ks, int64_t nstage, double gs_mul, int64_t abl,
-                  bool pdl, bool l2pf, bool bulk)
+                  bool pdl, bool l2pf, int64_t cpc)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     const __half* Xp = reinterpret_cast<const __half*>(X.data_ptr());
@@ -1010,13 +1020,15 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
 #define OKC_W(G, M, T, S, NS, SK, AB) launch_wt<G, M, T, S, NS, SK, AB>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), blk_bm.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
         pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, l2pf, stream)
+    const bool bulk = cpc > 0;
     if (bulk) {
         const int T = (gated ? 2 : 1) * (int)mw * WT_NWARPS;
         TORCH_CHECK((reinterpret_cast<uintptr_t>(Wp) & 127) == 0 && (reinterpret_cast<uintptr_t>(Sp) & 127) == 0 && Wr.is_contiguous() && Sr.is_contiguous(), "wt bulk: layout alignment");
         TORCH_CHECK(Wr.numel() % (T * 1024) == 0 && Sr.numel() % (T * 128) == 0, "wt bulk: grouped layout size");
     }
-    const int key = (bulk ? 100000000 : 0) + (int)abl * 10000000 + (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
-#define OKC_WB(G, M, T, S, NS) launch_wt<G, M, T, S, NS, false, 0, true>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
+    TORCH_CHECK(cpc <= 1 || (K / 128) % cpc == 0, "wt bulk: chunks per copy must divide K / 128");
+    const int key = (int)cpc * 100000000 + (int)abl * 10000000 + (ksplit > 1 ? 1000000 : 0) + (gated ? 100000 : 0) + (int)mw * 10000 + (int)nt * 1000 + (int)ks * 100 + (int)nstage;
+#define OKC_WB(G, M, T, S, NS) launch_wt<G, M, T, S, NS, false, 0, true, 1>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
         blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), blk_bm.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
         pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, l2pf, stream)
     switch (key) {
@@ -1026,6 +1038,18 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
         case 100021104: OKC_WB(false, 2, 1, 1, 4); break;  case 100021106: OKC_WB(false, 2, 1, 1, 6); break;  case 100021108: OKC_WB(false, 2, 1, 1, 8); break;
         case 100012104: OKC_WB(false, 1, 2, 1, 4); break;  case 100022104: OKC_WB(false, 2, 2, 1, 4); break;  case 100022103: OKC_WB(false, 2, 2, 1, 3); break;
         case 100012106: OKC_WB(false, 1, 2, 1, 6); break;
+#define OKC_WC(G, M, T, S, NS, C) launch_wt<G, M, T, S, NS, false, 0, true, C>(Xp, (int)X.stride(0), sorted_tok.data_ptr<int>(), blk_e.data_ptr<int>(), \
+        blk_row0.data_ptr<int>(), blk_end.data_ptr<int>(), nblk.data_ptr<int>(), blk_bm.data_ptr<int>(), Wp, Sp, gs.data_ptr<float>(), o16, obf, ldo, \
+        pp, ldp, prow, cnt, (int)ksplit, (int)K, (int)ntiles, (int)max_blocks, (float)gs_mul, pdl, l2pf, stream)
+        // super-stages: CPC chunks per bulk copy (gated TPC = 8 -> 16 / 32 KB; non-gated mw 1 -> 8 / 16 / 32 KB)
+        case 400111102: OKC_WC(true, 1, 1, 1, 2, 4); break;   case 400111103: OKC_WC(true, 1, 1, 1, 3, 4); break;
+        case 200111104: OKC_WC(true, 1, 1, 1, 4, 2); break;   case 200111103: OKC_WC(true, 1, 1, 1, 3, 2); break;
+        case 400112102: OKC_WC(true, 1, 2, 1, 2, 4); break;   case 200112103: OKC_WC(true, 1, 2, 1, 3, 2); break;
+        case 400011102: OKC_WC(false, 1, 1, 1, 2, 4); break;  case 400011103: OKC_WC(false, 1, 1, 1, 3, 4); break;
+        case 800011102: OKC_WC(false, 1, 1, 1, 2, 8); break;  case 200011104: OKC_WC(false, 1, 1, 1, 4, 2); break;
+        case 400021102: OKC_WC(false, 2, 1, 1, 2, 4); break;  case 400021103: OKC_WC(false, 2, 1, 1, 3, 4); break;
+        case 400012102: OKC_WC(false, 1, 2, 1, 2, 4); break;  case 200012103: OKC_WC(false, 1, 2, 1, 3, 2); break;
+        case 400022102: OKC_WC(false, 2, 2, 1, 2, 4); break;
         case 111102: OKC_W(true, 1, 1, 1, 2, false, 0); break;   case 111104: OKC_W(true, 1, 1, 1, 4, false, 0); break;
         case 111108: OKC_W(true, 1, 1, 1, 8, false, 0); break;
         case 112102: OKC_W(true, 1, 2, 1, 2, false, 0); break;   case 112104: OKC_W(true, 1, 2, 1, 4, false, 0); break;
@@ -1043,6 +1067,7 @@ void moe_w4a16_wt(torch::Tensor X, torch::Tensor sorted_tok, torch::Tensor blk_e
     }
 #undef OKC_W
 #undef OKC_WB
+#undef OKC_WC
 }
 
 void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, torch::Tensor nw, torch::Tensor out,
