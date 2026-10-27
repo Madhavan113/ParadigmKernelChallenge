@@ -4507,7 +4507,8 @@ def _ext(defines=None):
                 src = ALT_SRCS[d[1:]]
         major, minor = torch.cuda.get_device_capability()
         arch = f"{major}{minor}" + ("a" if major == 9 else "")
-        tag = "_".join(d.replace("=", "").replace("-D", "").replace("@", "src").lower() for d in defines) or "main"
+        import hashlib  # short unique name: a ~190-char module name produced a .so without its PyInit symbol
+        tag = hashlib.sha1("_".join(defines).encode()).hexdigest()[:16]
         _EXTS[defines] = load_inline(
             name=f"okc_moe_w4a16_v216x_{tag}_sm{arch}",
             cpp_sources=CPP_SRC,
@@ -4866,9 +4867,18 @@ def _diag(state, weights):
     for d, _ in variants.values():
         if d not in todo and (d + (("-DOKC_DQ7=1",) if DQ7 and "-DOKC_DQ7=1" not in d else ())) not in _EXTS:
             todo.append(d)
+    def _try_ext(d):
+        try:
+            _ext(d)
+        except Exception as ex:
+            print(f"[diag] variant {d} failed to build: {str(ex)[-200:]}", flush=True)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-        list(ex.map(_ext, todo))
+        list(ex.map(_try_ext, todo))
     print(f"[diag] compiled {len(todo)} extra variants in {time.time() - t0:.0f}s", flush=True)
+
+    def _built(d):  # (an unbuilt variant only loses its column)
+        return (d + (("-DOKC_DQ7=1",) if DQ7 and "-DOKC_DQ7=1" not in d else ())) in _EXTS
     for bs in shapes:
         d = _gen_input(bs, DIAG_SEED + bs, dev)
         ids = d["topk_ids"]
@@ -4877,7 +4887,7 @@ def _diag(state, weights):
         torch.cuda.synchronize()
         row = [f"bs={bs:3d} touched={touched:2d}"]
         for name, (defs, vshapes) in variants.items():
-            if bs not in vshapes:
+            if bs not in vshapes or not _built(defs):
                 continue
             try:
                 ext = _ext(defs)
@@ -4899,7 +4909,7 @@ def _diag(state, weights):
                 torch.cuda.synchronize()
         print("[diag] " + "  ".join(row), flush=True)
     # timeline of the debug variants (-DOKC_DEBUG=1): per-CTA %globaltimer stamps, min-max over CTAs
-    for dbgname in [k for k, (v, _) in variants.items() if "-DOKC_DEBUG=1" in v]:
+    for dbgname in [k for k, (v, _) in variants.items() if "-DOKC_DEBUG=1" in v and _built(v)]:
         defs, vshapes = variants[dbgname]
         ext = _ext(defs)
         G = state["grid"]
