@@ -1956,7 +1956,7 @@ __device__ __forceinline__ void mma16816_nv(float* c, uint32_t a0, uint32_t a1, 
 }
 __host__ __device__ constexpr int w12m_stage_bytes(int mw, int nt) { return W12M_WARPS * mw * W12_TILE_BYTES + 8 * nt * W12_XSTRIDE * 2; }
 
-template <int MW, int NT, int NSTAGE>
+template <int MW, int NT, int NSTAGE, int MODE = 0>
 __global__ void __launch_bounds__(256, 1)
 w12m_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* __restrict__ W, int eb,
             float* __restrict__ part, int N, int K)
@@ -2026,6 +2026,10 @@ w12m_kernel(const __nv_bfloat16* __restrict__ X, int ldx, int m, const uint8_t* 
         stage = stage + 1 == NSTAGE ? 0 : stage + 1;
         stage_n = stage_n + 1 == NSTAGE ? 0 : stage_n + 1;
         const uint32_t xb = smem_u32(xs) + ((lane & 7) * W12_XSTRIDE + (lane >> 3) * 8) * 2;
+        if constexpr (MODE == 1) {                                        // bench ablation: the cp.async ring only
+            if (lane == 0) acc[0][0][0] += __uint_as_float(*reinterpret_cast<const uint32_t*>(ws + warp * 16) & 0x007FFFFFu);
+            continue;
+        }
         #pragma unroll
         for (int h = 0; h < 2; ++h) {                                     // k16 steps 4h..4h+3
             uint4 lo[MW][2], nbw[MW];
@@ -2107,13 +2111,13 @@ w12m_reduce_kernel(const float* __restrict__ part, int KSPLIT, int m, int N,
     *reinterpret_cast<__nv_bfloat162*>(out + (size_t)i * ldo + n0) = __floats2bfloat162_rn(sx, sy);
 }
 
-template <int MW, int NT, int NSTAGE>
+template <int MW, int NT, int NSTAGE, int MODE = 0>
 void launch_w12m(const __nv_bfloat16* X, int ldx, int m, const uint8_t* W, int eb, float* part, int N, int K, int sk, cudaStream_t stream)
 {
     constexpr int smem = NSTAGE * w12m_stage_bytes(MW, NT);
     static bool attr = false;
-    if (!attr) { cudaFuncSetAttribute(w12m_kernel<MW, NT, NSTAGE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
-    w12m_kernel<MW, NT, NSTAGE><<<dim3(N / (128 * MW), sk), 256, smem, stream>>>(X, ldx, m, W, eb, part, N, K);
+    if (!attr) { cudaFuncSetAttribute(w12m_kernel<MW, NT, NSTAGE, MODE>, cudaFuncAttributeMaxDynamicSharedMemorySize, smem); attr = true; }
+    w12m_kernel<MW, NT, NSTAGE, MODE><<<dim3(N / (128 * MW), sk), 256, smem, stream>>>(X, ldx, m, W, eb, part, N, K);
 }
 
 } // namespace
@@ -2446,7 +2450,7 @@ void w12b(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, t
 }
 
 void w12m(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,
-          torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl)
+          torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl, int64_t mode)
 {
     auto stream = at::cuda::getCurrentCUDAStream();
     TORCH_CHECK(n % (128 * mw) == 0 && k % 128 == 0 && (k / 128) % sk == 0 && (k / 128) / sk >= 1 && m <= 8 * nt && m >= 1, "w12m: shape/config mismatch");
@@ -2460,12 +2464,17 @@ void w12m(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_roff, 
     const int ldx = (int)X.stride(0), ldo = (int)out.stride(0);
 #define OKC_W12M(MWv, NTv, NS) launch_w12m<MWv, NTv, NS>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream)
     const int key = (int)mw * 1000 + (int)nt * 10 + (int)nstage;
+    if (mode == 1) {   // bench ablation: loads only (1/16/3)
+        launch_w12m<1, 16, 3, 1>(Xp, ldx, (int)m, Wp, (int)eb, pp, (int)n, (int)k, (int)sk, stream);
+    } else {
     switch (key) {
         case 1163: OKC_W12M(1, 16, 3); break;   case 1162: OKC_W12M(1, 16, 2); break;
         case 2162: OKC_W12M(2, 16, 2); break;   case 1322: OKC_W12M(1, 32, 2); break;
         default: TORCH_CHECK(false, "unsupported w12m config (mw, nt, nstage)");
     }
+    }
 #undef OKC_W12M
+    if (mode == 2) return;   // bench ablation: GEMM only (no reduce launch; output not written)
     cudaLaunchConfig_t cfg = {};
     cfg.gridDim = dim3((unsigned)((n / 2 + 255) / 256), (unsigned)m);
     cfg.blockDim = dim3(256);
@@ -2499,7 +2508,7 @@ void w12(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, to
 void w12b(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_off, torch::Tensor esc_n, torch::Tensor esc_k, torch::Tensor esc_d,
           torch::Tensor out, int64_t m, int64_t n, int64_t k, int64_t nt, int64_t warps, int64_t nst);
 void w12m(torch::Tensor X, torch::Tensor W, int64_t eb, torch::Tensor esc_roff, torch::Tensor esc_k, torch::Tensor esc_d,
-          torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl);
+          torch::Tensor out, torch::Tensor part, int64_t m, int64_t n, int64_t k, int64_t mw, int64_t nt, int64_t nstage, int64_t sk, bool pdl, int64_t mode);
 """
 
 _EXT = None
@@ -3007,7 +3016,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
         if pk is None or w12 is None:
             return torch.matmul(x, w.t(), out=out)
         build().w12m(x, w12, pk["eb"], pk["esc_roff"], pk["esc_k"], pk["esc_delta"], out, state["partials"],
-                     m, n, k, cfg["mw"], cfg["nt"], cfg["nstage"], cfg["sk"], True)
+                     m, n, k, cfg["mw"], cfg["nt"], cfg["nstage"], cfg["sk"], True, cfg.get("mode", 0))
         return out
     if cfg.get("w12b"):
         pk = state.get(layer + "_p12")
@@ -3218,22 +3227,19 @@ def _bench(state):
     print("BENCH proj, judge protocol (us per replay minus fixed cost; '!' = rel err above tol)")
     if ext is not None:
         print("BENCH m=128/256 12-bit GEMM w12m (mw/nt/nstage/sk) vs the current path (cuBLAS / bmm split-K)")
+        # ablations of the 1/16/3 variant: mode 1 = cp.async ring only (no compute), mode 2 = GEMM without the reduce launch
         plan = [
-            (128, "pooler", 4096, [(1, 16, 3, 4), (1, 16, 3, 8), (1, 16, 2, 4), (2, 16, 2, 8), (2, 16, 2, 4)]),
-            (128, "qkv_gate", 2304, [(1, 16, 3, 8), (1, 16, 3, 4), (1, 16, 2, 8), (2, 16, 2, 8)]),
-            (128, "unpooler", 8192, [(1, 16, 3, 2), (1, 16, 3, 4), (1, 16, 2, 2), (2, 16, 2, 4), (2, 16, 2, 2)]),
-            (128, "o", 8192, [(1, 16, 3, 1), (1, 16, 3, 2), (1, 16, 2, 2), (2, 16, 2, 2), (2, 16, 2, 1)]),
-            (256, "pooler", 4096, [(1, 32, 2, 4), (1, 32, 2, 8), (1, 32, 2, 2)]),
-            (256, "qkv_gate", 2304, [(1, 32, 2, 8), (1, 32, 2, 4)]),
-            (256, "unpooler", 8192, [(1, 32, 2, 2), (1, 32, 2, 4)]),
-            (256, "o", 8192, [(1, 32, 2, 1), (1, 32, 2, 2)]),
+            (128, "pooler", 4096, [(1, 16, 3, 4, 0), (1, 16, 3, 4, 1), (1, 16, 3, 4, 2), (1, 16, 3, 8, 1), (1, 16, 3, 2, 1), (1, 16, 3, 2, 0)]),
+            (128, "qkv_gate", 2304, [(1, 16, 3, 4, 0), (1, 16, 3, 4, 1), (1, 16, 3, 4, 2), (1, 16, 3, 8, 1)]),
+            (128, "o", 8192, [(1, 16, 3, 2, 0), (1, 16, 3, 2, 1), (1, 16, 3, 2, 2), (1, 16, 3, 1, 1)]),
+            (128, "unpooler", 8192, [(1, 16, 3, 2, 0), (1, 16, 3, 2, 1), (1, 16, 3, 2, 2)]),
         ]
         for m, layer, n, cands in plan:
             if not budget():
                 break
             parts = [row("current", layer, m, n, None)]
-            for mw, nt, ns, sk in cands:
-                parts.append(row(f"w12m {mw}/{nt}/{ns}/{sk}", layer, m, n, dict(w12m=True, mw=mw, nt=nt, nstage=ns, sk=sk)))
+            for mw, nt, ns, sk, mode in cands:
+                parts.append(row(f"w12m {mw}/{nt}/{ns}/{sk} mode{mode}", layer, m, n, dict(w12m=True, mw=mw, nt=nt, nstage=ns, sk=sk, mode=mode)))
             print(f"  m={m} {layer:9s} n={n}: " + " | ".join(parts))
     _OVERRIDE = None
     print(f"BENCH proj done in {time.time() - t0:.0f}s")
