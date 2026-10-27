@@ -200,3 +200,21 @@ pr candidates must include their routing kernel). (3) At T=128/256 the o project
 (15.7+3.2 / 23.7 us) in the layer even as bf16 F.linear, while the proj module's isolated timing of the same call is
 10.6 / 12.5 us: unexplained, worth a dedicated look. (4) MoE and attention kernel times move 5-20 us run to run on
 identical code: judge component changes by their kernel rows, never by the geomean.
+
+## 7. Follow-up: the T = 128/256 dense GEMMs (job ba80dfcdbc2c48ee, 2.0963x, 13/13; commit fa2fc10)
+
+The "o projection runs a 19-24 us split-K kernel" in section 6 was a misattribution: at T = 128 the judge profile's
+`splitK` kernel (15.4 + 3.2 us) is the qkv GEMM (N = 2304 = 24 tiles of 96 x 64, K = 8192: cuBLAS splits K to fill the
+GPU); o and the unpooler share the `128x64` kernel (29 us for both = ~10.6 + ~19), exactly the proj module's isolated
+timings. The tuner's DIAG (every candidate's graph time per matrix, judge .log `T128/.../T256/...` lines):
+
+| T | qkv (floor 7.9/7.9) | o (3.5) | pooler+router cat (15.7) | unpooler (14) |
+|---|---|---|---|---|
+| 128 | Triton 20.8, cuBLAS fp32 20.5, bf16 20.6, K-major 20.4, proj-gq 20.3 | 11.4 / 11.4 / 10.9 / 10.8 / 11.6 | 32.2 / 32.2 / K-major 33.1 / proj pool+router 41.2 | 23.6 / 23.4 / 23.4 / 22.1 / 23.3 |
+| 256 | 23.7 / 23.3 / 23.1 / 24.2 / 23.0 | 13.6 / 13.7 / 12.8 / 12.7 / 12.7 | 39.2 / 38.6 / 43.3 / 50.8 | 29.6 / 29.5 / 27.8 / 28.2 / 27.6 |
+
+Every candidate is within ~1 us of cuBLAS on every matrix; hypotheses (a) workspace/heuristics, (b) input layout,
+(c) PDL neighbours are moot (no discrepancy exists); (d) the proj module's m >= 33 routes gain <= 1 us. The judged
+T > 32 shapes are unchanged within noise (verify-16 255.3/345.1, verify-32 322.1/490.5). The remaining headroom there
+is cuBLAS vs the bandwidth floor (qkv 20 vs 7.9 us, pr 32 vs 15.7, un 22 vs 14, o 11 vs 3.5: ~45 us per verify-16
+shape, ~55 per verify-32), which needs a custom skinny-M (M = 128/256) GEMM, not a dispatch change.
