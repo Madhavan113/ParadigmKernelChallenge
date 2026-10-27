@@ -1104,7 +1104,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       bulk_g2s(sbase + st * SST + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * st);
     }
     if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
-    if (!(dgv & 4))
+    if (!(dgv & 4) && !(FUSE && b_hout != nullptr))   // (with the boundary prologue the x boxes follow it, below)
       for (int st = 0; st < P; ++st) tma_load_3d(sbase + st * SST, &xmap, full0 + 8 * st, 0, 0, (gs0 + st) * UPS);
     if (COMP) {   // this CTA's escape table
       if constexpr (CL == 1) {
@@ -1131,6 +1131,89 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   // ranks > 0 send into it) is only arrived at here and waited on right before the remote stores
   __syncthreads();
   if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");   // every thread: x and the outputs are ours from here
+  if constexpr (FUSE) {
+    if (b_hout != nullptr) {
+      // ---- boundary-1 prologue (decode layer, M <= 8; used at M = 1): this launch's x is the layer's h, which does
+      // not exist yet. Every CTA computes it redundantly (bit-identical values, same fixed reduction order) from the
+      // o-projection output a (b_gp slot, bf16 [M, 8192]) and the input stream s (b_sin, fp32):
+      //   r  = rsqrt(mean(a^2) + 1e-8);  s1 = alpha s + beta (a r)         (alpha/beta: the residual gate, fp32)
+      //   h  = s1 rsqrt(mean(s1^2) + 1e-5) (1 + gw)   -> bf16 into the x buffer (b_hout); CTA 0 also stores s1 (b_sout)
+      // with sum(s1^2) = A + 2 r B + r^2 D from the one-pass partials C = sum a^2, A = sum alpha^2 s^2,
+      // B = sum alpha beta s a, D = sum beta^2 a^2 (one CTA-wide reduction). The weight ring (P stages) is already
+      // streaming; the x boxes are issued after the fence below. NC threads x 32 columns = the 8192-wide row.
+      static_assert(NC * 32 == 8192, "sk2 boundary prologue: 256 consumer threads x 32 columns");
+      __shared__ float s_bred[16][4];
+      const int c0 = tid * 32;
+      for (int tt = 0; tt < M; ++tt) {
+        float a[32], s[32], al[32], be[32];
+        if (tid < NC) {
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const uint4 av = __ldcg(reinterpret_cast<const uint4*>(b_gp + (size_t)tt * 8192 + c0 + 8 * i));
+            const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&av);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const float2 f = __bfloat1622float2(a2[j]); a[8 * i + 2 * j] = f.x; a[8 * i + 2 * j + 1] = f.y; }
+          }
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const float4 sv = __ldg(reinterpret_cast<const float4*>(b_sin + (size_t)tt * 8192 + c0 + 4 * i));
+            const float4 lv = __ldg(reinterpret_cast<const float4*>(b_alpha + c0 + 4 * i));
+            const float4 bv = __ldg(reinterpret_cast<const float4*>(b_beta + c0 + 4 * i));
+            s[4 * i] = sv.x; s[4 * i + 1] = sv.y; s[4 * i + 2] = sv.z; s[4 * i + 3] = sv.w;
+            al[4 * i] = lv.x; al[4 * i + 1] = lv.y; al[4 * i + 2] = lv.z; al[4 * i + 3] = lv.w;
+            be[4 * i] = bv.x; be[4 * i + 1] = bv.y; be[4 * i + 2] = bv.z; be[4 * i + 3] = bv.w;
+          }
+        }
+        float pC = 0.f, pA = 0.f, pB = 0.f, pD = 0.f;
+        if (tid < NC) {
+#pragma unroll
+          for (int j = 0; j < 32; ++j) {
+            const float as_ = al[j] * s[j], ba_ = be[j] * a[j];
+            pC += a[j] * a[j]; pA += as_ * as_; pB += as_ * ba_; pD += ba_ * ba_;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          pC += __shfl_xor_sync(0xffffffffu, pC, off); pA += __shfl_xor_sync(0xffffffffu, pA, off);
+          pB += __shfl_xor_sync(0xffffffffu, pB, off); pD += __shfl_xor_sync(0xffffffffu, pD, off);
+        }
+        if (lane == 0 && warp < NW) { s_bred[warp][0] = pC; s_bred[warp][1] = pA; s_bred[warp][2] = pB; s_bred[warp][3] = pD; }
+        __syncthreads();
+        float C = 0.f, A = 0.f, B = 0.f, D = 0.f;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) { C += s_bred[w][0]; A += s_bred[w][1]; B += s_bred[w][2]; D += s_bred[w][3]; }
+        __syncthreads();   // s_bred is reused by the next row
+        const float r = rsqrtf(C * (1.f / 8192.f) + 1e-8f);
+        const float r2 = rsqrtf((A + 2.f * r * B + r * r * D) * (1.f / 8192.f) + 1e-5f);
+        if (tid < NC) {
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const uint4 gv = __ldg(reinterpret_cast<const uint4*>(b_gn + c0 + 8 * i));
+            const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gv);
+            uint4 hv;
+            __nv_bfloat162* h2 = reinterpret_cast<__nv_bfloat162*>(&hv);
+            float s1v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s1v[j] = al[8 * i + j] * s[8 * i + j] + be[8 * i + j] * (a[8 * i + j] * r);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              const float2 g = __bfloat1622float2(g2[j]);
+              h2[j] = __floats2bfloat162_rn(s1v[2 * j] * r2 * (1.f + g.x), s1v[2 * j + 1] * r2 * (1.f + g.y));
+            }
+            *reinterpret_cast<uint4*>(b_hout + (size_t)tt * 8192 + c0 + 8 * i) = hv;
+            if (blockIdx.x == 0) {
+              *reinterpret_cast<float4*>(b_sout + (size_t)tt * 8192 + c0 + 8 * i) = make_float4(s1v[0], s1v[1], s1v[2], s1v[3]);
+              *reinterpret_cast<float4*>(b_sout + (size_t)tt * 8192 + c0 + 8 * i + 4) = make_float4(s1v[4], s1v[5], s1v[6], s1v[7]);
+            }
+          }
+        }
+      }
+      asm volatile("fence.proxy.async.global;" ::: "memory");   // h (generic-proxy stores) -> visible to the TMA (async proxy)
+      __syncthreads();
+      if (tid == 0 && !(dgv & 4))   // the x boxes of the first P stages (their barriers already expect XBYr + WBY bytes)
+        for (int st = 0; st < P; ++st) tma_load_3d(sbase + st * SST, &xmap, full0 + 8 * st, 0, 0, (gs0 + st) * UPS);
+    }
+  }
   if constexpr (CL > 1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");   // inits fenced above
 
   if (warp == NW) {
@@ -1817,7 +1900,9 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
 void sk2f(at::Tensor Ws, at::Tensor Wsr, at::Tensor x, at::Tensor out, at::Tensor outr, at::Tensor ptab, int64_t pmax,
           int64_t base4, at::Tensor part, at::Tensor rcnt, int64_t M, int64_t tokr, at::Tensor rbias, at::Tensor gpre,
           at::Tensor rids, at::Tensor rlids, at::Tensor rwts, at::Tensor xm, at::Tensor rls, at::Tensor part2,
-          at::Tensor dcnt, int64_t fuse_route) {
+          at::Tensor dcnt, int64_t fuse_route, at::Tensor ba, at::Tensor bs, at::Tensor b1a, at::Tensor b1b,
+          at::Tensor b1g, at::Tensor b1s, int64_t fuse_bnd1) {
+  TORCH_CHECK(!fuse_bnd1 || M <= 8, "sk2f: the boundary prologue needs M <= 8");
   @@SK2F_DISPATCH@@
   TORCH_CHECK(false, "sk2f: no config");
 }
@@ -2211,7 +2296,8 @@ void sk2(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor pta
 void sk2f(torch::Tensor Ws, torch::Tensor Wsr, torch::Tensor x, torch::Tensor out, torch::Tensor outr, torch::Tensor ptab,
           int64_t pmax, int64_t base4, torch::Tensor part, torch::Tensor rcnt, int64_t M, int64_t tokr, torch::Tensor rbias,
           torch::Tensor gpre, torch::Tensor rids, torch::Tensor rlids, torch::Tensor rwts, torch::Tensor xm, torch::Tensor rls,
-          torch::Tensor part2, torch::Tensor dcnt, int64_t fuse_route);
+          torch::Tensor part2, torch::Tensor dcnt, int64_t fuse_route, torch::Tensor ba, torch::Tensor bs, torch::Tensor b1a,
+          torch::Tensor b1b, torch::Tensor b1g, torch::Tensor b1s, int64_t fuse_bnd1);
 void sk2b(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor ptab, int64_t pmax, int64_t base4, int64_t M,
           int64_t N, int64_t K, int64_t cfg, int64_t tokr, torch::Tensor alpha, torch::Tensor beta, torch::Tensor sin_,
           torch::Tensor gp, torch::Tensor gn, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
@@ -2918,7 +3004,8 @@ def _sk2_src(sm90):
                 'int64_t, int64_t, int64_t, at::Tensor) { TORCH_CHECK(false, "sk2 needs sm_90"); }\n'
                 'void sk2f(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, '
                 'at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
-                'at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
+                'at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
+                'at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
                 'void sk2b(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, '
                 'int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
                 'at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2b needs sm_90"); }\n'
@@ -2952,7 +3039,15 @@ def _sk2_src(sm90):
                           f"fuse_route ? rwts.data_ptr<float>() : nullptr, "
                           f"fuse_route ? reinterpret_cast<__nv_bfloat16*>(xm.data_ptr()) : nullptr, "
                           f"fuse_route ? rls.data_ptr<int>() : nullptr, fuse_route ? part2.data_ptr<float>() : nullptr, "
-                          f"fuse_route ? dcnt.data_ptr<int>() : nullptr); return; }}")
+                          f"fuse_route ? dcnt.data_ptr<int>() : nullptr, "
+                          # boundary-1 prologue through the b_* slots: alpha, beta, stream (b_sin), a (b_gp), 1+gw source (b_gn),
+                          # s1 out (b_sout), h = this launch's x buffer (b_hout); no b_part / b_cnt
+                          f"fuse_bnd1 ? b1a.data_ptr<float>() : nullptr, fuse_bnd1 ? b1b.data_ptr<float>() : nullptr, "
+                          f"fuse_bnd1 ? bs.data_ptr<float>() : nullptr, "
+                          f"fuse_bnd1 ? reinterpret_cast<const __nv_bfloat16*>(ba.data_ptr()) : nullptr, "
+                          f"fuse_bnd1 ? reinterpret_cast<const __nv_bfloat16*>(b1g.data_ptr()) : nullptr, "
+                          f"fuse_bnd1 ? b1s.data_ptr<float>() : nullptr, "
+                          f"fuse_bnd1 ? reinterpret_cast<__nv_bfloat16*>(x.data_ptr()) : nullptr, nullptr, nullptr); return; }}")
     blines = []   # boundary tails: the o projection and the unpooler slice at tokr 8 (M <= 8), bf16 out, CL == 1
     for ci, cfg in enumerate(SK2_CONFIGS):
         name, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
@@ -3120,7 +3215,7 @@ def run_sk2_tail(x, layer, m, n, k, state, tail):
     return out
 
 
-def fused_pooler_router(x, state, route=None):
+def fused_pooler_router(x, state, route=None, bnd1=None):
     """Pooler and router of one decode step in ONE launch (m <= 32, sm_90): x [m, 8192] bf16 ->
     (pooler [m, 4096] bf16, router [m, 256] fp32). Same numerics as the separate sk2 kernels: 12-bit lossless pooler
     weights with exact escape corrections, router as BF16 hi + lo with FP32 accumulation (quarter-K partials added in
@@ -3147,8 +3242,18 @@ def fused_pooler_router(x, state, route=None):
         rbias = gpre = rids = rlids = rwts = xm = rls = d
     else:
         rbias, gpre, rids, rlids, rwts, xm, rls = route
+    # bnd1 = (a bf16 [m, 8192]: the o-projection output, s fp32 [m, 8192]: the input stream, alpha fp32 [8192],
+    # beta fp32 [8192], gw bf16 [8192]: the pre-FFN norm weight, s1_out fp32 [m, 8192]): the launch computes its own
+    # x = h = rmsnorm(alpha s + beta rmsnorm(a)) (1 + gw) into x (an empty buffer) in its prologue (m <= 8) and CTA 0
+    # stores s1; the decode layer's _boundary1 without a launch
+    if bnd1 is None:
+        ba = bs = b1a = b1b = b1g = b1s = d
+    else:
+        ba, bs, b1a, b1b, b1g, b1s = bnd1
+        assert m <= 8 and ba.dtype == torch.bfloat16 and bs.dtype == torch.float32 and b1g.dtype == torch.bfloat16
     ext.sk2f(stream, rstream, x, out, outr, tab, pmax, b4, state["fused_part"], state["fused_cnt"], m, _sk2_tokr(m),
-             rbias, gpre, rids, rlids, rwts, xm, rls, state["fused_part2"], state["fused_dcnt"], 0 if route is None else 1)
+             rbias, gpre, rids, rlids, rwts, xm, rls, state["fused_part2"], state["fused_dcnt"], 0 if route is None else 1,
+             ba, bs, b1a, b1b, b1g, b1s, 0 if bnd1 is None else 1)
     return out, outr
 
 

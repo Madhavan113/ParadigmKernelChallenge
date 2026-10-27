@@ -171,6 +171,9 @@ namespace {
 #ifndef OKC_WSMINB
 #define OKC_WSMINB 2
 #endif
+#ifndef OKC_WSMINB1
+#define OKC_WSMINB1 OKC_WSMINB   // q_len 1 flat kernel: CTAs per SM the registers must allow (3: 396-CTA grids)
+#endif
 #ifndef OKC_SETMAXNREG
 #define OKC_SETMAXNREG 1
 #endif
@@ -188,6 +191,27 @@ namespace {
 #endif
 #ifndef OKC_XNOWAIT
 #define OKC_XNOWAIT 0   // (probe) per-request loop: no wait for the tile's copies (garbage), the compute-bound tile time
+#endif
+#ifndef OKC_XNOWAITF
+#define OKC_XNOWAITF 0  // (probe) flat producers issue no K/V copies (stale data): the consumer-bound tile time
+#endif
+#ifndef OKC_CPHINT
+#define OKC_CPHINT 0    // flat producer: K/V copies with an L2 evict_first cache hint (the rows are read once)
+#endif
+#ifndef OKC_EXH8F
+#define OKC_EXH8F 0     // flat q8 (PK2 path): the softmax exponentials as f16x2 pairs (half the MUFU ops; the P bytes are e4m3
+                        // anyway); the lazy-offset byte test, the split PV and the late sync are unchanged
+#endif
+#ifndef OKC_PFL2
+#define OKC_PFL2 0      // flat q1 producer (page indices by TMA): prefetch.global.L2 of the K/V rows OKC_PFL2 tiles ahead of
+                        // the copies (more rows in flight without more stages); 0 = off
+#endif
+#ifndef OKC_PIPE8
+#define OKC_PIPE8 0     // flat q8: the next tile's stage wait + QK^T wgmma issued right after this tile's PV wgmma (both in
+                        // flight across the loop edge: the QK^T latency and the PV end-of-tile wait leave the chain)
+#endif
+#ifndef OKC_FLATONLY
+#define OKC_FLATONLY 0  // bench builds: only the flat kernels carry code (the per-request instances return at once)
 #endif
 #ifndef OKC_FENCEAR
 #define OKC_FENCEAR 0   // merge / barrier fences as fence.acq_rel.gpu instead of fence.sc.gpu
@@ -616,7 +640,7 @@ struct Cfg {
   static constexpr bool WS = F && OKC_SM90 && OKC_WS && (L == 1 || OKC_WS8);
   static constexpr int NP = WS ? ((L == 1) ? OKC_NP : OKC_NP8) : 0;   // producer threads
   static constexpr int NTX = NT + NP;                     // threads per CTA
-  static constexpr int MINB = WS ? (F2 ? 1 : OKC_WSMINB) : (S2 ? 1 : 2);   // CTAs per SM the registers must allow
+  static constexpr int MINB = WS ? (F2 ? 1 : (L == 1 ? OKC_WSMINB1 : OKC_WSMINB)) : (S2 ? 1 : 2);   // CTAs per SM the registers must allow
   // setmaxnreg split of the CTA's registers (launch: 65536 / (MINB * NTX), rounded down to 8)
   static constexpr int BASEREGS = (65536 / (MINB * NTX)) / 8 * 8 > 255 ? 248 : (65536 / (MINB * NTX)) / 8 * 8;
   static constexpr int PREGS = OKC_PREGS > 0 ? OKC_PREGS : ((L == 1 && NP <= 128) ? 56 : 32);
@@ -678,6 +702,15 @@ __device__ __forceinline__ uint32_t smem_u32(const void* p) {
 }
 __device__ __forceinline__ void cp_async16(uint32_t dst, const void* src, int src_bytes) {
   asm volatile("cp.async.cg.shared.global [%0], [%1], 16, %2;\n" ::"r"(dst), "l"(src), "r"(src_bytes));
+}
+// (OKC_CPHINT) the same with an L2 cache policy (createpolicy)
+__device__ __forceinline__ void cp_async16_hint(uint32_t dst, const void* src, int src_bytes, uint64_t pol) {
+  asm volatile("cp.async.cg.shared.global.L2::cache_hint [%0], [%1], 16, %2, %3;\n" ::"r"(dst), "l"(src), "r"(src_bytes), "l"(pol));
+}
+__device__ __forceinline__ uint64_t l2_evict_first_policy() {
+  uint64_t pol;
+  asm volatile("createpolicy.fractional.L2::evict_first.b64 %0, 1.0;\n" : "=l"(pol));
+  return pol;
 }
 __device__ __forceinline__ void cp_async16_pred(uint32_t dst, const void* src, int src_bytes, bool pred) {
   // predicated copy (no branch): pred = 0 issues nothing, src_bytes = 0 zero-fills
@@ -1085,6 +1118,12 @@ __device__ __forceinline__ uint32_t ex2_e4m3x4_h(float x0, float x1, float x2, f
   asm("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(hi) : "r"(eb));
   return (uint32_t)lo | ((uint32_t)hi << 16);
 }
+// (OKC_EXH8F) four exponentials packed to e4m3: f16x2 pairs or fp32 (the PK2 pack)
+#if OKC_EXH8F
+#define PKX(a, b, c, d) ex2_e4m3x4_h(a, b, c, d)
+#else
+#define PKX(a, b, c, d) e4m3x4f(ex2(a), ex2(b), ex2(c), ex2(d))
+#endif
 // sigmoid for the output gate: 0.5 + 0.5 tanh(x / 2) with the hardware tanh (3 instructions; abs error ~2^-12,
 // below the BF16 output's rounding) or exp + fast reciprocal
 __device__ __forceinline__ float sigm(float x) {
@@ -1849,6 +1888,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       const bool pfast = OKC_OFF32 && p.off32 && p.lp == 0;
       const uint32_t pcol = (uint32_t)(pair * 128 + ch * 16);
       const uint32_t pso = r0 * ROWB + ((ch ^ (r0 & 7)) << 4);
+      const uint64_t cpol = OKC_CPHINT ? l2_evict_first_policy() : 0ull;
 #endif
       // OKC_TMAPG: page indices by TMA (q_len 1 flat only: f16 -2.4%, f32 -1.7%; the q_len 8 flat kernel lost ~0.7%)
       constexpr bool TMAPG_ON = OKC_TMAPG && (L == 1 || OKC_TMAPG8);
@@ -1965,6 +2005,20 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         if constexpr (TMAPG_ON) {
           fetch_pages(x + PD);
           load_pages_t(x, pg);
+#if OKC_PFL2 > 0 && OKC_PFAST
+          // (OKC_PFL2) the rows of tile x + OKC_PFL2 toward L2 (its page indices landed PD - OKC_PFL2 tiles ago); one
+          // lane per row, common tiles only
+          if (OKC_PFL2 < PD && pfast && ch == 0 && x + OKC_PFL2 < ntiles && start + (x + OKC_PFL2) * TILE + TILE <= cache_end) {
+            int pgf[PK];
+            load_pages_t(x + OKC_PFL2, pgf);
+#pragma unroll
+            for (int k = 0; k < PK; ++k) {
+              const uint32_t off = ((uint32_t)pgf[k] << p.lrb) + pcol;
+              asm volatile("prefetch.global.L2 [%0];" ::"l"(p.k_cache + off));
+              asm volatile("prefetch.global.L2 [%0];" ::"l"(p.v_cache + off));
+            }
+          }
+#endif
         } else {
           load_pages(x + 1, pgn);   // in flight while this tile's copies issue
         }
@@ -1973,6 +2027,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         PROF_MARK(0);
         if (x == 0 && q == 0) FPRO_STAMP(46);
         const uint32_t kb = smem_u32(S.k + st * STAGE_BYTES), vb = smem_u32(S.v + st * STAGE_BYTES);
+        if constexpr (!OKC_XNOWAITF) {   // (OKC_XNOWAITF probe: no copies, the stage barrier completes at once)
 #if OKC_PFAST
         // common tiles (every row cached, page size 1, caches below 4 GB): one shift-add per row, no per-row
         // branches (the producer's instructions take issue slots from the consumers on the same SMSPs)
@@ -1980,8 +2035,13 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
           for (int k = 0; k < PK; ++k) {
             const uint32_t off = ((uint32_t)pg[k] << p.lrb) + pcol;
-            cp_async16(kb + pso + k * (PR * ROWB), p.k_cache + off, 16);
-            cp_async16(vb + pso + k * (PR * ROWB), p.v_cache + off, 16);
+            if constexpr (OKC_CPHINT) {
+              cp_async16_hint(kb + pso + k * (PR * ROWB), p.k_cache + off, 16, cpol);
+              cp_async16_hint(vb + pso + k * (PR * ROWB), p.v_cache + off, 16, cpol);
+            } else {
+              cp_async16(kb + pso + k * (PR * ROWB), p.k_cache + off, 16);
+              cp_async16(vb + pso + k * (PR * ROWB), p.v_cache + off, 16);
+            }
           }
         } else
 #endif
@@ -2007,6 +2067,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
             cp_async16_zero(kb + so, p.k_cache);
             cp_async16_zero(vb + so, p.v_cache);
           }
+        }
         }
         cp_async_mbar_arrive(&S.full[st]);
         if (x == 0 && q == 0) FPRO_STAMP(43);
@@ -2688,7 +2749,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     }
 
 #if OKC_NOCOMPUTE
-    if constexpr (WS) { __syncwarp(); if (lane == 0) mbar_arrive(&S.empty[(tb + i) % STAGES]); }
+    if constexpr (WS) { __syncwarp(); if (OKC_XP_ARRALL || lane == 0) mbar_arrive(&S.empty[(tb + i) % STAGES]); }
     continue;
 #endif
     const uint8_t* K = S.k + ((tb + i) % STAGES) * STAGE_BYTES;
@@ -2959,6 +3020,37 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     i_cur = S.nxt[wgi][0];
   }
   const int nit = S2 ? ((ntiles + 1) >> 1) : (F2 ? 0x7fffffff : ntiles);
+  // OKC_PIPE8 (flat producer mode, FP8 PV, loop-carried addressing): tile i+1's stage wait and QK^T go out right after
+  // tile i's PV; the scores live across the loop edge, so they are declared outside the loop in that build only
+  constexpr bool PIPE8 = OKC_PIPE8 && WS && FLAT && ADDR && PV8 && OKC_QSS && OKC_RARE && PVSPLIT && OKC_PVSPLIT == 1 &&
+                         LSYNC && !PTR && !F2 && !S2 && !OKC_PROF && !OKC_TURN && !OKC_NOCOMPUTE && OKC_WGDEC;
+  float s_outer[PIPE8 ? 32 : 1];
+  auto issue_qk = [&](int st_) {   // (PIPE8) the QK^T wgmmas of the tile in stage st_ into s_outer
+    if constexpr (PIPE8) {
+      wgmma_fence();
+#if OKC_DSHFL
+      const uint32_t kl = klo0 + (uint32_t)(st_ * (STAGE_BYTES >> 4));
+      const uint64_t kd = ((uint64_t)((1024 >> 4) | (1u << 30)) << 32) | kl;
+      const uint64_t kd2 = ((uint64_t)((1024 >> 4) | (1u << 30)) << 32) | (kl + 2u);
+      const uint64_t qd2 = ((uint64_t)((512 >> 4) | (2u << 30)) << 32) | (qlo0 + 2u);
+      wgmma_m64n64k32_e4m3_ss(s_outer, qdesc0, kd, 0);
+      wgmma_m64n64k32_e4m3_ss(s_outer, qd2, kd2, 1);
+#else
+      const uint64_t kd = kdesc0 + (uint64_t)(st_ * (STAGE_BYTES >> 4));
+      wgmma_m64n64k32_e4m3_ss(s_outer, qdesc0, kd, 0);
+      wgmma_m64n64k32_e4m3_ss(s_outer, qdesc0 + 2, kd + 2, 1);
+#endif
+      wgmma_commit();
+    }
+  };
+  if constexpr (PIPE8) {
+    if (ntiles > 0) {   // tile 0: landed (+ new rows), both warpgroups meet (the q staging), its QK^T issued ahead
+      mbar_wait_full(&S.full[st_c], ph_c);
+      if (((uint32_t)0 - r_lo > r_span) && (0 >= i_new)) ws_patch_ni<L, NT, PTR>(&S, 0, st_c, start, seq, end, tid);
+      csync<WS, NT>();
+      issue_qk(st_c);
+    }
+  }
   constexpr int UNR8 = WS ? OKC_UNR8 : ((MODE & 3) == 1 ? OKC_UNRN : 1);   // (pragma arguments are not macro-expanded;
   // plain split-KV with many tiles per CTA (b32 q8 sliding: 9) gains from the unroll, 1-tile coop grids lose)
 #pragma unroll (UNR8)
@@ -2987,7 +3079,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       // tile i landed (+ new rows); previous tile's PV of this warpgroup done (its V16 half is free). The two
       // warpgroups (one per KV head) only meet when both must: tile 0 (q staging) and tiles with new rows.
       bool patched;
-      if constexpr (ADDR) {
+      if constexpr (PIPE8) {
+        patched = false;   // (waited for, patched and its QK^T issued when the previous tile's PV went out)
+      } else if constexpr (ADDR) {
         mbar_wait_full(&S.full[st_c], ph_c);
         if constexpr (OKC_RARE) patched = ((uint32_t)i - r_lo > r_span) && (i >= i_new) && ws_patch_ni<L, NT, PTR>(&S, i, st_c, start, seq, end, tid);
         else if constexpr (OKC_PATCHNI && WS) patched = (i >= i_new) && ws_patch_ni<L, NT, PTR>(&S, i, st_c, start, seq, end, tid);
@@ -2998,8 +3092,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       } else {
         patched = ws_acquire(i, (tb + i) % STAGES);
       }
-      if (patched || i == 0 || !OKC_WGDEC) csync<WS, NT>();
-      else if (!(PV8ON && OKC_PV8FLAT && OKC_NOSYNC0)) wgsync(hk);
+      if constexpr (!PIPE8) {
+        if (patched || i == 0 || !OKC_WGDEC) csync<WS, NT>();
+        else if (!(PV8ON && OKC_PV8FLAT && OKC_NOSYNC0)) wgsync(hk);
+      }
       // (FP8 PV: V^T is double-buffered and each warp's wgmma wait already covers the PV that read this tile's
       // buffer, so the tile needs no warpgroup barrier before its transpose)
       PROF_MARK(0);
@@ -3033,6 +3129,16 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       PROF_MARK(1);
     }
 
+#if OKC_NOCOMPUTE
+    if constexpr (WS && ADDR) {   // (probe) the stage is released untouched: the load-bound tile time
+      __syncwarp();
+      if (OKC_XP_ARRALL || lane == 0) mbar_arrive(&S.empty[st_c]);
+      if (++st_c == STAGES) { st_c = 0; ph_c ^= 1u; }
+      vtb_c = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(vtb_c) ^ vtb_x);
+      vdesc_c ^= vdesc_x;
+      continue;
+    }
+#endif
     const int st = ADDR ? st_c : (tb + i) % STAGES;
     const uint32_t kaddr = smem_u32(S.k + st * STAGE_BYTES) + hk * 64;
     if constexpr (PVSPLIT && OKC_PVSPLIT == 2) {   // the previous tile's PV ran across the stage wait
@@ -3045,7 +3151,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
       for (int e = 0; e < 8; ++e) asm volatile("" : "+r"(pa[e >> 2][e & 3]));
     }
-    float s[32];
+    float s_inner[PIPE8 ? 1 : 32];
+    float* s_sel = PIPE8 ? s_outer : s_inner;
+    float (&s)[32] = *reinterpret_cast<float(*)[32]>(s_sel);
+    if constexpr (!PIPE8) {
     wgmma_fence();
     if constexpr (PV8 && OKC_QSS && ADDR) {
 #if OKC_DSHFL
@@ -3072,12 +3181,13 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       wgmma_m64n64k32_e4m3(s, qa8[1][0], qa8[1][1], qa8[1][2], qa8[1][3], desc_sw128(kaddr + 32), 1);
     }
     wgmma_commit();
+    }   // (!PIPE8)
     if constexpr (OKC_QKFIRST && !WS && !Cfg<L, FLAT>::S2) {   // (OKC_QKFIRST) the copies for tile i + STAGES - 1
       if (i + STAGES - 1 < ntiles) issue_kv(i + STAGES - 1, true);
       issue_idx(i + 2 * STAGES - 2);
       cp_commit();
     }
-    if constexpr (PV8 && FLAT && OKC_PVW1) {
+    if constexpr (PV8 && FLAT && OKC_PVW1 && !PIPE8) {
       // the previous tile's PV (committed before this QK^T) is done: its P registers are free for the transpose
       // below (the flat kernel's 104-register consumers spilled there) and o / lacc are settled
       wgmma_wait<1>();
@@ -3296,10 +3406,10 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
           for (int kk = 0; kk < 2; ++kk) {
             const float* sv = s + 16 * kk;
-            pa[kk][0] = e4m3x4f(ex2(fmaf(sv[0], ssc, -dlo)), ex2(fmaf(sv[1], ssc, -dlo)), ex2(fmaf(sv[4], ssc, -dlo)), ex2(fmaf(sv[5], ssc, -dlo)));
-            pa[kk][1] = e4m3x4f(ex2(fmaf(sv[2], ssc, -dhi)), ex2(fmaf(sv[3], ssc, -dhi)), ex2(fmaf(sv[6], ssc, -dhi)), ex2(fmaf(sv[7], ssc, -dhi)));
-            pa[kk][2] = e4m3x4f(ex2(fmaf(sv[8], ssc, -dlo)), ex2(fmaf(sv[9], ssc, -dlo)), ex2(fmaf(sv[12], ssc, -dlo)), ex2(fmaf(sv[13], ssc, -dlo)));
-            pa[kk][3] = e4m3x4f(ex2(fmaf(sv[10], ssc, -dhi)), ex2(fmaf(sv[11], ssc, -dhi)), ex2(fmaf(sv[14], ssc, -dhi)), ex2(fmaf(sv[15], ssc, -dhi)));
+            pa[kk][0] = PKX(fmaf(sv[0], ssc, -dlo), fmaf(sv[1], ssc, -dlo), fmaf(sv[4], ssc, -dlo), fmaf(sv[5], ssc, -dlo));
+            pa[kk][1] = PKX(fmaf(sv[2], ssc, -dhi), fmaf(sv[3], ssc, -dhi), fmaf(sv[6], ssc, -dhi), fmaf(sv[7], ssc, -dhi));
+            pa[kk][2] = PKX(fmaf(sv[8], ssc, -dlo), fmaf(sv[9], ssc, -dlo), fmaf(sv[12], ssc, -dlo), fmaf(sv[13], ssc, -dlo));
+            pa[kk][3] = PKX(fmaf(sv[10], ssc, -dhi), fmaf(sv[11], ssc, -dhi), fmaf(sv[14], ssc, -dhi), fmaf(sv[15], ssc, -dhi));
           }
         };
         pack2();
@@ -3446,7 +3556,20 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       }
       float* od = &o[0][0][0];
       if constexpr (PVSPLIT) {
-        if constexpr (OKC_PVSPLIT == 1) {   // done before the next tile (no wgmma in flight across the loop edge)
+        if constexpr (PIPE8) {
+          // next tile: stage advance, its wait (+ new rows: both warpgroups meet) and its QK^T, across this tile's PV
+          // (the wgmma wait after the next transpose covers both; o / lacc / pa are fenced there)
+          if (++st_c == STAGES) { st_c = 0; ph_c ^= 1u; }
+          vtb_c = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(vtb_c) ^ vtb_x);
+          vdesc_c ^= vdesc_x;
+          if (i + 1 < ntiles) {
+            mbar_wait_full(&S.full[st_c], ph_c);
+            const bool patched_n = ((uint32_t)(i + 1) - r_lo > r_span) && (i + 1 >= i_new) &&
+                                   ws_patch_ni<L, NT, PTR>(&S, i + 1, st_c, start, seq, end, tid);
+            if (patched_n) csync<WS, NT>();
+            issue_qk(st_c);
+          }
+        } else if constexpr (OKC_PVSPLIT == 1) {   // done before the next tile (no wgmma in flight across the loop edge)
           wgmma_wait<0>();
 #pragma unroll
           for (int e = 0; e < 32; ++e) reg_fence(od[e]);
@@ -3541,7 +3664,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       if (blockIdx.x * 2 < gridDim.x) __nanosleep(OKC_YIELD);
     }
 #endif
-    if constexpr (ADDR) {
+    if constexpr (ADDR && !PIPE8) {
       if (++st_c == STAGES) { st_c = 0; ph_c ^= 1u; }
       vtb_c = reinterpret_cast<uint8_t*>(reinterpret_cast<uintptr_t>(vtb_c) ^ vtb_x);
       vdesc_c ^= vdesc_x;
@@ -4175,6 +4298,7 @@ __global__ void __launch_bounds__(Cfg<L, FLAT>::NTX, Cfg<L, FLAT>::MINB) attn_ke
   extern __shared__ __align__(1024) uint8_t smem_raw[];
   // 1024-byte aligned base: the 128B-swizzled tiles must start on swizzle-pattern boundaries (wgmma)
   Smem<L, FLAT>& S = *reinterpret_cast<Smem<L, FLAT>*>(smem_raw + ((1024u - (smem_u32(smem_raw) & 1023u)) & 1023u));
+  if constexpr (!FLAT && OKC_FLATONLY) return;   // (bench builds of the flat kernels only)
   const int pair = blockIdx.z;
   DBG(0);
 #if OKC_SMDBG
@@ -5283,7 +5407,174 @@ def att__fits(data):
     return (data["qkv"].numel() < (1 << 31) and data["page_table"].numel() < (1 << 31) and out_elems < (1 << 31))
 
 
+att_OKC_BENCH = 0      # 1: one on-device sweep of flat-kernel builds in the first eager call (never under graph capture); prints to the log
+att__BENCH_DONE = False
+# (name, extra nvcc flags) of the builds the sweep times on synthetic inputs shaped like the scored full-context cases
+att_BENCH_VARIANTS = [
+    ("base", ()),
+    ("pfl2_1", ("-DOKC_PFL2=1",)),
+    ("pfl2_2", ("-DOKC_PFL2=2",)),
+]
+att_BENCH_SHAPES = [(16, 1), (32, 1)]   # (batch, q_len), full layer, ctx 80000 agentic
+# launch-plan sweeps on the base build: ((batch, q_len, window), [override dicts]) ({} = today's plan)
+att_W2K = 2048
+att_BENCH_PLANS = []
+att_BENCH_BUDGET_S = 100
+import os as _os
+att_BENCH_WORKERS = max(1, min(6, (_os.cpu_count() or 1)))
+
+
+def att__bench_inputs(data, B, L, ctx=80000, seed=0, window=0):
+    """Synthetic inputs like the judge's generator: scattered pages, agentic lengths (fixed at batch 1)."""
+    dev = data["qkv"].device
+    cfg0 = dict(data["config"])
+    HQ, HKV, D = cfg0["num_q_heads"], cfg0["num_kv_heads"], cfg0["head_dim"]
+    g = torch.Generator(device=dev).manual_seed(seed)
+    longest = math.ceil(ctx * 1.075)
+    max_pages = longest + L
+    u = torch.rand((B,), generator=g, device=dev)
+    seq = (ctx * (1 + 0.075 * (2 * u - 1))).long().clamp(1, longest)
+    if B == 1:
+        longest = ctx
+        max_pages = ctx + L
+        seq = torch.full((1,), ctx, dtype=torch.long, device=dev)
+    total = B * max_pages
+    perm = torch.randperm(total, generator=g, device=dev).to(torch.int32)
+    page_table = torch.full((B, max_pages), -1, dtype=torch.int32, device=dev)
+    pages_per = seq + L
+    offs = torch.cumsum(pages_per, 0) - pages_per
+    for b in range(B):
+        n, o = int(pages_per[b]), int(offs[b])
+        page_table[b, :n] = perm[o:o + n]
+    k_cache = torch.randn((total, 1, HKV, D), generator=g, device=dev).to(torch.float8_e4m3fn)
+    v_cache = torch.randn((total, 1, HKV, D), generator=g, device=dev).to(torch.float8_e4m3fn)
+    pos = (seq[:, None] + torch.arange(L, device=dev)).reshape(-1)
+    loc = torch.gather(page_table.long(), 1, pos.view(B, L)).reshape(-1)
+    qkv = (2 * torch.randn((B * L, (2 * HQ + 2 * HKV) * D), generator=g, device=dev)).to(torch.bfloat16)
+    c = dict(cfg0, batch=B, q_len=L, page_size=1, window=window, rope_theta=500000.0 if window else 0.0)
+    return {"qkv": qkv, "positions": pos, "cache_loc": loc, "cache_seqlens": seq.int(), "cu_seqlens_q": None,
+            "scheduler_metadata": None, "k_cache": k_cache, "v_cache": v_cache, "k_scale": data["k_scale"],
+            "v_scale": data["v_scale"], "page_table": page_table, "seq_lens": seq.int(), "config": c}
+
+
+def att__bench_timeit(fn, flush, sink, reps=9):
+    """us per CUDA-graph replay after an L2 flush (median, best), as the judge times."""
+    fn(); fn()
+    torch.cuda.synchronize()
+    st = torch.cuda.Stream()
+    st.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(st):
+        gph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(gph, stream=st):
+            fn()
+    torch.cuda.current_stream().wait_stream(st)
+    torch.cuda.synchronize()
+    e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+    ts = []
+    for _ in range(reps):
+        sink.copy_(flush.view(-1, 1 << 16).sum(1, dtype=torch.int32))   # cold L2 by reading, as the judge does
+        e0.record()
+        gph.replay()
+        e1.record()
+        torch.cuda.synchronize()
+        ts.append(e0.elapsed_time(e1) * 1000.0)
+    ts.sort()
+    return ts[len(ts) // 2], ts[0]
+
+
+def att__bench(data):
+    """The sweep (in process, as the judge allows no child processes): variants over BENCH_SHAPES, then the plan
+    sweeps on the base build. Stops at the first CUDA error (the context is sticky-dead then)."""
+    import time, hashlib
+    from concurrent.futures import ThreadPoolExecutor
+    t0 = time.time()
+    t_end = t0 + att_BENCH_BUDGET_S
+    dev = data["qkv"].device
+    flush = torch.zeros((160 << 20,), dtype=torch.uint8, device=dev)
+    sink = torch.empty(((160 << 20) >> 16,), dtype=torch.int32, device=dev)
+    nv = len(att_BENCH_VARIANTS)
+    print(f"BENCH attention: {nv} flat builds x {att_BENCH_SHAPES} + {len(att_BENCH_PLANS)} plan sweeps (us per graph replay after an L2 flush: median / best)")
+
+    def build(item):
+        name, flags = item[0], item[1]
+        if not flags:
+            return name, att__module(), None
+        tag = "_b" + hashlib.md5(" ".join(flags).encode()).hexdigest()[:8]
+        try:
+            return name, att__build(tag=tag, flags=("-DOKC_FLATONLY=1", *flags)), None
+        except Exception as e:   # noqa: BLE001
+            return name, None, str(e)[-500:]
+
+    with ThreadPoolExecutor(max_workers=att_BENCH_WORKERS) as ex:
+        built = {n: (m, err) for n, m, err in ex.map(build, att_BENCH_VARIANTS)}
+    print(f"BENCH builds done in {time.time() - t0:.0f}s: " +
+          ", ".join(f"{n}:{'ok' if m else 'FAIL ' + (err or '')[-200:]}" for n, (m, err) in built.items()))
+    base_mod = att__module()
+    inputs = {(B, L): att__bench_inputs(data, B, L) for (B, L) in att_BENCH_SHAPES}
+    refs = {}
+    for v in att_BENCH_VARIANTS:
+        name, flags = v[0], v[1]
+        ov_by_L = v[2] if len(v) > 2 else {}
+        mod = built.get(name, (None, None))[0]
+        if mod is None:
+            continue
+        for (B, L) in att_BENCH_SHAPES:
+            if time.time() > t_end:
+                print("BENCH budget reached"); break
+            d = inputs[(B, L)]
+            ov = ov_by_L.get(L, {})
+            try:
+                o = att__launch(d, _mod=mod, **ov)
+                torch.cuda.synchronize()
+                if (B, L) not in refs:
+                    refs[(B, L)] = att__launch(d, _mod=base_mod).float()
+                    torch.cuda.synchronize()
+                ref = refs[(B, L)]
+                err = float((o.float() - ref).norm() / (ref.norm() + 1e-20))
+                us, best = att__bench_timeit(lambda: att__launch(d, _mod=mod, **ov), flush, sink)
+                print(f"BENCH B{B} L{L} full {name:12s} {str(flags) + (str(ov) if ov else ''):58s} {us:8.1f} / {best:8.1f} us  relerr {err:.2e}")
+            except Exception as e:   # noqa: BLE001
+                print(f"BENCH B{B} L{L} full {name:12s} failed: {str(e)[-200:]}")
+                if "CUDA" in str(e) or "illegal" in str(e):
+                    print(f"BENCH stopped: sticky CUDA error in {name}")
+                    return
+    del inputs, refs
+    for (B, L, window), plans in att_BENCH_PLANS:
+        if time.time() > t_end:
+            print("BENCH budget reached"); break
+        d = att__bench_inputs(data, B, L, window=window)
+        ref = None
+        for ov in plans:
+            try:
+                o = att__launch(d, _mod=base_mod, **ov)
+                torch.cuda.synchronize()
+                if ref is None:
+                    ref, err = o.float(), 0.0
+                else:
+                    err = float((o.float() - ref).norm() / (ref.norm() + 1e-20))
+                us, best = att__bench_timeit(lambda: att__launch(d, _mod=base_mod, **ov), flush, sink)
+                print(f"BENCH B{B} L{L} {'sliding' if window else 'full':7s} plan {str(ov):50s} {us:8.1f} / {best:8.1f} us  relerr {err:.2e}")
+            except Exception as e:   # noqa: BLE001
+                print(f"BENCH B{B} L{L} plan {ov} failed: {str(e)[-200:]}")
+                if "CUDA" in str(e) or "illegal" in str(e):
+                    print("BENCH stopped: sticky CUDA error in the plan sweeps")
+                    return
+        del d
+    # probe builds may leave garbage in the shared workspace: back to the all-zero state
+    for t in att__WS.get(str(dev), ()):
+        t.zero_()
+    torch.cuda.synchronize()
+    print(f"BENCH done in {time.time() - t0:.0f}s")
+
+
 def att_kernel_fn(data: att_Inputs) -> torch.Tensor:
+    global att__BENCH_DONE
+    if att_OKC_BENCH and not att__BENCH_DONE and torch.cuda.is_available() and not torch.cuda.is_current_stream_capturing():
+        att__BENCH_DONE = True
+        try:
+            att__bench(data)
+        except Exception as e:   # noqa: BLE001
+            print("BENCH failed:", repr(e)[-400:])
     if not att__supported(data["config"]) or not att__fits(data):
         return att__fallback(data)
     return att__launch(data)
@@ -7965,6 +8256,21 @@ __device__ __forceinline__ int wgs_cost(int pb, int cnt) {
 #ifndef OKC_WGSFCI
 #define OKC_WGSFCI 3
 #endif
+#ifndef OKC_WGSMMAN
+#define OKC_WGSMMAN 0  // WGS: jobs with <= this many n-tiles run on per-warp mma.sync (wgs_seg_mma) instead of wgmma
+#endif
+#ifndef OKC_WGSMMANA
+#define OKC_WGSMMANA 4  // wgs_seg_mma: accumulator chains for 1-n-tile jobs
+#endif
+#ifndef OKC_WGSGS4N
+#define OKC_WGSGS4N 0  // WGS: jobs with <= this many n-tiles commit 4 k16 steps per wgmma group (small accumulators)
+#endif
+#ifndef OKC_WGSWD
+#define OKC_WGSWD 1    // WGS: wgmma groups kept in flight (wait_group depth); OKC_WGSWD + 1 A-fragment buffers
+#endif
+#ifndef OKC_XNOSC
+#define OKC_XNOSC 0    // dev: WGS without the block-scale multiplies (timing only)
+#endif
 #ifndef OKC_WGSGS
 #define OKC_WGSGS 2  // WGS: k16 steps per wgmma commit group (4 serializes the N=16..32 variants at 96 registers: C7512)
 #endif
@@ -8504,8 +8810,9 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
   float d[WGS_NT][4];  // written first by a scale-d = 0 wgmma (no zeroing: ptxas would serialize the wgmmas, C7513)
   // k16 steps per commit group: the whole function shares one register budget (96 at 544 threads) and ptxas
   // serializes every wgmma if any pipeline does not fit (C7512), so the wide-N variants commit 2 steps at a time
-  constexpr int GS = OKC_WGSGS;
-  uint32_t af[2][GS][4];
+  constexpr int GS = (NTT <= OKC_WGSGS4N) ? 4 : OKC_WGSGS;  // 4 steps per commit group where the accumulators are small
+  constexpr int NB = OKC_WGSWD + 1;                           // A-fragment buffers: OKC_WGSWD groups stay in flight
+  uint32_t af[NB][GS][4];
   int prev = -1;  // x slot the last committed group may still read
 #if OKC_WGSDESC0
   // slot-0 descriptor and code pointer, once per segment: a stage adds its slot's offset (the address field cannot
@@ -8559,12 +8866,17 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
           // one bf16x2, and the multiplies broadcast its halves (HMUL2 .H0_H0 / .H1_H1): 2 instructions per k16 fewer
           const uint32_t sw = js < 2 ? scg.x : scg.y, sb = (uint32_t)(js & 1) * 2u;
           const uint32_t sgp = __byte_perm(sw, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16c + 0x5C005C00u;
-          af[ci & 1][jj][0] = bmul2l(r0, sgp); af[ci & 1][jj][1] = bmul2h(r1, sgp);
-          af[ci & 1][jj][2] = bmul2l(r2, sgp); af[ci & 1][jj][3] = bmul2h(r3, sgp);
+#if OKC_XNOSC
+          (void)sgp;
+          af[ci % NB][jj][0] = r0; af[ci % NB][jj][1] = r1; af[ci % NB][jj][2] = r2; af[ci % NB][jj][3] = r3;  // dev: no scale
+#else
+          af[ci % NB][jj][0] = bmul2l(r0, sgp); af[ci % NB][jj][1] = bmul2h(r1, sgp);
+          af[ci % NB][jj][2] = bmul2l(r2, sgp); af[ci % NB][jj][3] = bmul2h(r3, sgp);
+#endif
 #else
           const uint32_t sg = SCDK(scg.x, js, k16c), s8 = SCDK(scg.y, js, k16c);
-          af[ci & 1][jj][0] = bmul2(r0, sg); af[ci & 1][jj][1] = bmul2(r1, s8);
-          af[ci & 1][jj][2] = bmul2(r2, sg); af[ci & 1][jj][3] = bmul2(r3, s8);
+          af[ci % NB][jj][0] = bmul2(r0, sg); af[ci % NB][jj][1] = bmul2(r1, s8);
+          af[ci % NB][jj][2] = bmul2(r2, sg); af[ci % NB][jj][3] = bmul2(r3, s8);
 #endif
         }
         wg_fence();
@@ -8573,12 +8885,12 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
           if (FIRST && ci == 0 && jj == 0)
             WGSMMA<NTT>::mma0(d, af[0][0][0], af[0][0][1], af[0][0][2], af[0][0][3], xd);
           else
-            WGSMMA<NTT>::mma(d, af[ci & 1][jj][0], af[ci & 1][jj][1], af[ci & 1][jj][2], af[ci & 1][jj][3],
+            WGSMMA<NTT>::mma(d, af[ci % NB][jj][0], af[ci % NB][jj][1], af[ci % NB][jj][2], af[ci % NB][jj][3],
                              xd + (uint64_t)((lg * 4 + h * GS + jj) * 16));
         }
         wg_commit();
-        wg_wait<1>();
-        if (ci == 0) {
+        wg_wait<OKC_WGSWD>();
+        if (ci == OKC_WGSWD - 1) {  // the previous stage's last group has retired: its x slot is free
           if (prev >= 0) {  // the previous stage's last group just retired: its x slot is free
             if (lane == 0) mbar_arrive1(S.bars + BX_E + prev);
             prev = -1;
@@ -8614,6 +8926,93 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
   for (int nt = 0; nt < NTT; ++nt) wgs_epi_tile<PB>(p, S, j, r16, nt, d[nt]);
   if (!PB) pd = WgsPend{1, u, -1, 0};  // the doneA release waits until the stores are done: deferred
 }
+#if OKC_WGSMMAN > 0
+// wgs_seg on per-warp mma.sync (m16n8k16) for jobs of <= OKC_WGSMMAN n-tiles: the same loads, dequant, scales and
+// epilogue / fixup paths as the wgmma version (the dequantized registers are an m16n8k16 A fragment, warp wp of the
+// warpgroup owns rows 16 wp.. of its 64; the wgmma D fragment of a warp is the mma.sync C fragment), but no
+// warpgroup-wide synchronization, descriptor or commit/wait per step: B fragments are 32-bit LDS from the x ring's
+// core matrices ([n8][k8][8 rows][16 B]: row g at +16 g, k = 2t at +4 t), 4 independent accumulator chains
+template <bool PB, int NTT>
+__device__ __forceinline__ void wgs_seg_mma(const Params& p, Smem& S, unsigned char* ring, int u, int s0, int s1, int slot,
+                                            int& seq, WgsPend& pd) {
+  const int tid = threadIdx.x, lane = tid & 31;
+  const int warp = WARP_IDX(tid);
+  const int wg = warp >> 2, wp = warp & 3, g = lane >> 2, t = lane & 3, wt = tid & 127;
+  constexpr int UBL = PB ? 4 : 5;
+  constexpr int NA = NTT == 1 ? OKC_WGSMMANA : 2;  // independent accumulator chains per n-tile
+  const uint32_t k16c = 16u + p.zero;
+  const unsigned char* xring = ring + WGS_NS * UNIT_BYTES + g * 16 + t * 4;
+  float acc[NA][NTT][4];
+#pragma unroll
+  for (int a = 0; a < NA; ++a)
+#pragma unroll
+    for (int nt = 0; nt < NTT; ++nt) { acc[a][nt][0] = 0.f; acc[a][nt][1] = 0.f; acc[a][nt][2] = 0.f; acc[a][nt][3] = 0.f; }
+#pragma unroll 1
+  for (int st = s0; st < s1; ++st) {
+    const int ws = seq % WGS_NS, xs = seq % WGS_NX;
+    wgs_wait(S.bars + BW_F + ws, (uint32_t)(seq / WGS_NS) & 1u, 3000000 + seq);
+    const unsigned char* pc = ring + ws * UNIT_BYTES + wg * WGS_PIECE;
+    wgs_wait(S.bars + BX_F + xs, (uint32_t)(seq / WGS_NX) & 1u, 4000000 + seq);
+    const unsigned char* xb = xring + xs * WGS_XS;
+    uint4 cwn = *reinterpret_cast<const uint4*>(pc + (wp * 32 + lane) * 16);
+    uint2 scn = *reinterpret_cast<const uint2*>(pc + 8192 + (wp * 8 + g) * 8);
+#pragma unroll
+    for (int lg = 0; lg < 4; ++lg) {
+      const uint4 cwg = cwn;
+      const uint2 scg = scn;
+      if (lg < 3) {
+        cwn = *reinterpret_cast<const uint4*>(pc + (((lg + 1) * 4 + wp) * 32 + lane) * 16);
+        scn = *reinterpret_cast<const uint2*>(pc + 8192 + (((lg + 1) * 4 + wp) * 8 + g) * 8);
+      } else if (lane == 0) {
+        mbar_arrive1(S.bars + BW_E + ws);  // every code and scale of this stage is in registers: weights slot free
+      }
+#pragma unroll
+      for (int js = 0; js < 4; ++js) {
+        const uint32_t q = js == 0 ? cwg.x : js == 1 ? cwg.y : js == 2 ? cwg.z : cwg.w;
+        uint32_t r0, r1, r2, r3;
+        dq4(q, r0, r1, r2, r3);
+        const uint32_t sw = js < 2 ? scg.x : scg.y, sb = (uint32_t)(js & 1) * 2u;
+        const uint32_t sgp = __byte_perm(sw, 0u, 0x4040u | sb | ((sb + 1u) << 8)) * k16c + 0x5C005C00u;
+        const uint32_t a0 = bmul2l(r0, sgp), a1 = bmul2h(r1, sgp), a2 = bmul2l(r2, sgp), a3 = bmul2h(r3, sgp);
+        const int step = lg * 4 + js;  // k16 step in the stage: k8 blocks 2 step, 2 step + 1 (128 B each)
+#pragma unroll
+        for (int nt = 0; nt < NTT; ++nt) {
+          const uint32_t b0 = *reinterpret_cast<const uint32_t*>(xb + nt * 4096 + step * 256);
+          const uint32_t b1 = *reinterpret_cast<const uint32_t*>(xb + nt * 4096 + step * 256 + 128);
+          mma_bf16(acc[step % NA][nt], a0, a1, a2, a3, b0, b1);
+        }
+      }
+    }
+    __syncwarp();
+    if (lane == 0) mbar_arrive1(S.bars + BX_E + xs);  // the stage's x slot is free (mma.sync is synchronous)
+    if (st == s0 && pd.kind) wgs_flush<PB>(p, S, pd);  // the previous segment's deferred work
+    ++seq;
+  }
+  float d[NTT][4];
+#pragma unroll
+  for (int nt = 0; nt < NTT; ++nt)
+#pragma unroll
+    for (int kk = 0; kk < 4; ++kk) {
+      float v = acc[0][nt][kk];
+#pragma unroll
+      for (int a = 1; a < NA; ++a) v += acc[a][nt][kk];
+      d[nt][kk] = v;
+    }
+  if (slot >= 0) {  // a share of a unit split between CTAs: add it now, count it later (deferred)
+    float* fb = wgs_fix(p, PB) + (size_t)(slot * 4 + wg) * WGS_FIXW + wt * 4;
+#pragma unroll
+    for (int nt = 0; nt < NTT; ++nt)
+      asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"l"(fb + nt * 512), "f"(d[nt][0]), "f"(d[nt][1]),
+                   "f"(d[nt][2]), "f"(d[nt][3]) : "memory");
+    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && (OKC_WGSDYN ? s1 == 16 : (PB ? s0 == 0 : s1 == 16))) ? 3 : 2, u, slot, s1 - s0};
+    return;
+  }
+  const int j = u >> UBL, r16 = (u & ((1 << UBL) - 1)) * 16 + wg * 4 + wp;
+#pragma unroll
+  for (int nt = 0; nt < NTT; ++nt) wgs_epi_tile<PB>(p, S, j, r16, nt, d[nt]);
+  if (!PB) pd = WgsPend{1, u, -1, 0};
+}
+#endif
 template <bool PB>
 __device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned char* ring, int g0, int g1, int& seq, int& k) {
   // (__forceinline__: outlined by NVVM when it grows, a CALL that makes ptxas serialize every wgmma, C7510)
@@ -8642,9 +9041,17 @@ __device__ __forceinline__ void wgs_phase(const Params& p, Smem& S, unsigned cha
     const int ntt = (S.jC[u >> UBL] + 7) >> 3;
 #endif
     switch (ntt) {
+#if OKC_WGSMMAN >= 1
+      case 1: wgs_seg_mma<PB, 1>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#else
       case 1: wgs_seg<PB, 1>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#endif
 #if OKC_FT_T > 8
+#if OKC_WGSMMAN >= 2
+      case 2: wgs_seg_mma<PB, 2>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#else
       case 2: wgs_seg<PB, 2>(p, S, ring, u, s0, s1, slot, seq, pd); break;
+#endif
       case 3: wgs_seg<PB, 3>(p, S, ring, u, s0, s1, slot, seq, pd); break;
       case 4: wgs_seg<PB, 4>(p, S, ring, u, s0, s1, slot, seq, pd); break;
 #endif
@@ -9723,7 +10130,7 @@ moe_TINY2_MAX_M = 8
 moe_MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 moe_MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 moe_DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-moe_DIAG_SET = "F"             # which variant set below (a copy of this file with another set runs as a second check)
+moe_DIAG_SET = "I"             # which variant set below (a copy of this file with another set runs as a second check)
 moe__WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 moe_DIAG_VARIANT_SETS = {
@@ -9734,6 +10141,29 @@ moe_DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": moe__WGS_SHAPES},
         "wgs_nomma": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": moe__WGS_SHAPES},
         "wgs_nodq": {"defines": moe_MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": moe__WGS_SHAPES},
+    },
+    "I": {  # WGS: per-warp mma.sync for small-N jobs (no warpgroup sync / descriptor / commit per step) vs wgmma
+        "main": {"defines": moe_MAIN_DEFINES, "shapes": moe__WGS_SHAPES},
+        "wgs_mma1": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSMMAN=1",), "shapes": moe__WGS_SHAPES},
+        "wgs_mma2": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSMMAN=2",), "shapes": moe__WGS_SHAPES},
+        "wgs_mma2_dbg": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSMMAN=2", "-DOKC_DEBUG=1"), "shapes": moe__WGS_SHAPES},
+        "wgs_mma2_na2": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSMMAN=2", "-DOKC_WGSMMANA=2"), "shapes": moe__WGS_SHAPES},
+    },
+    "H": {  # WGS for M <= 64: FT_T=32 frees accumulator registers (x slots 16 KB): deeper wgmma pipeline / weight ring
+        "main": {"defines": moe_MAIN_DEFINES, "shapes": [32, 128]},
+        "wgs_ft32": {"defines": moe_MAIN_DEFINES + ("-DOKC_FT_T=32",), "shapes": [32, 128]},
+        "wgs_ft32_wd2": {"defines": moe_MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSWD=2"), "shapes": [32]},
+        "wgs_ft32_gs4": {"defines": moe_MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSGS4N=4"), "shapes": [32]},
+        "wgs_ft32_ns4": {"defines": moe_MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSNS=4"), "shapes": [32]},
+        "wgs_ft32_ns4_wd2": {"defines": moe_MAIN_DEFINES + ("-DOKC_FT_T=32", "-DOKC_WGSNS=4", "-DOKC_WGSWD=2"), "shapes": [32]},
+    },
+    "G": {  # WGS wgmma pipeline: commit-group length for small N, wait depth, no-scale ablation (bs32/128/256)
+        "main": {"defines": moe_MAIN_DEFINES, "shapes": moe__WGS_SHAPES},
+        "wgs_gs4n2": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSGS4N=2",), "shapes": moe__WGS_SHAPES},
+        "wgs_wd2": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSWD=2",), "shapes": moe__WGS_SHAPES},
+        "wgs_gs4n2_wd2": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSGS4N=2", "-DOKC_WGSWD=2"), "shapes": moe__WGS_SHAPES},
+        "wgs_gs4": {"defines": moe_MAIN_DEFINES + ("-DOKC_WGSGS=4",), "shapes": moe__WGS_SHAPES},
+        "wgs_noscale": {"defines": moe_MAIN_DEFINES + ("-DOKC_XNOSC=1",), "shapes": moe__WGS_SHAPES},
     },
     "F": {  # WGS early producer start (fixed consumer/range sync), bs32/128/256
         "main": {"defines": moe_MAIN_DEFINES, "shapes": moe__WGS_SHAPES},
@@ -9783,7 +10213,7 @@ moe_DIAG_VARIANT_SETS = {
     },
 }
 moe_DIAG_VARIANTS = moe_DIAG_VARIANT_SETS[moe_DIAG_SET]
-moe_DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if moe_DIAG_SET == "A" else moe__WGS_SHAPES if moe_DIAG_SET in ("D", "F") else [1, 16, 32, 128, 256] if moe_DIAG_SET == "E" else [1, 8, 16]
+moe_DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if moe_DIAG_SET == "A" else moe__WGS_SHAPES if moe_DIAG_SET in ("D", "F", "G", "I") else [32, 128] if moe_DIAG_SET == "H" else [1, 16, 32, 128, 256] if moe_DIAG_SET == "E" else [1, 8, 16]
 moe_DIAG_SEED = 1234
 moe_DIAG_BW = moe_DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 moe_DIAG_BW_MODES = (8, 16, 17, 19, 24)
@@ -10164,6 +10594,15 @@ def moe__diag(state, weights):
         except Exception as ex:  # diagnostics must never break the run
             print(f"[diag-bw] failed: {ex}", flush=True)
     sfx = state.get("sfx", ())
+    try:  # block-scale statistics (E4M3 bytes): share of powers of two (mantissa 0), exponent span
+        for nm in ("w13_sf", "w2_sf"):
+            b = weights[nm][:32].contiguous().view(torch.uint8)
+            pow2 = float(((b & 7) == 0).float().mean())
+            ex = (b.int() >> 3) & 15
+            print(f"[diag] {nm}: power-of-two scales {pow2:.3f}, exponent min/max {int(ex.min())}/{int(ex.max())}, "
+                  f"bytes min/max {int(b.min()):#x}/{int(b.max()):#x}", flush=True)
+    except Exception as ex:
+        print(f"[diag] scale stats failed: {ex}", flush=True)
     shapes = list(moe_DIAG_SHAPES)
     variants = {}  # name -> (defines, shapes)
     for name, v in moe_DIAG_VARIANTS.items():
@@ -11364,7 +11803,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       bulk_g2s(sbase + st * SST + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * st);
     }
     if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
-    if (!(dgv & 4))
+    if (!(dgv & 4) && !(FUSE && b_hout != nullptr))   // (with the boundary prologue the x boxes follow it, below)
       for (int st = 0; st < P; ++st) tma_load_3d(sbase + st * SST, &xmap, full0 + 8 * st, 0, 0, (gs0 + st) * UPS);
     if (COMP) {   // this CTA's escape table
       if constexpr (CL == 1) {
@@ -11391,6 +11830,89 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   // ranks > 0 send into it) is only arrived at here and waited on right before the remote stores
   __syncthreads();
   if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");   // every thread: x and the outputs are ours from here
+  if constexpr (FUSE) {
+    if (b_hout != nullptr) {
+      // ---- boundary-1 prologue (decode layer, M <= 8; used at M = 1): this launch's x is the layer's h, which does
+      // not exist yet. Every CTA computes it redundantly (bit-identical values, same fixed reduction order) from the
+      // o-projection output a (b_gp slot, bf16 [M, 8192]) and the input stream s (b_sin, fp32):
+      //   r  = rsqrt(mean(a^2) + 1e-8);  s1 = alpha s + beta (a r)         (alpha/beta: the residual gate, fp32)
+      //   h  = s1 rsqrt(mean(s1^2) + 1e-5) (1 + gw)   -> bf16 into the x buffer (b_hout); CTA 0 also stores s1 (b_sout)
+      // with sum(s1^2) = A + 2 r B + r^2 D from the one-pass partials C = sum a^2, A = sum alpha^2 s^2,
+      // B = sum alpha beta s a, D = sum beta^2 a^2 (one CTA-wide reduction). The weight ring (P stages) is already
+      // streaming; the x boxes are issued after the fence below. NC threads x 32 columns = the 8192-wide row.
+      static_assert(NC * 32 == 8192, "sk2 boundary prologue: 256 consumer threads x 32 columns");
+      __shared__ float s_bred[16][4];
+      const int c0 = tid * 32;
+      for (int tt = 0; tt < M; ++tt) {
+        float a[32], s[32], al[32], be[32];
+        if (tid < NC) {
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const uint4 av = __ldcg(reinterpret_cast<const uint4*>(b_gp + (size_t)tt * 8192 + c0 + 8 * i));
+            const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&av);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) { const float2 f = __bfloat1622float2(a2[j]); a[8 * i + 2 * j] = f.x; a[8 * i + 2 * j + 1] = f.y; }
+          }
+#pragma unroll
+          for (int i = 0; i < 8; ++i) {
+            const float4 sv = __ldg(reinterpret_cast<const float4*>(b_sin + (size_t)tt * 8192 + c0 + 4 * i));
+            const float4 lv = __ldg(reinterpret_cast<const float4*>(b_alpha + c0 + 4 * i));
+            const float4 bv = __ldg(reinterpret_cast<const float4*>(b_beta + c0 + 4 * i));
+            s[4 * i] = sv.x; s[4 * i + 1] = sv.y; s[4 * i + 2] = sv.z; s[4 * i + 3] = sv.w;
+            al[4 * i] = lv.x; al[4 * i + 1] = lv.y; al[4 * i + 2] = lv.z; al[4 * i + 3] = lv.w;
+            be[4 * i] = bv.x; be[4 * i + 1] = bv.y; be[4 * i + 2] = bv.z; be[4 * i + 3] = bv.w;
+          }
+        }
+        float pC = 0.f, pA = 0.f, pB = 0.f, pD = 0.f;
+        if (tid < NC) {
+#pragma unroll
+          for (int j = 0; j < 32; ++j) {
+            const float as_ = al[j] * s[j], ba_ = be[j] * a[j];
+            pC += a[j] * a[j]; pA += as_ * as_; pB += as_ * ba_; pD += ba_ * ba_;
+          }
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) {
+          pC += __shfl_xor_sync(0xffffffffu, pC, off); pA += __shfl_xor_sync(0xffffffffu, pA, off);
+          pB += __shfl_xor_sync(0xffffffffu, pB, off); pD += __shfl_xor_sync(0xffffffffu, pD, off);
+        }
+        if (lane == 0 && warp < NW) { s_bred[warp][0] = pC; s_bred[warp][1] = pA; s_bred[warp][2] = pB; s_bred[warp][3] = pD; }
+        __syncthreads();
+        float C = 0.f, A = 0.f, B = 0.f, D = 0.f;
+#pragma unroll
+        for (int w = 0; w < NW; ++w) { C += s_bred[w][0]; A += s_bred[w][1]; B += s_bred[w][2]; D += s_bred[w][3]; }
+        __syncthreads();   // s_bred is reused by the next row
+        const float r = rsqrtf(C * (1.f / 8192.f) + 1e-8f);
+        const float r2 = rsqrtf((A + 2.f * r * B + r * r * D) * (1.f / 8192.f) + 1e-5f);
+        if (tid < NC) {
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const uint4 gv = __ldg(reinterpret_cast<const uint4*>(b_gn + c0 + 8 * i));
+            const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gv);
+            uint4 hv;
+            __nv_bfloat162* h2 = reinterpret_cast<__nv_bfloat162*>(&hv);
+            float s1v[8];
+#pragma unroll
+            for (int j = 0; j < 8; ++j) s1v[j] = al[8 * i + j] * s[8 * i + j] + be[8 * i + j] * (a[8 * i + j] * r);
+#pragma unroll
+            for (int j = 0; j < 4; ++j) {
+              const float2 g = __bfloat1622float2(g2[j]);
+              h2[j] = __floats2bfloat162_rn(s1v[2 * j] * r2 * (1.f + g.x), s1v[2 * j + 1] * r2 * (1.f + g.y));
+            }
+            *reinterpret_cast<uint4*>(b_hout + (size_t)tt * 8192 + c0 + 8 * i) = hv;
+            if (blockIdx.x == 0) {
+              *reinterpret_cast<float4*>(b_sout + (size_t)tt * 8192 + c0 + 8 * i) = make_float4(s1v[0], s1v[1], s1v[2], s1v[3]);
+              *reinterpret_cast<float4*>(b_sout + (size_t)tt * 8192 + c0 + 8 * i + 4) = make_float4(s1v[4], s1v[5], s1v[6], s1v[7]);
+            }
+          }
+        }
+      }
+      asm volatile("fence.proxy.async.global;" ::: "memory");   // h (generic-proxy stores) -> visible to the TMA (async proxy)
+      __syncthreads();
+      if (tid == 0 && !(dgv & 4))   // the x boxes of the first P stages (their barriers already expect XBYr + WBY bytes)
+        for (int st = 0; st < P; ++st) tma_load_3d(sbase + st * SST, &xmap, full0 + 8 * st, 0, 0, (gs0 + st) * UPS);
+    }
+  }
   if constexpr (CL > 1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");   // inits fenced above
 
   if (warp == NW) {
@@ -12077,7 +12599,9 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
 void sk2f(at::Tensor Ws, at::Tensor Wsr, at::Tensor x, at::Tensor out, at::Tensor outr, at::Tensor ptab, int64_t pmax,
           int64_t base4, at::Tensor part, at::Tensor rcnt, int64_t M, int64_t tokr, at::Tensor rbias, at::Tensor gpre,
           at::Tensor rids, at::Tensor rlids, at::Tensor rwts, at::Tensor xm, at::Tensor rls, at::Tensor part2,
-          at::Tensor dcnt, int64_t fuse_route) {
+          at::Tensor dcnt, int64_t fuse_route, at::Tensor ba, at::Tensor bs, at::Tensor b1a, at::Tensor b1b,
+          at::Tensor b1g, at::Tensor b1s, int64_t fuse_bnd1) {
+  TORCH_CHECK(!fuse_bnd1 || M <= 8, "sk2f: the boundary prologue needs M <= 8");
   @@SK2F_DISPATCH@@
   TORCH_CHECK(false, "sk2f: no config");
 }
@@ -12471,7 +12995,8 @@ void sk2(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor pta
 void sk2f(torch::Tensor Ws, torch::Tensor Wsr, torch::Tensor x, torch::Tensor out, torch::Tensor outr, torch::Tensor ptab,
           int64_t pmax, int64_t base4, torch::Tensor part, torch::Tensor rcnt, int64_t M, int64_t tokr, torch::Tensor rbias,
           torch::Tensor gpre, torch::Tensor rids, torch::Tensor rlids, torch::Tensor rwts, torch::Tensor xm, torch::Tensor rls,
-          torch::Tensor part2, torch::Tensor dcnt, int64_t fuse_route);
+          torch::Tensor part2, torch::Tensor dcnt, int64_t fuse_route, torch::Tensor ba, torch::Tensor bs, torch::Tensor b1a,
+          torch::Tensor b1b, torch::Tensor b1g, torch::Tensor b1s, int64_t fuse_bnd1);
 void sk2b(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor ptab, int64_t pmax, int64_t base4, int64_t M,
           int64_t N, int64_t K, int64_t cfg, int64_t tokr, torch::Tensor alpha, torch::Tensor beta, torch::Tensor sin_,
           torch::Tensor gp, torch::Tensor gn, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
@@ -13178,7 +13703,8 @@ def bfp__sk2_src(sm90):
                 'int64_t, int64_t, int64_t, at::Tensor) { TORCH_CHECK(false, "sk2 needs sm_90"); }\n'
                 'void sk2f(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, '
                 'at::Tensor, at::Tensor, int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
-                'at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
+                'at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
+                'at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
                 'void sk2b(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, '
                 'int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
                 'at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2b needs sm_90"); }\n'
@@ -13212,7 +13738,15 @@ def bfp__sk2_src(sm90):
                           f"fuse_route ? rwts.data_ptr<float>() : nullptr, "
                           f"fuse_route ? reinterpret_cast<__nv_bfloat16*>(xm.data_ptr()) : nullptr, "
                           f"fuse_route ? rls.data_ptr<int>() : nullptr, fuse_route ? part2.data_ptr<float>() : nullptr, "
-                          f"fuse_route ? dcnt.data_ptr<int>() : nullptr); return; }}")
+                          f"fuse_route ? dcnt.data_ptr<int>() : nullptr, "
+                          # boundary-1 prologue through the b_* slots: alpha, beta, stream (b_sin), a (b_gp), 1+gw source (b_gn),
+                          # s1 out (b_sout), h = this launch's x buffer (b_hout); no b_part / b_cnt
+                          f"fuse_bnd1 ? b1a.data_ptr<float>() : nullptr, fuse_bnd1 ? b1b.data_ptr<float>() : nullptr, "
+                          f"fuse_bnd1 ? bs.data_ptr<float>() : nullptr, "
+                          f"fuse_bnd1 ? reinterpret_cast<const __nv_bfloat16*>(ba.data_ptr()) : nullptr, "
+                          f"fuse_bnd1 ? reinterpret_cast<const __nv_bfloat16*>(b1g.data_ptr()) : nullptr, "
+                          f"fuse_bnd1 ? b1s.data_ptr<float>() : nullptr, "
+                          f"fuse_bnd1 ? reinterpret_cast<__nv_bfloat16*>(x.data_ptr()) : nullptr, nullptr, nullptr); return; }}")
     blines = []   # boundary tails: the o projection and the unpooler slice at tokr 8 (M <= 8), bf16 out, CL == 1
     for ci, cfg in enumerate(bfp_SK2_CONFIGS):
         name, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
@@ -13380,7 +13914,7 @@ def bfp_run_sk2_tail(x, layer, m, n, k, state, tail):
     return out
 
 
-def bfp_fused_pooler_router(x, state, route=None):
+def bfp_fused_pooler_router(x, state, route=None, bnd1=None):
     """Pooler and router of one decode step in ONE launch (m <= 32, sm_90): x [m, 8192] bf16 ->
     (pooler [m, 4096] bf16, router [m, 256] fp32). Same numerics as the separate sk2 kernels: 12-bit lossless pooler
     weights with exact escape corrections, router as BF16 hi + lo with FP32 accumulation (quarter-K partials added in
@@ -13407,8 +13941,18 @@ def bfp_fused_pooler_router(x, state, route=None):
         rbias = gpre = rids = rlids = rwts = xm = rls = d
     else:
         rbias, gpre, rids, rlids, rwts, xm, rls = route
+    # bnd1 = (a bf16 [m, 8192]: the o-projection output, s fp32 [m, 8192]: the input stream, alpha fp32 [8192],
+    # beta fp32 [8192], gw bf16 [8192]: the pre-FFN norm weight, s1_out fp32 [m, 8192]): the launch computes its own
+    # x = h = rmsnorm(alpha s + beta rmsnorm(a)) (1 + gw) into x (an empty buffer) in its prologue (m <= 8) and CTA 0
+    # stores s1; the decode layer's _boundary1 without a launch
+    if bnd1 is None:
+        ba = bs = b1a = b1b = b1g = b1s = d
+    else:
+        ba, bs, b1a, b1b, b1g, b1s = bnd1
+        assert m <= 8 and ba.dtype == torch.bfloat16 and bs.dtype == torch.float32 and b1g.dtype == torch.bfloat16
     ext.sk2f(stream, rstream, x, out, outr, tab, pmax, b4, state["fused_part"], state["fused_cnt"], m, bfp__sk2_tokr(m),
-             rbias, gpre, rids, rlids, rwts, xm, rls, state["fused_part2"], state["fused_dcnt"], 0 if route is None else 1)
+             rbias, gpre, rids, rlids, rwts, xm, rls, state["fused_part2"], state["fused_dcnt"], 0 if route is None else 1,
+             ba, bs, b1a, b1b, b1g, b1s, 0 if bnd1 is None else 1)
     return out, outr
 
 
@@ -13815,10 +14359,14 @@ _T_COPY = {"qkv": "qkvT", "o": "oT", "pr": "prT", "un": "unpoolT"}   # dense nam
 BFP_PDL_N = 2   # bf16_proj's sk2 / fused kernels: weight stages issued before griddepcontrol.wait (0 = off)
 
 
+PDL_N_SWEEP = (2, 3, 4, 6)   # prepare(): per T, the sk2 pre-wait weight-stage count timed on the whole post-attention chain
+_PDL_N_BY_T = {}             # T -> the winner (the ring has 4-6 stages at tokr 8; 6 = the whole ring streams before the wait)
+
+
 def _bfp_pdl(T):
     """Their launchers read SK2_PDL (bfp_SK2_PDL once inlined) at every launch: same T rule as this file's glue."""
     global bfp_SK2_PDL
-    bfp_SK2_PDL = BFP_PDL_N if _pdl(T) else 0
+    bfp_SK2_PDL = _PDL_N_BY_T.get(T, BFP_PDL_N) if _pdl(T) else 0
 
 
 def _bfp_gemm(st, name, x, m, n, k):
@@ -13928,6 +14476,58 @@ def _boundary_selftest(st):
             return
     print("boundary tails ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
     st["fuse_bnd_ok"] = True
+
+
+FUSE_BND1 = True   # the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
+                   # output (every CTA redundantly, before its x boxes; the weight ring is already streaming): no
+                   # _boundary1 launch at T <= BND1_MAX_T. Enabled only when the prepare-time self-test matches.
+BND1_MAX_T = 1     # one row per CTA prologue is hidden behind the ring fill; 8 rows are not (measured design limit)
+
+
+def _bnd1_fuse_ok(state, T):
+    return (FUSE_BND1 and T <= BND1_MAX_T and state.get("fuse_bnd1_ok") and state.get("bfp") is not None
+            and "bnd1" in bfp_fused_pooler_router.__code__.co_varnames and "ab1" in state
+            and state["g_preffn"].dtype == torch.bfloat16)
+
+
+def _bnd1_selftest(st):
+    """The fused launch's boundary-1 prologue against _boundary1 (+ the plain fused launch on _boundary1's h) at
+    T = 1 and 8 on synthetic inputs; any mismatch or exception disables it (st["fuse_bnd1_ok"]); printed."""
+    st["fuse_bnd1_ok"] = False
+    if (not FUSE_BND1 or st.get("bfp") is None or "bnd1" not in bfp_fused_pooler_router.__code__.co_varnames
+            or "ab1" not in st):
+        print("boundary-1 prologue: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    g = torch.Generator(device=dev).manual_seed(779)
+    f32 = dict(device=dev, dtype=torch.float32)
+    report = []
+    for T in (1, 8):
+        a = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        s = torch.randn(T, HIDDEN, generator=g, device=dev)
+        h = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        s1 = torch.empty((T, HIDDEN), **f32)
+        try:
+            _bfp_pdl(T)
+            pooled, logits = bfp_fused_pooler_router(h, st["bfp"], None, (a, s, st["ab1"][0], st["ab1"][1], st["g_preffn"], s1))
+            torch.cuda.synchronize()
+        except Exception as ex:  # noqa: BLE001
+            print(f"boundary-1 prologue T{T}: FAILED {repr(ex)[:300]}", flush=True)
+            return
+        s1r = torch.empty((T, HIDDEN), **f32)
+        hr = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        _boundary1[(T,)](a.view(1, T, HIDDEN), 1, T, s, st["gate1"], st["gate1"], st["g_preffn"], s1r, hr, num_warps=16)
+        pooled_r, logits_r = bfp_fused_pooler_router(hr, st["bfp"])
+        torch.cuda.synchronize()
+        errs = [float((x.float() - y.float()).norm() / max(1e-6, float(y.float().norm())))
+                for x, y in ((s1, s1r), (h, hr), (pooled, pooled_r), (logits, logits_r))]
+        report.append((T, errs))
+        if not all(e < 2e-3 for e in errs):
+            print(f"boundary-1 prologue T{T}: MISMATCH rel err s1 {errs[0]:.2e} h {errs[1]:.2e} pooled {errs[2]:.2e} "
+                  f"logits {errs[3]:.2e}", flush=True)
+            return
+    print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
+    st["fuse_bnd1_ok"] = True
 
 
 def _gate_coeffs(g):
@@ -15173,6 +15773,18 @@ def _tune(st, log=False):
             best, bestv2 = DEFAULT_MOE, dfltv2
         st["moe_pick"][T] = best if best is not None else DEFAULT_MOE
         st["gluev2"][T] = bestv2
+        if _pdl(T) and st.get("bfp") is not None:   # sk2 PDL depth: weight stages issued before griddepcontrol.wait,
+            ptimes = {}                               # timed on the whole post-attention chain (where the overlap is)
+            for n in PDL_N_SWEEP:
+                _PDL_N_BY_T[T] = n
+                try:
+                    ptimes[n] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                except Exception:  # noqa: BLE001
+                    ptimes[n] = 1e30
+            nbest = min(ptimes, key=lambda n: ptimes[n])
+            _PDL_N_BY_T[T] = nbest
+            if log:
+                msg.append("pdl[" + " ".join(f"{n}:{t:.0f}" for n, t in ptimes.items()) + f"]->{nbest}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -15237,7 +15849,7 @@ def prepare(weights):
         raise errs[0]
     _ma_prepare(weights, st)
     _bfp_prepare(weights, st)
-    for selftest in (_route_selftest, _boundary_selftest):   # the fused tails, each enabled only when it matches
+    for selftest in (_route_selftest, _boundary_selftest, _bnd1_selftest):   # the fused paths, each enabled only when it matches
         try:
             selftest(st)
         except Exception as ex:  # noqa: BLE001
@@ -15269,6 +15881,11 @@ def prepare(weights):
             times = st.get("mm_times", {}).get(k, {})
             v = min(v, key=lambda p: times.get(p, 1e30))
         st.setdefault("mm_pick", {})[k] = v
+    if st.get("fuse_bnd1_ok"):   # the boundary-1 prologue lives in the fused pooler + router launch: pin it at those T
+        for T_ in TUNED_T:
+            if T_ <= BND1_MAX_T:
+                st["mm_pick"][(T_, "pr")] = "bfpf"
+                st["mm_pick"][(T_, "o")] = "bfp"
     torch.cuda.synchronize()
     if st.get("att_ok"):
         _attn_selftest(st)     # every attention plan family once, on synthetic inputs
@@ -15485,6 +16102,7 @@ def _after_attention(data, state, o_in, gate, T):
     v2 = gv.get(T, gv.get(_bucket(T), False)) if FORCE_GLUEV2 is None else FORCE_GLUEV2
     s1 = torch.empty((T, HIDDEN), **f32)
     h = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+    bnd1 = None   # set when _boundary1 is deferred into the fused pooler + router launch's prologue
     if v2:
         # o projection with no K split (each program owns whole rows) + the boundary's four per-token sums
         a_out = torch.empty((T, HIDDEN), **f32)
@@ -15507,8 +16125,13 @@ def _after_attention(data, state, o_in, gate, T):
             P, S = dense(o_in, state["o"], T, state, "o")
         else:
             P, S = dense_ng(o_in, gate, state["o"], T, state)
-        _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
-                         num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+        if (gate is None and S == 1 and P.dtype == torch.bfloat16 and _bnd1_fuse_ok(state, T)
+                and data["stream"].dtype == torch.float32 and data["stream"].is_contiguous()):
+            # deferred: the fused pooler + router launch computes h (its own x) and s1 in its prologue (no launch)
+            bnd1 = (P.view(T, HIDDEN), data["stream"], state["ab1"][0], state["ab1"][1], state["g_preffn"], s1)
+        else:
+            _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
+                             num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
     # 4. pooler + router (BF16 hi + lo rows, FP32 accumulation), routing, pre-expert norm
     ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     lids = torch.empty((T, 8), device=dev, dtype=torch.int32)
@@ -15527,15 +16150,24 @@ def _after_attention(data, state, o_in, gate, T):
     xm = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
     mmp = state.get("mm_pick", {})
     ppick = mmp.get((T, "pr"), mmp.get((_bucket(T), "pr"), False))
-    if ppick == "bfpf" and T <= 32 and state.get("bfp") is not None:
+    use_fused_pr = ppick == "bfpf" and T <= 32 and state.get("bfp") is not None
+    if bnd1 is not None and not use_fused_pr:   # the deferred boundary has no fused launch to live in: run it
+        _boundary1[(T,)](bnd1[0].view(1, T, HIDDEN), 1, T, bnd1[1], state["gate1"], state["gate1"], state["g_preffn"],
+                         s1, h, num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+        bnd1 = None
+    if use_fused_pr:
         # bf16_proj's fused pooler + router: one launch, both read h once (bf16 [T, 4096], fp32 [T, 256]); with
-        # FUSE_ROUTE its last CTA also does the routing and the pre-expert norm (no _route_split launch)
+        # FUSE_ROUTE its last CTA also does the routing and the pre-expert norm (no _route_split launch); with
+        # bnd1 its prologue computes h (= its x) and s1 from the o-projection output (no _boundary1 launch)
         _bfp_pdl(T)
         route = _fused_route(state, data, ids, lids, wts, xm) if (use_marlin or use_ma) else None
         if route is None:   # (the standalone proj module's launch takes no route argument)
-            P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
+            if bnd1 is not None:
+                P, S = bfp_fused_pooler_router(h, state["bfp"], None, bnd1), -1
+            else:
+                P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
         else:
-            P, S = bfp_fused_pooler_router(h, state["bfp"], route), -2
+            P, S = bfp_fused_pooler_router(h, state["bfp"], route, bnd1), -2
     elif ppick in ("bfp", "bfq") and state.get("bfp") is not None:   # ("bfq": the proj module's m >= 33 routes)
         pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
         logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed

@@ -115,10 +115,14 @@ _T_COPY = {"qkv": "qkvT", "o": "oT", "pr": "prT", "un": "unpoolT"}   # dense nam
 BFP_PDL_N = 2   # bf16_proj's sk2 / fused kernels: weight stages issued before griddepcontrol.wait (0 = off)
 
 
+PDL_N_SWEEP = (2, 3, 4, 6)   # prepare(): per T, the sk2 pre-wait weight-stage count timed on the whole post-attention chain
+_PDL_N_BY_T = {}             # T -> the winner (the ring has 4-6 stages at tokr 8; 6 = the whole ring streams before the wait)
+
+
 def _bfp_pdl(T):
     """Their launchers read SK2_PDL (bfp_SK2_PDL once inlined) at every launch: same T rule as this file's glue."""
     global bfp_SK2_PDL
-    bfp_SK2_PDL = BFP_PDL_N if _pdl(T) else 0
+    bfp_SK2_PDL = _PDL_N_BY_T.get(T, BFP_PDL_N) if _pdl(T) else 0
 
 
 def _bfp_gemm(st, name, x, m, n, k):
@@ -228,6 +232,58 @@ def _boundary_selftest(st):
             return
     print("boundary tails ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
     st["fuse_bnd_ok"] = True
+
+
+FUSE_BND1 = True   # the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
+                   # output (every CTA redundantly, before its x boxes; the weight ring is already streaming): no
+                   # _boundary1 launch at T <= BND1_MAX_T. Enabled only when the prepare-time self-test matches.
+BND1_MAX_T = 1     # one row per CTA prologue is hidden behind the ring fill; 8 rows are not (measured design limit)
+
+
+def _bnd1_fuse_ok(state, T):
+    return (FUSE_BND1 and T <= BND1_MAX_T and state.get("fuse_bnd1_ok") and state.get("bfp") is not None
+            and "bnd1" in bfp_fused_pooler_router.__code__.co_varnames and "ab1" in state
+            and state["g_preffn"].dtype == torch.bfloat16)
+
+
+def _bnd1_selftest(st):
+    """The fused launch's boundary-1 prologue against _boundary1 (+ the plain fused launch on _boundary1's h) at
+    T = 1 and 8 on synthetic inputs; any mismatch or exception disables it (st["fuse_bnd1_ok"]); printed."""
+    st["fuse_bnd1_ok"] = False
+    if (not FUSE_BND1 or st.get("bfp") is None or "bnd1" not in bfp_fused_pooler_router.__code__.co_varnames
+            or "ab1" not in st):
+        print("boundary-1 prologue: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    g = torch.Generator(device=dev).manual_seed(779)
+    f32 = dict(device=dev, dtype=torch.float32)
+    report = []
+    for T in (1, 8):
+        a = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        s = torch.randn(T, HIDDEN, generator=g, device=dev)
+        h = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        s1 = torch.empty((T, HIDDEN), **f32)
+        try:
+            _bfp_pdl(T)
+            pooled, logits = bfp_fused_pooler_router(h, st["bfp"], None, (a, s, st["ab1"][0], st["ab1"][1], st["g_preffn"], s1))
+            torch.cuda.synchronize()
+        except Exception as ex:  # noqa: BLE001
+            print(f"boundary-1 prologue T{T}: FAILED {repr(ex)[:300]}", flush=True)
+            return
+        s1r = torch.empty((T, HIDDEN), **f32)
+        hr = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+        _boundary1[(T,)](a.view(1, T, HIDDEN), 1, T, s, st["gate1"], st["gate1"], st["g_preffn"], s1r, hr, num_warps=16)
+        pooled_r, logits_r = bfp_fused_pooler_router(hr, st["bfp"])
+        torch.cuda.synchronize()
+        errs = [float((x.float() - y.float()).norm() / max(1e-6, float(y.float().norm())))
+                for x, y in ((s1, s1r), (h, hr), (pooled, pooled_r), (logits, logits_r))]
+        report.append((T, errs))
+        if not all(e < 2e-3 for e in errs):
+            print(f"boundary-1 prologue T{T}: MISMATCH rel err s1 {errs[0]:.2e} h {errs[1]:.2e} pooled {errs[2]:.2e} "
+                  f"logits {errs[3]:.2e}", flush=True)
+            return
+    print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
+    st["fuse_bnd1_ok"] = True
 
 
 def _gate_coeffs(g):
@@ -1473,6 +1529,18 @@ def _tune(st, log=False):
             best, bestv2 = DEFAULT_MOE, dfltv2
         st["moe_pick"][T] = best if best is not None else DEFAULT_MOE
         st["gluev2"][T] = bestv2
+        if _pdl(T) and st.get("bfp") is not None:   # sk2 PDL depth: weight stages issued before griddepcontrol.wait,
+            ptimes = {}                               # timed on the whole post-attention chain (where the overlap is)
+            for n in PDL_N_SWEEP:
+                _PDL_N_BY_T[T] = n
+                try:
+                    ptimes[n] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                except Exception:  # noqa: BLE001
+                    ptimes[n] = 1e30
+            nbest = min(ptimes, key=lambda n: ptimes[n])
+            _PDL_N_BY_T[T] = nbest
+            if log:
+                msg.append("pdl[" + " ".join(f"{n}:{t:.0f}" for n, t in ptimes.items()) + f"]->{nbest}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -1537,7 +1605,7 @@ def prepare(weights):
         raise errs[0]
     _ma_prepare(weights, st)
     _bfp_prepare(weights, st)
-    for selftest in (_route_selftest, _boundary_selftest):   # the fused tails, each enabled only when it matches
+    for selftest in (_route_selftest, _boundary_selftest, _bnd1_selftest):   # the fused paths, each enabled only when it matches
         try:
             selftest(st)
         except Exception as ex:  # noqa: BLE001
@@ -1569,6 +1637,11 @@ def prepare(weights):
             times = st.get("mm_times", {}).get(k, {})
             v = min(v, key=lambda p: times.get(p, 1e30))
         st.setdefault("mm_pick", {})[k] = v
+    if st.get("fuse_bnd1_ok"):   # the boundary-1 prologue lives in the fused pooler + router launch: pin it at those T
+        for T_ in TUNED_T:
+            if T_ <= BND1_MAX_T:
+                st["mm_pick"][(T_, "pr")] = "bfpf"
+                st["mm_pick"][(T_, "o")] = "bfp"
     torch.cuda.synchronize()
     if st.get("att_ok"):
         _attn_selftest(st)     # every attention plan family once, on synthetic inputs
@@ -1785,6 +1858,7 @@ def _after_attention(data, state, o_in, gate, T):
     v2 = gv.get(T, gv.get(_bucket(T), False)) if FORCE_GLUEV2 is None else FORCE_GLUEV2
     s1 = torch.empty((T, HIDDEN), **f32)
     h = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+    bnd1 = None   # set when _boundary1 is deferred into the fused pooler + router launch's prologue
     if v2:
         # o projection with no K split (each program owns whole rows) + the boundary's four per-token sums
         a_out = torch.empty((T, HIDDEN), **f32)
@@ -1807,8 +1881,13 @@ def _after_attention(data, state, o_in, gate, T):
             P, S = dense(o_in, state["o"], T, state, "o")
         else:
             P, S = dense_ng(o_in, gate, state["o"], T, state)
-        _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
-                         num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+        if (gate is None and S == 1 and P.dtype == torch.bfloat16 and _bnd1_fuse_ok(state, T)
+                and data["stream"].dtype == torch.float32 and data["stream"].is_contiguous()):
+            # deferred: the fused pooler + router launch computes h (its own x) and s1 in its prologue (no launch)
+            bnd1 = (P.view(T, HIDDEN), data["stream"], state["ab1"][0], state["ab1"][1], state["g_preffn"], s1)
+        else:
+            _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
+                             num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
     # 4. pooler + router (BF16 hi + lo rows, FP32 accumulation), routing, pre-expert norm
     ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
     lids = torch.empty((T, 8), device=dev, dtype=torch.int32)
@@ -1827,15 +1906,24 @@ def _after_attention(data, state, o_in, gate, T):
     xm = torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16)
     mmp = state.get("mm_pick", {})
     ppick = mmp.get((T, "pr"), mmp.get((_bucket(T), "pr"), False))
-    if ppick == "bfpf" and T <= 32 and state.get("bfp") is not None:
+    use_fused_pr = ppick == "bfpf" and T <= 32 and state.get("bfp") is not None
+    if bnd1 is not None and not use_fused_pr:   # the deferred boundary has no fused launch to live in: run it
+        _boundary1[(T,)](bnd1[0].view(1, T, HIDDEN), 1, T, bnd1[1], state["gate1"], state["gate1"], state["g_preffn"],
+                         s1, h, num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+        bnd1 = None
+    if use_fused_pr:
         # bf16_proj's fused pooler + router: one launch, both read h once (bf16 [T, 4096], fp32 [T, 256]); with
-        # FUSE_ROUTE its last CTA also does the routing and the pre-expert norm (no _route_split launch)
+        # FUSE_ROUTE its last CTA also does the routing and the pre-expert norm (no _route_split launch); with
+        # bnd1 its prologue computes h (= its x) and s1 from the o-projection output (no _boundary1 launch)
         _bfp_pdl(T)
         route = _fused_route(state, data, ids, lids, wts, xm) if (use_marlin or use_ma) else None
         if route is None:   # (the standalone proj module's launch takes no route argument)
-            P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
+            if bnd1 is not None:
+                P, S = bfp_fused_pooler_router(h, state["bfp"], None, bnd1), -1
+            else:
+                P, S = bfp_fused_pooler_router(h, state["bfp"]), -1
         else:
-            P, S = bfp_fused_pooler_router(h, state["bfp"], route), -2
+            P, S = bfp_fused_pooler_router(h, state["bfp"], route, bnd1), -2
     elif ppick in ("bfp", "bfq") and state.get("bfp") is not None:   # ("bfq": the proj module's m >= 33 routes)
         pooled = _bfp_gemm(state, "pool", h, T, D_EXPERT, HIDDEN)          # bf16 [T, 4096]
         logits = _bfp_gemm(state, "router", h, T, N_EXPERTS, HIDDEN)       # fp32 [T, 256], hi+lo already summed
