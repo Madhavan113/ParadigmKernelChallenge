@@ -2720,7 +2720,7 @@ W12_SHAPES = {}
 # w12b: single-launch form (16-row tile per CTA, W warps over K slices): (layer, n, m) -> (nt, warps, nst)
 # w12m: the 12-bit GEMM for m = 128 / 256 (weights = mma M side, 128*mw-row CTA tiles, 8*nt tokens, K split sk):
 # (layer, n, m) -> (mw, nt, nstage, sk); empty until the judge table shows a win
-W12M_SHAPES = {}
+W12M_SHAPES = {}   # dormant: tensor-bound at the mma.sync rate (~250 TFLOPS measured: pooler m=128 GEMM-only 35.8 us vs 23 cuBLAS; checks f2c19115, 3a2dd69a, 8256bca0)
 W12B_SHAPES = {}   # w12 ties the table at m=8 on the judge (check a6b2bd96: pooler 18.34 vs 18.18, qkv 14.36 vs 14.28) and loses at
 # m=16/32 stay on the table (the w12 GEMM alone is at the memory wall, ~13-17 us, but its K-split reduce launch costs 3-5 us)
 # (layer, n, m) -> (SPLIT_K, num_warps, num_stages): the Triton 12-bit tiled GEMM (m <= 64)
@@ -3134,7 +3134,7 @@ def _launch(x, w, w2, out, state, cfg, m, n, k, layer=None):
 # == END SHARED proj ==
 
 
-BENCH = True        # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = False       # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
