@@ -77,7 +77,7 @@ def _bench_stream(state):
     tiny = torch.empty((1,), dtype=torch.int32, device=dev)
     t_empty = timeit(lambda: tiny.fill_(0))
     print(f"BENCH stream (judge protocol; replay fixed cost {t_empty:.1f} us subtracted): us (TB/s)")
-    combos = [(4, 16384), (6, 16384), (8, 16384), (12, 16384), (2, 32768), (3, 32768), (4, 32768), (6, 32768), (8, 8192)]
+    combos = [(4, 16384), (2, 32768), (6, 32768)]
     for bs in (1, 8):
         x, ids, tw = _judge_inputs(bs, dev, seed=10 + bs)
         experts = sorted(set(int(v) for v in ids[(ids >= 0) & (ids < LOCAL)].flatten().tolist()))
@@ -129,6 +129,33 @@ def _bench_stream(state):
                 print(f"    c{cpsm} ({len(segs)} CTAs x {piece // 1024} KB): " + " | ".join(parts))
                 if time.time() - t0 > BENCH_BUDGET_S:
                     print("  (budget)"); return
+    # bulk-copy weight path vs the current policy, full path (cold-L2 graph replays like _bench_wt)
+    global _WT_OVERRIDE
+    print("BENCH wt bulk (full path, _timeit_cold us; '!' = rel err vs Marlin > 1.2e-2): current policy vs (nt, mw2, ks, nstage, ksplit, bulk)")
+    for bs in (1, 8, 16, 32):
+        x, ids, tw = _judge_inputs(bs, dev, seed=10 + bs)
+        rows = []
+        try:
+            rows.append(f"current {_timeit_cold(lambda: _moe_forward_wt(x, ids, tw, 0, 4096, state), dev):6.1f}")
+        except Exception as e:
+            rows.append(f"current fail {str(e)[:40]}")
+        for v in ((1, 1, 1, 8, 1, 1), (1, 1, 1, 6, 1, 1), (1, 1, 1, 4, 1, 1), (1, 2, 1, 4, 1, 1), (1, 2, 1, 6, 1, 1), (2, 2, 1, 4, 1, 1), (1, 1, 1, 8, 1, 0)):
+            if bs > 8 * v[0]:
+                continue
+            _WT_OVERRIDE = v
+            try:
+                ref = _moe_forward_marlin(x, ids, tw, 0, 4096, state).float()
+                out = _moe_forward_wt(x, ids, tw, 0, 4096, state).float()
+                err = float((out - ref).norm() / ref.norm().clamp(min=1e-12))
+                tt = _timeit_cold(lambda: _moe_forward_wt(x, ids, tw, 0, 4096, state), dev)
+                rows.append(f"{v} {tt:6.1f}{'' if err < 1.2e-2 else '!'}")
+            except Exception as e:
+                rows.append(f"{v} fail {str(e)[:40]}")
+            finally:
+                _WT_OVERRIDE = None
+        print(f"  bs{bs:2d}: " + " | ".join(rows))
+        if time.time() - t0 > BENCH_BUDGET_S:
+            print("  (budget)"); break
     print(f"BENCH stream done in {time.time() - t0:.0f}s")
 # == END stream bench ==
 '''

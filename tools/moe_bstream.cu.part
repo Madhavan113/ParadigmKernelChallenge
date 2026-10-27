@@ -4,23 +4,6 @@
 // length; lengths multiples of 16) through an NST-slot ring of SB-byte bulk copies (cp.async.bulk, one mbarrier per
 // slot, issued by thread 0; the last copy is the remainder), touching 128 x 4 B per stage. The host pads the dynamic
 // smem to pin the CTAs per SM.
-__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
-    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(bar), "r"(count));
-}
-__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
-    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "r"(bytes) : "memory");
-}
-__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
-    asm volatile("{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
-                 :: "r"(bar), "r"(parity) : "memory");
-}
-__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
-    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
-                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
-}
-__device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
-__device__ __forceinline__ void fence_mbar_init() { asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory"); }
-
 template <int NST, int SB>
 __global__ void __launch_bounds__(128) bstream_ranges_kernel(const uint8_t* __restrict__ b0, const uint8_t* __restrict__ b1,
                                                              const long long* __restrict__ ranges, uint32_t* __restrict__ out)
