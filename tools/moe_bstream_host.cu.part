@@ -1,0 +1,25 @@
+// == BEGIN bstream host ==
+void bstream_ranges(torch::Tensor b0, torch::Tensor b1, torch::Tensor ranges, torch::Tensor out, int64_t nst, int64_t sb, int64_t smem_alloc)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(ranges.dtype() == torch::kInt64 && ranges.is_contiguous() && ranges.dim() == 2 && ranges.size(1) == 3, "bstream: ranges [n, 3] int64");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(b0.data_ptr()) & 15) == 0 && (reinterpret_cast<uintptr_t>(b1.data_ptr()) & 15) == 0, "bstream: buffers 16 B aligned");
+    const int n = (int)ranges.size(0);
+    TORCH_CHECK(out.numel() >= 4 * n, "bstream: out");
+    const uint8_t* p0 = reinterpret_cast<const uint8_t*>(b0.data_ptr());
+    const uint8_t* p1 = reinterpret_cast<const uint8_t*>(b1.data_ptr());
+    const long long* r = ranges.data_ptr<long long>();
+    uint32_t* o = reinterpret_cast<uint32_t*>(out.data_ptr());
+    const int smem = (int)std::max<int64_t>(smem_alloc, nst * sb);
+#define BSR_CASE(NS_, SB_) \
+    if (nst == NS_ && sb == SB_) { static bool a = false; \
+        if (!a) { cudaFuncSetAttribute(bstream_ranges_kernel<NS_, SB_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448 - 4096); a = true; } \
+        bstream_ranges_kernel<NS_, SB_><<<(unsigned)n, 128, smem, stream>>>(p0, p1, r, o); return; }
+    BSR_CASE(4, 16384) BSR_CASE(6, 16384) BSR_CASE(8, 16384) BSR_CASE(12, 16384)
+    BSR_CASE(4, 32768) BSR_CASE(6, 32768) BSR_CASE(3, 32768) BSR_CASE(2, 32768)
+    BSR_CASE(8, 8192) BSR_CASE(4, 8192)
+    BSR_CASE(1, 32768)
+#undef BSR_CASE
+    TORCH_CHECK(false, "bstream: unsupported (nst, sb)");
+}
+// == END bstream host ==

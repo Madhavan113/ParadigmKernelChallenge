@@ -1306,6 +1306,69 @@ moe_route_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ 
     if (tid == 0) nblk[0] = total;
 }
 
+// == BEGIN bstream device ==
+// ---- bstream_ranges: loads-only streaming microbenchmark over per-CTA contiguous byte ranges of two buffers
+// (the WT weight / scale layouts of the active experts). CTA i streams range i = (buffer index, byte offset, byte
+// length; lengths multiples of 16) through an NST-slot ring of SB-byte bulk copies (cp.async.bulk, one mbarrier per
+// slot, issued by thread 0; the last copy is the remainder), touching 128 x 4 B per stage. The host pads the dynamic
+// smem to pin the CTAs per SM.
+__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(bar), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+    asm volatile("{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+                 :: "r"(bar), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+__device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void fence_mbar_init() { asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory"); }
+
+template <int NST, int SB>
+__global__ void __launch_bounds__(128) bstream_ranges_kernel(const uint8_t* __restrict__ b0, const uint8_t* __restrict__ b1,
+                                                             const long long* __restrict__ ranges, uint32_t* __restrict__ out)
+{
+    extern __shared__ __align__(128) uint8_t bs_smem[];
+    __shared__ __align__(8) unsigned long long bars[NST];
+    const long long which = ranges[3 * blockIdx.x], off = ranges[3 * blockIdx.x + 1], len = ranges[3 * blockIdx.x + 2];
+    const uint8_t* base = (which == 0 ? b0 : b1) + off;
+    const long long per = (len + SB - 1) / SB;                           // stages (the last one partial)
+    const uint32_t sb = smem_u32(bs_smem);
+    const int tid = threadIdx.x;
+    uint32_t acc = 0;
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NST; ++s) mbar_init(smem_u32(&bars[s]), 1);
+        fence_mbar_init();
+    }
+    __syncthreads();
+    auto issue = [&](long long c, int st) {
+        const uint32_t bytes = (uint32_t)((c + 1) * SB <= len ? SB : len - c * SB);
+        mbar_expect_tx(smem_u32(&bars[st]), bytes);
+        bulk_g2s(sb + st * SB, base + c * SB, bytes, smem_u32(&bars[st]));
+    };
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NST; ++s) if (s < per) issue(s, s);
+    }
+    for (long long c = 0; c < per; ++c) {
+        const int st = (int)(c % NST);
+        mbar_wait(smem_u32(&bars[st]), (uint32_t)((c / NST) & 1));
+        acc ^= *reinterpret_cast<const uint32_t*>(bs_smem + st * SB + (tid * 16) % SB);
+        __syncthreads();
+        if (tid == 0 && c + NST < per) { fence_proxy_async(); issue(c + NST, st); }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((tid & 31) == 0) out[blockIdx.x * 4 + (tid >> 5)] = acc;
+}
+// == END bstream device ==
+
 } // namespace
 
 void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
@@ -1423,7 +1486,33 @@ void moe_route(torch::Tensor ids, torch::Tensor x, torch::Tensor x16, torch::Ten
         ids.data_ptr<int>(), reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<__half*>(x16.data_ptr()),
         sorted_tok.data_ptr<int>(), row_of_pair.data_ptr<int>(), blk_e.data_ptr<int>(), blk_row0.data_ptr<int>(),
         blk_end.data_ptr<int>(), nblk.data_ptr<int>(), blk_bm.data_ptr<int>(), (int)M, (int)local_start, (int)BM, (int)BM2, n_elems, (float)xscale);
+}// == BEGIN bstream host ==
+void bstream_ranges(torch::Tensor b0, torch::Tensor b1, torch::Tensor ranges, torch::Tensor out, int64_t nst, int64_t sb, int64_t smem_alloc)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(ranges.dtype() == torch::kInt64 && ranges.is_contiguous() && ranges.dim() == 2 && ranges.size(1) == 3, "bstream: ranges [n, 3] int64");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(b0.data_ptr()) & 15) == 0 && (reinterpret_cast<uintptr_t>(b1.data_ptr()) & 15) == 0, "bstream: buffers 16 B aligned");
+    const int n = (int)ranges.size(0);
+    TORCH_CHECK(out.numel() >= 4 * n, "bstream: out");
+    const uint8_t* p0 = reinterpret_cast<const uint8_t*>(b0.data_ptr());
+    const uint8_t* p1 = reinterpret_cast<const uint8_t*>(b1.data_ptr());
+    const long long* r = ranges.data_ptr<long long>();
+    uint32_t* o = reinterpret_cast<uint32_t*>(out.data_ptr());
+    const int smem = (int)std::max<int64_t>(smem_alloc, nst * sb);
+#define BSR_CASE(NS_, SB_) \
+    if (nst == NS_ && sb == SB_) { static bool a = false; \
+        if (!a) { cudaFuncSetAttribute(bstream_ranges_kernel<NS_, SB_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448 - 4096); a = true; } \
+        bstream_ranges_kernel<NS_, SB_><<<(unsigned)n, 128, smem, stream>>>(p0, p1, r, o); return; }
+    BSR_CASE(4, 16384) BSR_CASE(6, 16384) BSR_CASE(8, 16384) BSR_CASE(12, 16384)
+    BSR_CASE(4, 32768) BSR_CASE(6, 32768) BSR_CASE(3, 32768) BSR_CASE(2, 32768)
+    BSR_CASE(8, 8192) BSR_CASE(4, 8192)
+    BSR_CASE(1, 32768)
+#undef BSR_CASE
+    TORCH_CHECK(false, "bstream: unsupported (nst, sb)");
 }
+// == END bstream host ==
+
+
 """
 
 CPP_SRC = """
@@ -1443,6 +1532,7 @@ void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, 
 void moe_route(torch::Tensor ids, torch::Tensor x, torch::Tensor x16, torch::Tensor sorted_tok, torch::Tensor row_of_pair,
                torch::Tensor blk_e, torch::Tensor blk_row0, torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor blk_bm,
                int64_t M, int64_t local_start, int64_t BM, int64_t BM2, double xscale);
+void bstream_ranges(torch::Tensor b0, torch::Tensor b1, torch::Tensor ranges, torch::Tensor out, int64_t nst, int64_t sb, int64_t smem_alloc);
 """
 
 _EXT = None
@@ -1453,9 +1543,9 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_moe_w4a16", cpp_sources=[CPP_SRC],
+            name="okc_moe_w4a16b", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_finalize", "moe_route"], extra_cuda_cflags=["-O3", "-arch=sm_90a", "--use_fast_math"], verbose=False)
+            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_finalize", "moe_route", "bstream_ranges"], extra_cuda_cflags=["-O3", "-gencode", "arch=compute_90a,code=sm_90a", "--use_fast_math"], verbose=False)
     return _EXT
 
 
@@ -1961,7 +2051,7 @@ def _moe_forward_triton(x, ids, tw, local_start: int, I: int, state) -> torch.Te
 # == END SHARED moe ==
 
 
-BENCH = False      # microbenchmarks in prepare (untimed; results go to the run log)
+BENCH = True       # microbenchmarks in prepare (untimed; results go to the run log)
 BENCH_BUDGET_S = 170
 
 
@@ -2302,6 +2392,106 @@ def _bench_wt(state, autotune=False):
 AUTOTUNE = False   # pick the wt variant per shape from the in-prepare bench (BENCH) instead of WT_DEFAULT
 
 
+# == BEGIN stream bench ==
+BENCH_STREAM = True   # phase 3 gate: bulk-copy streaming ceiling over the active experts' WT layouts
+
+
+def _bench_stream(state):
+    """Loads-only streaming over exactly the active experts' Wt/St ranges (judge-like routing at bs 1 / 8): bulk-copy
+    rings NST x SB per CTA at 1/2/4 CTAs per SM (each CTA a contiguous range of total / CTAs bytes), vs the current
+    wt kernel's loads-only ablation and its full GEMM, judge protocol (read flush, single graph replay, median)."""
+    import time
+    global _WT_ABL
+    t0 = time.time()
+    dev = state["w13"].device
+    ext = build()
+    sink = torch.empty((4096 * 4,), dtype=torch.int32, device=dev)
+    flush = torch.empty((256 << 20,), dtype=torch.uint8, device=dev)
+    fl = flush.numel() // 264
+    fr = torch.tensor([[0, i * fl, fl - fl % 16] for i in range(264)], dtype=torch.int64, device=dev)
+
+    def do_flush():
+        ext.bstream_ranges(flush, flush, fr, sink, 2, 32768, 65536)
+
+    def timeit(fn, reps=9):
+        fn(); fn()
+        torch.cuda.synchronize()
+        g = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(g):
+            fn()
+        g.replay()
+        torch.cuda.synchronize()
+        ts = []
+        for _ in range(reps):
+            do_flush()
+            e0, e1 = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+            e0.record()
+            g.replay()
+            e1.record()
+            torch.cuda.synchronize()
+            ts.append(e0.elapsed_time(e1) * 1000.0)
+        ts.sort()
+        return ts[len(ts) // 2]
+
+    tiny = torch.empty((1,), dtype=torch.int32, device=dev)
+    t_empty = timeit(lambda: tiny.fill_(0))
+    print(f"BENCH stream (judge protocol; replay fixed cost {t_empty:.1f} us subtracted): us (TB/s)")
+    combos = [(4, 16384), (6, 16384), (8, 16384), (12, 16384), (2, 32768), (3, 32768), (4, 32768), (6, 32768), (8, 8192)]
+    for bs in (1, 8):
+        x, ids, tw = _judge_inputs(bs, dev, seed=10 + bs)
+        experts = sorted(set(int(v) for v in ids[(ids >= 0) & (ids < LOCAL)].flatten().tolist()))
+        nt, mw2, ks, ns, ksp = _wt_variant(bs, state)
+        NP, MAXB = _route_wt(x, ids, 0, 8 * nt, state, ext)
+        maxb = min(MAXB, _wt_max_blocks(bs, 8 * nt))
+        torch.cuda.synchronize()
+        for name, wk, sk_, gated, K_, ntiles, xin, outp in (("gemm1", "Wt13", "St13", True, 4096, 512, state["x16"][:bs], state["inter"]),
+                                                            ("gemm2", "Wt2", "St2", False, 4096, 256, state["inter"], state["y"])):
+            W, S = state[wk], state[sk_]
+            wb, sb_ = W[0].numel() * W.element_size(), S[0].numel() * S.element_size()
+            total = len(experts) * (wb + sb_)
+            lists = (state["sorted_tok"], state["blk_e"], state["blk_row0"], state["blk_end"], state["nblk"], state["blk_bm"])
+            rows = []
+            for abl, label in ((3, "wt loads-only"), (0, "wt full")):
+                try:
+                    tt = timeit(lambda: ext.moe_w4a16_wt(xin, *lists, W, S, state["gs13" if gated else "gs2"], outp, state["part"], state["counters"], ksp, K_, ntiles, maxb,
+                                                         gated, 1 if gated else mw2, nt, ks, ns, state["gs_mul"], abl, False, False)) - t_empty
+                    rows.append(f"{label} {tt:5.1f} ({total / tt / 1e6:.2f})")
+                except Exception as e:
+                    rows.append(f"{label} fail {str(e)[:40]}")
+            print(f"  {name} bs{bs}: {len(experts)} experts, {total / 1e6:.1f} MB | " + " | ".join(rows))
+            for cpsm in (1, 2, 4):
+                n_cta = 132 * cpsm
+                piece = (total // n_cta) // 16 * 16
+                segs = []
+                for e in experts:                                     # the concatenated [W_e | S_e] ranges, cut into pieces
+                    for which, nbytes in ((0, wb), (1, sb_)):
+                        off = e * nbytes
+                        done = 0
+                        while done < nbytes:
+                            ln = min(piece, nbytes - done)
+                            segs.append([which, off + done, ln])
+                            done += ln
+                ranges = torch.tensor(segs, dtype=torch.int64, device=dev)
+                parts = []
+                for nst, sb in combos:
+                    need = nst * sb
+                    cap = min(233472 // cpsm - 1024, 232448 - 4096)
+                    if need > cap:
+                        parts.append(f"{nst}x{sb // 1024}K n/a")
+                        continue
+                    alloc = min(max(need, 233472 // (cpsm + 1)), cap)
+                    try:
+                        tt = timeit(lambda: ext.bstream_ranges(W, S, ranges, sink, nst, sb, alloc)) - t_empty
+                        parts.append(f"{nst}x{sb // 1024}K {tt:5.1f} ({total / tt / 1e6:.2f})")
+                    except Exception as e:
+                        parts.append(f"{nst}x{sb // 1024}K fail {str(e)[:30]}")
+                print(f"    c{cpsm} ({len(segs)} CTAs x {piece // 1024} KB): " + " | ".join(parts))
+                if time.time() - t0 > BENCH_BUDGET_S:
+                    print("  (budget)"); return
+    print(f"BENCH stream done in {time.time() - t0:.0f}s")
+# == END stream bench ==
+
+
 def prepare(weights: Weights):
     state = _moe_state(weights)
     if "Wt13" in state and "bank" in state:
@@ -2311,7 +2501,13 @@ def prepare(weights: Weights):
             print("selftest wt failed:", repr(e)[:200])
             state["wt_ok"] = False
         torch.cuda.synchronize()
-    if BENCH and "Wt13" in state:
+    if BENCH and BENCH_STREAM and "Wt13" in state:
+        try:
+            _bench_stream(state)
+        except Exception as e:
+            print("BENCH stream failed:", repr(e))
+        torch.cuda.synchronize()
+    if BENCH and not BENCH_STREAM and "Wt13" in state:
         try:
             _bench_wt(state, autotune=AUTOTUNE)
         except Exception as e:

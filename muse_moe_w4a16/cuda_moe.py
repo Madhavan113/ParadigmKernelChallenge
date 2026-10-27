@@ -873,6 +873,69 @@ moe_route_kernel(const int* __restrict__ ids, const __nv_bfloat16* __restrict__ 
     if (tid == 0) nblk[0] = total;
 }
 
+// == BEGIN bstream device ==
+// ---- bstream_ranges: loads-only streaming microbenchmark over per-CTA contiguous byte ranges of two buffers
+// (the WT weight / scale layouts of the active experts). CTA i streams range i = (buffer index, byte offset, byte
+// length; lengths multiples of 16) through an NST-slot ring of SB-byte bulk copies (cp.async.bulk, one mbarrier per
+// slot, issued by thread 0; the last copy is the remainder), touching 128 x 4 B per stage. The host pads the dynamic
+// smem to pin the CTAs per SM.
+__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(bar), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+    asm volatile("{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+                 :: "r"(bar), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+__device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void fence_mbar_init() { asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory"); }
+
+template <int NST, int SB>
+__global__ void __launch_bounds__(128) bstream_ranges_kernel(const uint8_t* __restrict__ b0, const uint8_t* __restrict__ b1,
+                                                             const long long* __restrict__ ranges, uint32_t* __restrict__ out)
+{
+    extern __shared__ __align__(128) uint8_t bs_smem[];
+    __shared__ __align__(8) unsigned long long bars[NST];
+    const long long which = ranges[3 * blockIdx.x], off = ranges[3 * blockIdx.x + 1], len = ranges[3 * blockIdx.x + 2];
+    const uint8_t* base = (which == 0 ? b0 : b1) + off;
+    const long long per = (len + SB - 1) / SB;                           // stages (the last one partial)
+    const uint32_t sb = smem_u32(bs_smem);
+    const int tid = threadIdx.x;
+    uint32_t acc = 0;
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NST; ++s) mbar_init(smem_u32(&bars[s]), 1);
+        fence_mbar_init();
+    }
+    __syncthreads();
+    auto issue = [&](long long c, int st) {
+        const uint32_t bytes = (uint32_t)((c + 1) * SB <= len ? SB : len - c * SB);
+        mbar_expect_tx(smem_u32(&bars[st]), bytes);
+        bulk_g2s(sb + st * SB, base + c * SB, bytes, smem_u32(&bars[st]));
+    };
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NST; ++s) if (s < per) issue(s, s);
+    }
+    for (long long c = 0; c < per; ++c) {
+        const int st = (int)(c % NST);
+        mbar_wait(smem_u32(&bars[st]), (uint32_t)((c / NST) & 1));
+        acc ^= *reinterpret_cast<const uint32_t*>(bs_smem + st * SB + (tid * 16) % SB);
+        __syncthreads();
+        if (tid == 0 && c + NST < per) { fence_proxy_async(); issue(c + NST, st); }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((tid & 31) == 0) out[blockIdx.x * 4 + (tid >> 5)] = acc;
+}
+// == END bstream device ==
+
 } // namespace
 
 void moe_w4a16_gemm(torch::Tensor A, torch::Tensor sorted_tok, torch::Tensor blk_e, torch::Tensor blk_row0,
@@ -990,7 +1053,33 @@ void moe_route(torch::Tensor ids, torch::Tensor x, torch::Tensor x16, torch::Ten
         ids.data_ptr<int>(), reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), reinterpret_cast<__half*>(x16.data_ptr()),
         sorted_tok.data_ptr<int>(), row_of_pair.data_ptr<int>(), blk_e.data_ptr<int>(), blk_row0.data_ptr<int>(),
         blk_end.data_ptr<int>(), nblk.data_ptr<int>(), blk_bm.data_ptr<int>(), (int)M, (int)local_start, (int)BM, (int)BM2, n_elems, (float)xscale);
+}// == BEGIN bstream host ==
+void bstream_ranges(torch::Tensor b0, torch::Tensor b1, torch::Tensor ranges, torch::Tensor out, int64_t nst, int64_t sb, int64_t smem_alloc)
+{
+    auto stream = at::cuda::getCurrentCUDAStream();
+    TORCH_CHECK(ranges.dtype() == torch::kInt64 && ranges.is_contiguous() && ranges.dim() == 2 && ranges.size(1) == 3, "bstream: ranges [n, 3] int64");
+    TORCH_CHECK((reinterpret_cast<uintptr_t>(b0.data_ptr()) & 15) == 0 && (reinterpret_cast<uintptr_t>(b1.data_ptr()) & 15) == 0, "bstream: buffers 16 B aligned");
+    const int n = (int)ranges.size(0);
+    TORCH_CHECK(out.numel() >= 4 * n, "bstream: out");
+    const uint8_t* p0 = reinterpret_cast<const uint8_t*>(b0.data_ptr());
+    const uint8_t* p1 = reinterpret_cast<const uint8_t*>(b1.data_ptr());
+    const long long* r = ranges.data_ptr<long long>();
+    uint32_t* o = reinterpret_cast<uint32_t*>(out.data_ptr());
+    const int smem = (int)std::max<int64_t>(smem_alloc, nst * sb);
+#define BSR_CASE(NS_, SB_) \
+    if (nst == NS_ && sb == SB_) { static bool a = false; \
+        if (!a) { cudaFuncSetAttribute(bstream_ranges_kernel<NS_, SB_>, cudaFuncAttributeMaxDynamicSharedMemorySize, 232448 - 4096); a = true; } \
+        bstream_ranges_kernel<NS_, SB_><<<(unsigned)n, 128, smem, stream>>>(p0, p1, r, o); return; }
+    BSR_CASE(4, 16384) BSR_CASE(6, 16384) BSR_CASE(8, 16384) BSR_CASE(12, 16384)
+    BSR_CASE(4, 32768) BSR_CASE(6, 32768) BSR_CASE(3, 32768) BSR_CASE(2, 32768)
+    BSR_CASE(8, 8192) BSR_CASE(4, 8192)
+    BSR_CASE(1, 32768)
+#undef BSR_CASE
+    TORCH_CHECK(false, "bstream: unsupported (nst, sb)");
 }
+// == END bstream host ==
+
+
 """
 
 CPP_SRC = """
@@ -1010,6 +1099,7 @@ void moe_finalize(torch::Tensor y, torch::Tensor row_of_pair, torch::Tensor tw, 
 void moe_route(torch::Tensor ids, torch::Tensor x, torch::Tensor x16, torch::Tensor sorted_tok, torch::Tensor row_of_pair,
                torch::Tensor blk_e, torch::Tensor blk_row0, torch::Tensor blk_end, torch::Tensor nblk, torch::Tensor blk_bm,
                int64_t M, int64_t local_start, int64_t BM, int64_t BM2, double xscale);
+void bstream_ranges(torch::Tensor b0, torch::Tensor b1, torch::Tensor ranges, torch::Tensor out, int64_t nst, int64_t sb, int64_t smem_alloc);
 """
 
 _EXT = None
@@ -1020,9 +1110,9 @@ def build():
     if _EXT is None:
         from torch.utils.cpp_extension import load_inline
         _EXT = load_inline(
-            name="okc_moe_w4a16", cpp_sources=[CPP_SRC],
+            name="okc_moe_w4a16b", cpp_sources=[CPP_SRC],
             cuda_sources=["#include <torch/extension.h>\n#include <ATen/cuda/CUDAContext.h>\n" + CUDA_SRC],
-            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_finalize", "moe_route"], extra_cuda_cflags=["-O3", "-arch=sm_90a", "--use_fast_math"], verbose=False)
+            functions=["moe_w4a16_gemm", "moe_w4a16_wt", "moe_finalize", "moe_route", "bstream_ranges"], extra_cuda_cflags=["-O3", "-gencode", "arch=compute_90a,code=sm_90a", "--use_fast_math"], verbose=False)
     return _EXT
 
 

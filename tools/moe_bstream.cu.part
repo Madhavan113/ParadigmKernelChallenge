@@ -1,0 +1,62 @@
+// == BEGIN bstream device ==
+// ---- bstream_ranges: loads-only streaming microbenchmark over per-CTA contiguous byte ranges of two buffers
+// (the WT weight / scale layouts of the active experts). CTA i streams range i = (buffer index, byte offset, byte
+// length; lengths multiples of 16) through an NST-slot ring of SB-byte bulk copies (cp.async.bulk, one mbarrier per
+// slot, issued by thread 0; the last copy is the remainder), touching 128 x 4 B per stage. The host pads the dynamic
+// smem to pin the CTAs per SM.
+__device__ __forceinline__ void mbar_init(uint32_t bar, uint32_t count) {
+    asm volatile("mbarrier.init.shared::cta.b64 [%0], %1;\n" :: "r"(bar), "r"(count));
+}
+__device__ __forceinline__ void mbar_expect_tx(uint32_t bar, uint32_t bytes) {
+    asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" :: "r"(bar), "r"(bytes) : "memory");
+}
+__device__ __forceinline__ void mbar_wait(uint32_t bar, uint32_t parity) {
+    asm volatile("{\n .reg .pred p;\n WAIT_%=:\n mbarrier.try_wait.parity.shared::cta.b64 p, [%0], %1;\n @!p bra WAIT_%=;\n}\n"
+                 :: "r"(bar), "r"(parity) : "memory");
+}
+__device__ __forceinline__ void bulk_g2s(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+    asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes [%0], [%1], %2, [%3];\n"
+                 :: "r"(dst), "l"(src), "r"(bytes), "r"(bar) : "memory");
+}
+__device__ __forceinline__ void fence_proxy_async() { asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory"); }
+__device__ __forceinline__ void fence_mbar_init() { asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory"); }
+
+template <int NST, int SB>
+__global__ void __launch_bounds__(128) bstream_ranges_kernel(const uint8_t* __restrict__ b0, const uint8_t* __restrict__ b1,
+                                                             const long long* __restrict__ ranges, uint32_t* __restrict__ out)
+{
+    extern __shared__ __align__(128) uint8_t bs_smem[];
+    __shared__ __align__(8) unsigned long long bars[NST];
+    const long long which = ranges[3 * blockIdx.x], off = ranges[3 * blockIdx.x + 1], len = ranges[3 * blockIdx.x + 2];
+    const uint8_t* base = (which == 0 ? b0 : b1) + off;
+    const long long per = (len + SB - 1) / SB;                           // stages (the last one partial)
+    const uint32_t sb = smem_u32(bs_smem);
+    const int tid = threadIdx.x;
+    uint32_t acc = 0;
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NST; ++s) mbar_init(smem_u32(&bars[s]), 1);
+        fence_mbar_init();
+    }
+    __syncthreads();
+    auto issue = [&](long long c, int st) {
+        const uint32_t bytes = (uint32_t)((c + 1) * SB <= len ? SB : len - c * SB);
+        mbar_expect_tx(smem_u32(&bars[st]), bytes);
+        bulk_g2s(sb + st * SB, base + c * SB, bytes, smem_u32(&bars[st]));
+    };
+    if (tid == 0) {
+        #pragma unroll
+        for (int s = 0; s < NST; ++s) if (s < per) issue(s, s);
+    }
+    for (long long c = 0; c < per; ++c) {
+        const int st = (int)(c % NST);
+        mbar_wait(smem_u32(&bars[st]), (uint32_t)((c / NST) & 1));
+        acc ^= *reinterpret_cast<const uint32_t*>(bs_smem + st * SB + (tid * 16) % SB);
+        __syncthreads();
+        if (tid == 0 && c + NST < per) { fence_proxy_async(); issue(c + NST, st); }
+    }
+    #pragma unroll
+    for (int o = 16; o > 0; o >>= 1) acc ^= __shfl_xor_sync(0xffffffffu, acc, o);
+    if ((tid & 31) == 0) out[blockIdx.x * 4 + (tid >> 5)] = acc;
+}
+// == END bstream device ==
