@@ -111,6 +111,10 @@ namespace {
 #define OKC_EXH8F 0     // flat q8 (PK2 path): the softmax exponentials as f16x2 pairs (half the MUFU ops; the P bytes are e4m3
                         // anyway); the lazy-offset byte test, the split PV and the late sync are unchanged
 #endif
+#ifndef OKC_PFL2
+#define OKC_PFL2 0      // flat q1 producer (page indices by TMA): prefetch.global.L2 of the K/V rows OKC_PFL2 tiles ahead of
+                        // the copies (more rows in flight without more stages); 0 = off
+#endif
 #ifndef OKC_PIPE8
 #define OKC_PIPE8 0     // flat q8: the next tile's stage wait + QK^T wgmma issued right after this tile's PV wgmma (both in
                         // flight across the loop edge: the QK^T latency and the PV end-of-tile wait leave the chain)
@@ -1910,6 +1914,20 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         if constexpr (TMAPG_ON) {
           fetch_pages(x + PD);
           load_pages_t(x, pg);
+#if OKC_PFL2 > 0 && OKC_PFAST
+          // (OKC_PFL2) the rows of tile x + OKC_PFL2 toward L2 (its page indices landed PD - OKC_PFL2 tiles ago); one
+          // lane per row, common tiles only
+          if (OKC_PFL2 < PD && pfast && ch == 0 && x + OKC_PFL2 < ntiles && start + (x + OKC_PFL2) * TILE + TILE <= cache_end) {
+            int pgf[PK];
+            load_pages_t(x + OKC_PFL2, pgf);
+#pragma unroll
+            for (int k = 0; k < PK; ++k) {
+              const uint32_t off = ((uint32_t)pgf[k] << p.lrb) + pcol;
+              asm volatile("prefetch.global.L2 [%0];" ::"l"(p.k_cache + off));
+              asm volatile("prefetch.global.L2 [%0];" ::"l"(p.v_cache + off));
+            }
+          }
+#endif
         } else {
           load_pages(x + 1, pgn);   // in flight while this tile's copies issue
         }
@@ -5303,10 +5321,10 @@ _BENCH_DONE = False
 # (name, extra nvcc flags) of the builds the sweep times on synthetic inputs shaped like the scored full-context cases
 BENCH_VARIANTS = [
     ("base", ()),
-    ("pvsplit2", ("-DOKC_PVSPLIT=2",)),
-    ("pvsplit2_pipe8", ("-DOKC_PVSPLIT=2", "-DOKC_PIPE8=1")),
+    ("pfl2_1", ("-DOKC_PFL2=1",)),
+    ("pfl2_2", ("-DOKC_PFL2=2",)),
 ]
-BENCH_SHAPES = [(16, 8), (32, 8)]   # (batch, q_len), full layer, ctx 80000 agentic
+BENCH_SHAPES = [(16, 1), (32, 1)]   # (batch, q_len), full layer, ctx 80000 agentic
 # launch-plan sweeps on the base build: ((batch, q_len, window), [override dicts]) ({} = today's plan)
 W2K = 2048
 BENCH_PLANS = []
