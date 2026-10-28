@@ -329,6 +329,11 @@ constexpr int HD = 4096, ID = 4096;
 constexpr int NW = OKC_NW, NT = NW * 32;
 constexpr int NTL = NT + (OKC_WGS ? (OKC_WGSFOLD ? 0 : OKC_WGSREG ? 128 : 64) : OKC_WS ? 32 : 0);  // + helper warp (WS) | weights and x producer warps (WGS)  // launched: NT compute threads (+ helper warp | WGS producer warp + epilogue warpgroup)
 constexpr int NRB = OKC_WS ? OKC_WSNR : 2;   // cross-warp partial-sum buffers
+#ifndef OKC_WSWARM
+#define OKC_WSWARM 0  // WS tiny builds: the helper warp runs its two epilogue code paths once with nothing to store before
+                      // the first unit arrives (instruction fetch: the first real epilogue took ~5 us on a cold code path
+                      // under the saturated memory system, later ones 0.2-0.5 us; the backlog delayed the doneA credits)
+#endif
 #ifndef OKC_WSH0
 #define OKC_WSH0 0  // WS tiny builds: the helper warp is HARDWARE warp 0 (the oldest warp of the CTA, which a greedy-then-
                     // oldest scheduler prefers over the ALU-saturating compute warps; as the youngest warp its first
@@ -339,9 +344,9 @@ constexpr int NRB = OKC_WS ? OKC_WSNR : 2;   // cross-warp partial-sum buffers
 #error "OKC_WSH0 needs the WS helper warp"
 #endif
 #if OKC_WSH0
-#define TIDX ((int)((threadIdx.x + NT) % NTL))
+#define TIDX ((threadIdx.x + NT) % NTL)
 #else
-#define TIDX ((int)threadIdx.x)
+#define TIDX threadIdx.x
 #endif
 #if OKC_WS || OKC_WGS
 // CTA barrier over the NT compute threads only (the helper warp syncs with them through mbarriers and barrier 2)
@@ -2517,7 +2522,8 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
 #endif
   unsigned long long dv_fence = 0, dv_wA = 0, dv_wB = 0, dv_eA = 0, dv_eB = 0, dv_t = 0;  // (debug) helper accounting
   if (OKC_DEBUG && lane == 0 && p.dbg) *DBGV_PTR(5) = gtimer();
-  for (int q = 0; q < Nh; ++q) {
+  for (int q = OKC_WSWARM ? -2 : 0; q < Nh; ++q) {
+    const bool warm = OKC_WSWARM && q < 0;  // OKC_WSWARM: q = -2 warms the phase-A epilogue code, q = -1 the phase-B one (constant false otherwise)
 #if !OKC_NOLOAD
     if (!OKC_WSRF && !OKC_WSB && lane == 0 && q + OKC_NS < N) {  // unit q + NS goes into unit q's slot once every compute warp released it
       mbar_wait(S.wse + q % OKC_NS, (uint32_t)((q / OKC_NS) & 1));
@@ -2527,13 +2533,13 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
 #if OKC_PBPF
     if (q < nA) pf_issue(q == nA - 1 ? (pf_n - pf_i + 31) / 32 : pf_per);
 #endif
-    const bool PB = q >= nA;
-    const int v = (OKC_WSSTR && ws_str(S)) ? (int)blockIdx.x + (PB ? q - nA : q) * (int)gridDim.x : (PB ? b0 + (q - nA) : a0 + q);
+    const bool PB = warm ? (q == -1) : (q >= nA);
+    const int v = warm ? 0 : (OKC_WSSTR && ws_str(S)) ? (int)blockIdx.x + (PB ? q - nA : q) * (int)gridDim.x : (PB ? b0 + (q - nA) : a0 + q);
     const int rbs = PB ? RB_B : RB_A;
     const int j = njF + v / rbs, rb = v - (v / rbs) * rbs;
-    const int bb = q % NRB;
+    const int bb = warm ? 0 : q % NRB;
     if (OKC_DEBUG) dv_t = gtimer();
-    mbar_wait(S.wsrf + bb, (uint32_t)((q / NRB) & 1));
+    if (!warm) mbar_wait(S.wsrf + bb, (uint32_t)((q / NRB) & 1));
     if (OKC_DEBUG) { const unsigned long long t1 = gtimer(); if (PB) dv_wB += t1 - dv_t; else dv_wA += t1 - dv_t; dv_t = t1; }
     float4 sm = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
@@ -2542,9 +2548,9 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
       sm.x += t.x; sm.y += t.y; sm.z += t.z; sm.w += t.w;
     }
     __syncwarp();
-    if (lane == 0) mbar_arrive1(S.wsre + bb);  // buffer free again
+    if (!warm && lane == 0) mbar_arrive1(S.wsre + bb);  // buffer free again
     // sm: (row gg, token 2tt), (row gg, token 2tt+1), (row gg+8, token 2tt), (row gg+8, token 2tt+1)
-    const int cnt = S.jC[j], st = S.jS[j], ce = S.jE[j];
+    const int cnt = warm ? 0 : S.jC[j], st = S.jS[j], ce = S.jE[j];  // (warm: no token -> no store, no atomic)
     if (!PB) {
 #if OKC_WSHP
       const float gsc = S.hgs[0][ce] * TWO62;
@@ -2560,6 +2566,7 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
           st_keep_bf16(p.inter + ((size_t)(st + tk) * ID + rb * 8 + gg), __float2bfloat16(probe_q(SILU_DIV(gt, 1.f + __expf(-gt)) * up)));
         }
       }
+      if (!warm)
 #if OKC_WSSTR
       if (ws_str(S)) {  // strided order: job j is credited as soon as this CTA's last unit of it is done (its B can start)
         if (q == nA - 1 || (((int)blockIdx.x + (q + 1) * (int)gridDim.x) >> RB_A_LOG) != (v >> RB_A_LOG)) {
@@ -2590,12 +2597,13 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
       }
       if (OKC_DEBUG && q == 0 && lane == 0) DBGU(3);  // (debug) the helper's first phase-A epilogue done
     } else {
-      const int n0 = rb * 16 + gg;
 #if OKC_WSHP
+      const int n0 = rb * 16 + gg;
       const float gsc = S.hgs[1][ce] * TWO62;
       const float nw0 = 1.f + __bfloat162float(S.hnw[n0]), nw1 = 1.f + __bfloat162float(S.hnw[n0 + 8]);
 #else
       const float gsc = p.gsB[ce] * TWO62;
+      const int n0 = rb * 16 + gg;
       const float nw0 = 1.f + __bfloat162float(p.normw[n0]), nw1 = 1.f + __bfloat162float(p.normw[n0 + 8]);
 #endif
 #pragma unroll
@@ -5193,10 +5201,10 @@ TINY_MAX_M = 4
 TINY2_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=1', '-DOKC_FINPF=1')  # bf16 WSB (Oct 26: bs8 +2.0..2.5%)
 TINY2_MAX_M = 8
 # TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
-MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
+MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1', '-DOKC_WSH0=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split  # Oct 28: + OKC_WSH0 (helper = hardware warp 0): -2.0..-2.9 us at bs16 on judge seeds 0-2 (VM, paired); TINY/TINY2 neutral -> unchanged
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
-DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "X"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
+DIAG_SET = "Z2"            # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 def _fast1(defs, n):  # a tiny define tuple with another FAST1 pre-issue depth (units issued before routing, <= OKC_NS)
@@ -5215,6 +5223,45 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "Z2": {  # the MID-only OKC_WSH0 policy: new MID vs the previous MID at bs16 on judge seeds 0-2 (two timings each);
+             # TINY / TINY2 unchanged (SASS byte-identical), timed once for the table
+        "mid_old": {"defines": tuple(d for d in MID_DEFINES if d != "-DOKC_WSH0=1"), "shapes": [16]},
+        "mid": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_old_b": {"defines": tuple(d for d in MID_DEFINES if d != "-DOKC_WSH0=1"), "shapes": [16]},
+        "mid_b": {"defines": MID_DEFINES, "shapes": [16]},
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+    },
+    "Z": {  # OKC_WSH0 paired against the shipped builds on the judge's generate_input at seeds 0-2 (two timings each)
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_h0": {"defines": TINY_DEFINES + ("-DOKC_WSH0=1",), "shapes": [1]},
+        "tiny_b": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_h0_b": {"defines": TINY_DEFINES + ("-DOKC_WSH0=1",), "shapes": [1]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_h0": {"defines": TINY2_DEFINES + ("-DOKC_WSH0=1",), "shapes": [8]},
+        "tiny2_b": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_h0_b": {"defines": TINY2_DEFINES + ("-DOKC_WSH0=1",), "shapes": [8]},
+        "mid": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_h0": {"defines": MID_DEFINES + ("-DOKC_WSH0=1",), "shapes": [16]},
+        "mid_b": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_h0_b": {"defines": MID_DEFINES + ("-DOKC_WSH0=1",), "shapes": [16]},
+    },
+    "Y": {  # OKC_WSWARM: the helper's epilogue code paths warmed before the first unit (set V-X stamps: the first real
+            # epilogue ~5 us regardless of constants in smem, TLB warm-up or warp age); alone, with H0, with the strided order
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_warm": {"defines": TINY_DEFINES + ("-DOKC_WSWARM=1",), "shapes": [1]},
+        "tiny_warm_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSWARM=1", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny_h0_warm": {"defines": TINY_DEFINES + ("-DOKC_WSWARM=1", "-DOKC_WSH0=1"), "shapes": [1]},
+        "tiny_h0_warm_str": {"defines": TINY_DEFINES + ("-DOKC_WSWARM=1", "-DOKC_WSH0=1", "-DOKC_WSSTR=4"), "shapes": [1]},
+        "tiny_h0_warm_str_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSWARM=1", "-DOKC_WSH0=1", "-DOKC_WSSTR=4", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_warm": {"defines": TINY2_DEFINES + ("-DOKC_WSWARM=1",), "shapes": [8]},
+        "tiny2_h0_warm": {"defines": TINY2_DEFINES + ("-DOKC_WSWARM=1", "-DOKC_WSH0=1"), "shapes": [8]},
+        "tiny2_h0_warm_dbg": {"defines": TINY2_DEFINES + ("-DOKC_WSWARM=1", "-DOKC_WSH0=1", "-DOKC_DEBUG=1"), "shapes": [8]},
+        "mid": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_warm": {"defines": MID_DEFINES + ("-DOKC_WSWARM=1",), "shapes": [16]},
+        "mid_h0_warm": {"defines": MID_DEFINES + ("-DOKC_WSWARM=1", "-DOKC_WSH0=1"), "shapes": [16]},
     },
     "X": {  # OKC_WSH0: the helper as hardware warp 0 (scheduler age priority), alone and with the strided order
         "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
@@ -5430,11 +5477,11 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET in ("Q", "S", "V") else [1, 8, 16] if DIAG_SET in ("W", "X") else [1, 4, 8, 16] if DIAG_SET in ("R", "T") else [32, 128] if DIAG_SET == "U" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET in ("Q", "S", "V") else [1, 8, 16] if DIAG_SET in ("W", "X", "Y", "Z", "Z2") else [1, 4, 8, 16] if DIAG_SET in ("R", "T") else [32, 128] if DIAG_SET == "U" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 # (bs, touched local experts) cases: the input seed is searched (DIAG_SEED + bs + 1000 k) for the judge's typical draw
 # (tools/moe_routing_stats.py, 60 seeds: bs1 p10/p50/p90 2/3/3, bs4 4/6/8, bs8 5/8/11); None: the fixed seed
-DIAG_CASES = [(1, 2), (1, 3), (8, 8)] if DIAG_SET == "V" else [(1, 2), (1, 3), (8, 8), (16, None)] if DIAG_SET in ("W", "X") else [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET in ("Q", "S") else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET in ("R", "T") else [(bs, None) for bs in DIAG_SHAPES]
+DIAG_CASES = [(16, ("ref", sd)) for sd in (0, 1, 2)] + [(1, ("ref", 0)), (8, ("ref", 0))] if DIAG_SET == "Z2" else [(bs, ("ref", sd)) for bs in (1, 8, 16) for sd in (0, 1, 2)] if DIAG_SET == "Z" else [(1, 2), (1, 3), (8, 8)] if DIAG_SET == "V" else [(1, 2), (1, 3), (8, 8), (16, None)] if DIAG_SET in ("W", "X", "Y") else [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET in ("Q", "S") else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET in ("R", "T") else [(bs, None) for bs in DIAG_SHAPES]
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
 
@@ -5988,6 +6035,16 @@ def _diag(state, weights):
     def _built(d):  # (an unbuilt variant only loses its column)
         return (d + (("-DOKC_DQ7=1",) if DQ7 and "-DOKC_DQ7=1" not in d else ())) in _EXTS
     def _case_input(bs, target):
+        if isinstance(target, tuple) and target[0] == "ref":  # the judge's generate_input at this seed (gpu_run --seed)
+            import importlib, os, sys
+            here = os.path.dirname(os.path.abspath(__file__))
+            if here not in sys.path:
+                sys.path.insert(0, here)
+            R = importlib.import_module("reference")
+            d = R.generate_input(seed=target[1], bs=bs, sharding="ep8")
+            d = {k: (v.to(dev) if hasattr(v, "to") else v) for k, v in d.items()}
+            ids = d["topk_ids"]
+            return d, int(torch.unique(ids[(ids >= 0) & (ids < 32)]).numel())
         for k in range(64 if target is not None else 1):
             d = _gen_input(bs, DIAG_SEED + bs + 1000 * k, dev)
             ids = d["topk_ids"]
@@ -6001,7 +6058,7 @@ def _diag(state, weights):
         ids = d["topk_ids"]
         ref = kernel_fn(d, state)  # the shipped policy's output for this input
         torch.cuda.synchronize()
-        row = [f"bs={bs:3d} touched={touched:2d}"]
+        row = [f"bs={bs:3d} touched={touched:2d}" + (f" seed={target[1]}" if isinstance(target, tuple) else "")]
         for name, (defs, vshapes) in variants.items():
             if bs not in vshapes or not _built(defs):
                 continue
