@@ -2035,7 +2035,7 @@ void gqx(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t M, int64_t
          int64_t cl, int64_t nstage);
 void rk(torch::Tensor Wc, torch::Tensor x, torch::Tensor out, int64_t S, torch::Tensor zc);
 void skx(torch::Tensor W, torch::Tensor Wt, torch::Tensor x, torch::Tensor out, torch::Tensor slab, torch::Tensor cnt,
-         int64_t M, int64_t N, int64_t K, int64_t bn, int64_t nstage, int64_t fix, int64_t tiled, int64_t grid);
+         int64_t M, int64_t N, int64_t K, int64_t bn, int64_t nstage, int64_t fix, int64_t tiled, int64_t diag, int64_t grid);
 """
 
 # (layer, mt) -> (splits, RG, WS); grid = (N / (16 RG), splits) ~ 128 CTAs
@@ -2723,7 +2723,9 @@ __device__ __forceinline__ void skx_store4(__nv_bfloat16* __restrict__ out, int 
 }
 #endif
 
-template <int BN, int NSTAGE, int FIX, bool TILED>
+// DIAG (measurement builds only, never self-tested, picked or routed): 1 = main loops only (no export, no tickets),
+// 2 = + the fragment export, 3 = + the release fence and tickets (no wait / reduce / epilogue).
+template <int BN, int NSTAGE, int FIX, bool TILED, int DIAG>
 __global__ void __launch_bounds__(288, 1)
 skx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUtensorMap mapX,
            const uint8_t* __restrict__ Wt, __nv_bfloat16* __restrict__ out, float4* __restrict__ slab,
@@ -2805,6 +2807,10 @@ skx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
     for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
     if (t == 0) mbar_arrive(empty0 + 8 * pending);
     pending = -1;
+    if constexpr (DIAG == 1) {   // keep the wgmma chain alive (ptxas drops accumulators nobody reads: 24 registers)
+      if (acc[0] == 12345.678f && acc[NACC - 1] == -12345.678f) out[tid] = __float2bfloat16_rn(acc[1]);
+      continue;
+    }
     // export this segment's fragments (no fence yet: a straddler goes straight on to its second segment)
     float4* sl = slab + (size_t)(FIX == 0 ? rb : (s ? G : 0) + ci) * NF4 + tid;
 #pragma unroll
@@ -2817,12 +2823,18 @@ skx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
         __stcg(sl + j * NTH, make_float4(acc[4 * j], acc[4 * j + 1], acc[4 * j + 2], acc[4 * j + 3]));
     }
   }
-  __threadfence();
+  if constexpr (DIAG == 1 || DIAG == 2) return;
+  // every consumer thread's exports precede the tickets: CTA barrier, then one thread releases at gpu scope
+  // (fence.acq_rel.gpu is cumulative over what the barrier made visible; a per-thread __threadfence = fence.sc.gpu
+  // costs microseconds), takes the tickets and acquires
   named_bar(1, NTH);
   if (tid == 0) {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
     for (int s = 0; s < nseg; ++s) s_tk[s] = atomicAdd(cnt + rb0 + s, 1);
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
   }
   named_bar(1, NTH);
+  if constexpr (DIAG == 3) return;
   for (int s = 0; s < nseg; ++s) {
     const int rb = rb0 + s;
     const int fc = (int)(((long long)(rb * C + 1) * G - 1) / U);            // first CTA touching rb
@@ -2830,7 +2842,6 @@ skx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
     const int P = lc - fc + 1;
     if constexpr (FIX == 0) {
       if (s_tk[s] != P - 1) continue;   // not the last arriver of this row block
-      __threadfence();
       const float4* src = slab + (size_t)rb * NF4 + tid;
 #pragma unroll 4
       for (int j = 0; j < NB; ++j) skx_store4(out, M, N, rb, j, tid, __ldcg(src + j * NTH));
@@ -2852,7 +2863,6 @@ skx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
         }
       }
       named_bar(1, NTH);
-      __threadfence();
       const int ua = s == 0 ? u0 : rb * C, ub = s == nseg - 1 ? u1 : (rb + 1) * C;
       const int lo = (int)(((long long)(ua - rb * C) * NF4) / C), hi = (int)(((long long)(ub - rb * C) * NF4) / C);
       for (int idx = lo + tid; idx < hi; idx += NTH) {
@@ -2877,13 +2887,13 @@ skx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUt
 #endif
 }
 
-template <int BN, int NSTAGE, int FIX, bool TILED>
+template <int BN, int NSTAGE, int FIX, bool TILED, int DIAG>
 static void launch_skx(const at::Tensor& W, const at::Tensor& Wt, const at::Tensor& x, at::Tensor& out, at::Tensor& slab,
                        at::Tensor& cnt, int M, int N, int K, int grid) {
   constexpr int ST = 128 * 128 + BN * 128;
   constexpr int NF4 = (BN / 8) * 256;
   const size_t smem = 1024 + (size_t)NSTAGE * ST + 16 * NSTAGE + 16;
-  auto kern = skx_kernel<BN, NSTAGE, FIX, TILED>;
+  auto kern = skx_kernel<BN, NSTAGE, FIX, TILED, DIAG>;
   TORCH_CHECK(N % 128 == 0 && K % 64 == 0 && M >= 1 && M <= BN, "skx: shape");
   const int C = K / 64, RB = N / 128, U = RB * C;
   TORCH_CHECK(U >= grid && (U + grid - 1) / grid <= C, "skx: schedule (units per CTA must not exceed a row block)");
@@ -2896,8 +2906,8 @@ static void launch_skx(const at::Tensor& W, const at::Tensor& Wt, const at::Tens
     int nb = 0;
     cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, kern, 288, smem);
     cudaGetLastError();
-    fprintf(stderr, "[okc] skx<bn %d, ns %d, fix %d, tiled %d>: smem %d, CTAs/SM %d, grid %d\n", BN, NSTAGE, FIX, (int)TILED,
-            (int)smem, nb, grid);
+    fprintf(stderr, "[okc] skx<bn %d, ns %d, fix %d, tiled %d, diag %d>: smem %d, CTAs/SM %d, grid %d\n", BN, NSTAGE, FIX,
+            (int)TILED, DIAG, (int)smem, nb, grid);
     TORCH_CHECK(nb >= 1, "skx: the CTA does not fit an SM");
     attr_done = true;
   }
@@ -2910,37 +2920,42 @@ static void launch_skx(const at::Tensor& W, const at::Tensor& Wt, const at::Tens
 }
 
 void skx(at::Tensor W, at::Tensor Wt, at::Tensor x, at::Tensor out, at::Tensor slab, at::Tensor cnt, int64_t M, int64_t N,
-         int64_t K, int64_t bn, int64_t nstage, int64_t fix, int64_t tiled, int64_t grid) {
+         int64_t K, int64_t bn, int64_t nstage, int64_t fix, int64_t tiled, int64_t diag, int64_t grid) {
   @@SKX_DISPATCH@@
   TORCH_CHECK(false, "skx: no config");
 }
 """
 
-# (layer, bn) -> [(nstage, fix, tiled), ...]: persistent stream-K candidates (grid = SM count, 1 CTA per SM, BM = 128);
+# (layer, bn) -> [(nstage, fix, tiled, diag), ...]: persistent stream-K candidates (grid = SM count, 1 CTA per SM, BM = 128);
 # fix 0 = red.add slabs + last-arriver epilogue (self-cleaning), fix 1 = per-CTA slabs + co-resident distributed reduce;
-# tiled 1 = W from the pre-swizzled contiguous copy (one bulk copy per unit).  Every entry is an autotune candidate.
+# tiled 1 = W from the pre-swizzled contiguous copy (one bulk copy per unit); diag > 0 = deliberately incomplete
+# measurement build (timed by the autotuner, never self-tested, picked or routed).  Every entry is a candidate.
+# Check 1 (e79f1d99, m=128 bench us): qkv fix1/fix0/tiled 28.3/31.1/28.1/30.7 vs gqx 18.0; o 25.0/25.8/24.6/25.4 vs
+# torchT 10.5; pooler 36.2/37.6/35.8/37.7 vs gq 25.0; unpooler 37.8/37.8/37.1/37.4 vs torchT 22.5; m=256 (4,1,0) 38-54
+# vs 23-31: ~0.5 us per unit (ingest-bound as modeled) but ~18 us of fixup overhead (per-thread fence.sc.gpu + ticket).
 SKX_CONFIGS = {
-    ("qkv_gate", 128): [(6, 1, 0), (6, 0, 0), (6, 1, 1), (6, 0, 1)],
-    ("pooler", 128): [(6, 1, 0), (6, 0, 0), (6, 1, 1), (6, 0, 1)],
-    ("unpooler", 128): [(6, 1, 0), (6, 0, 0), (6, 1, 1), (6, 0, 1)],
-    ("o", 128): [(6, 1, 0), (6, 0, 0), (6, 1, 1), (6, 0, 1)],
-    ("qkv_gate", 256): [(4, 1, 0)],
-    ("pooler", 256): [(4, 1, 0)],
-    ("unpooler", 256): [(4, 1, 0)],
-    ("o", 256): [(4, 1, 0)],
+    ("qkv_gate", 128): [(6, 1, 0, 0), (6, 0, 0, 0), (6, 1, 0, 1), (6, 1, 0, 2), (6, 1, 0, 3)],
+    ("pooler", 128): [(6, 1, 0, 0), (6, 0, 0, 0), (6, 1, 0, 1), (6, 1, 0, 2), (6, 1, 0, 3)],
+    ("unpooler", 128): [(6, 1, 0, 0), (6, 0, 0, 0), (6, 1, 0, 1), (6, 1, 0, 2), (6, 1, 0, 3)],
+    ("o", 128): [(6, 1, 0, 0), (6, 0, 0, 0), (6, 1, 0, 1), (6, 1, 0, 2), (6, 1, 0, 3)],
 }
 USE_SKX = True
+
+
+def _skx_diag(layer, m, ch):
+    """True for a diagnostic (incomplete) skx candidate: timed, never self-tested, picked or routed."""
+    return ch[0] == "skx" and SKX_CONFIGS[(layer, _skx_bn(m))][ch[1] if len(ch) > 1 else 0][3] > 0
 
 
 def _skx_src(sm90):
     if not sm90 or not SKX_CONFIGS:
         return ('void skx(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, '
-                'int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) { TORCH_CHECK(false, "skx needs sm_90"); }')
+                'int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) { TORCH_CHECK(false, "skx needs sm_90"); }')
     lines = []
     for (layer, bn), cfgs in sorted(SKX_CONFIGS.items()):
-        for ns, fix, tiled in cfgs:
-            lines.append(f"if (bn == {bn} && nstage == {ns} && fix == {fix} && tiled == {tiled}) "
-                         f"{{ launch_skx<{bn}, {ns}, {fix}, {str(bool(tiled)).lower()}>(W, Wt, x, out, slab, cnt, M, N, K, (int)grid); return; }}")
+        for ns, fix, tiled, diag in cfgs:
+            lines.append(f"if (bn == {bn} && nstage == {ns} && fix == {fix} && tiled == {tiled} && diag == {diag}) "
+                         f"{{ launch_skx<{bn}, {ns}, {fix}, {str(bool(tiled)).lower()}, {diag}>(W, Wt, x, out, slab, cnt, M, N, K, (int)grid); return; }}")
     return SKX_SRC.replace("@@SKX_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
 
 
@@ -2955,7 +2970,7 @@ def skx_prepare(weights, state):
         return
     dev = weights["o"].device
     nsm = state["nsm"]
-    cfgs = [(layer, bn, ns, fix, tiled) for (layer, bn), lst in SKX_CONFIGS.items() for (ns, fix, tiled) in lst
+    cfgs = [(layer, bn, ns, fix, tiled) for (layer, bn), lst in SKX_CONFIGS.items() for (ns, fix, tiled, diag) in lst
             if layer in state["raw"]]
     if not cfgs:
         return
@@ -2973,16 +2988,17 @@ def skx_prepare(weights, state):
         if tiled and layer not in sk["tiled"]:
             sk["tiled"][layer] = swizzle_tiles(state["raw"][layer], 128).view(torch.uint8).reshape(-1)
     state["skx"] = sk
+    print(f"[okc] skx configs (nstage, fix, tiled, diag): {SKX_CONFIGS}", file=sys.stderr)
 
 
 def _run_skx(x, layer, m, n, k, state, idx=0):
-    ns, fix, tiled = SKX_CONFIGS[(layer, _skx_bn(m))][idx]
+    ns, fix, tiled, diag = SKX_CONFIGS[(layer, _skx_bn(m))][idx]
     sk = state["skx"]
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     w = state["raw"][layer]
     wt = sk["tiled"][layer] if tiled else w
     _get_ext().skx(w, wt, x, out, sk["slab0" if fix == 0 else "slab1"], sk["cnt"][(layer, fix)], m, n, k, _skx_bn(m),
-                   ns, fix, tiled, state["nsm"])
+                   ns, fix, tiled, diag, state["nsm"])
     return out
 
 
@@ -4519,7 +4535,7 @@ def _selftest(weights, state):
                 ref = ref.to(torch.bfloat16).double()
             tol = 2e-5 if layer == "router" else 5e-3
             for ch in _candidates(layer, m, state):
-                if ch[0] == "torch":
+                if ch[0] == "torch" or _skx_diag(layer, m, ch):
                     continue
                 key = _cand_key(layer, m, ch)
                 try:
@@ -4771,11 +4787,12 @@ def _autotune(weights, state):
             for i, e0, e1 in evs:
                 per[i].append(e0.elapsed_time(e1))
             med = [sorted(v)[len(v) // 2] for v in per]
-            best = min(range(len(cands)), key=lambda i: med[i])
+            real = [i for i in range(len(cands)) if not _skx_diag(layer, m, cands[i])]   # diagnostic builds: timed only
+            best = min(real, key=lambda i: med[i])
             state["choice"][(layer, m)] = cands[best]
             # CUTLASS is tuned for the scored m only (its partial token tiles are slow: m=129 +14 us, m=200 +4 us vs
             # cuBLAS): other m of the bucket take the best other candidate
-            alt = [i for i in range(len(cands)) if cands[i][0] != "cutlass"]
+            alt = [i for i in real if cands[i][0] != "cutlass"]
             if alt:
                 state.setdefault("choice_alt", {})[(layer, m)] = cands[min(alt, key=lambda i: med[i])]
             state.setdefault("tune_log", []).append((layer, m, [(c[0], round(1000 * v, 2)) for c, v in zip(cands, med)]))

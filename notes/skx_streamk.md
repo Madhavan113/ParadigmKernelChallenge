@@ -47,4 +47,26 @@ plus the fixup tail (~1-2 us: 64 KB exported per segment, ~64-74 KB read per CTA
 
 ## Judge results
 
-(filled in per check below)
+### Check 1: e79f1d997676444f (commit 25c08d1), 1.4756x (CI 1.453-1.498), 9/9, nothing disabled
+
+Candidates (nstage, fix, tiled): [0]=(6,1,0) [1]=(6,0,0) [2]=(6,1,1) [3]=(6,0,1) at BN=128, (4,1,0) at BN=256.
+In-prepare bench (cold-L2 graph replay, us incl. ~3.5 us replay cost; the judge table carries the unchanged picks):
+
+| m=128 | skx[0] fix1 | skx[1] fix0 | skx[2] fix1 tiled | skx[3] fix0 tiled | current pick | judged pick |
+|---|---|---|---|---|---|---|
+| qkv | 28.32 | 31.07 | 28.06 | 30.72 | gqx 17.98 | 14.59 |
+| o | 24.96 | 25.82 | 24.61 | 25.44 | torchT 10.46 | 7.59 |
+| pooler | 36.19 | 37.57 | 35.84 | 37.66 | gq 24.96 | 21.44 |
+| unpooler | 37.82 | 37.76 | 37.12 | 37.38 | torchT 22.53 | 18.86 |
+| m=256 | skx (4,1,0) | | | | | |
+| qkv | 38.08 | | | | torch 23.49 | 19.47 |
+| o | 36.74 | | | | torch 12.54 | 9.37 |
+| pooler | 49.73 | | | | cutlass 30.59 | 27.29 |
+| unpooler | 54.08 | | | | torchT 27.3 | 23.84 |
+
+Reading: fix 0 == fix 1 and tiled == untiled (+-1 us), so the shared machinery is at fault. Fit over the four layers
+(units/CTA 8 / 17.5 / 31 / 31, segments/CTA 1.39 / 1.09 / 1.21 / 1.45): ~0.52 us per unit (= 63 GB/s per SM: the
+main loop is ingest-bound as modeled, qkv ~9 us) + ~18 us for the first segment's export/fixup + ~7 us per extra
+segment. The same +6-11 us "partial stores & ticket" cost was seen in the w12/g12 rounds; all three used a per-thread
+__threadfence() (fence.sc.gpu) before the ticket. Round 2: CUTLASS-style release (CTA barrier, one thread
+fence.acq_rel.gpu + atomics) and DIAG levels 1/2/3 (main loop only / + export / + fence + tickets) to attribute.

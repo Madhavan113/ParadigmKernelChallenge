@@ -31,19 +31,23 @@ for m in (1, 5, 7, 8, 9, 16, 32, 33, 128, 130, 200, 256, 512, 1000):
             if len(set(keys)) != len(keys):
                 print(f"m={m} {layer}: duplicate candidate keys {keys}"); bad += 1
             # pretend the autotuner picked skx[0] for the scored m of this bucket, then route an untuned m
-            if want:
-                state["choice"][(layer, 128 if m <= 128 else 256)] = skx[0]
+            if want:   # the autotuner only ever picks a non-diagnostic candidate
+                state["choice"][(layer, 128 if m <= 128 else 256)] = [c for c in skx if not S._skx_diag(layer, m, c)][0]
             ch = S._nearby_choice(layer, m, state)
             if ch is not None and ch[0] == "skx" and not (32 < m <= 256 and (m in (128, 256) or m <= 128)):
                 print(f"m={m} {layer}: untuned m routed to skx: {ch}"); bad += 1
             if ch is not None and ch[0] == "skx" and m > S._skx_bn(m):
                 print(f"m={m} {layer}: skx bn {S._skx_bn(m)} < m"); bad += 1
+            if ch is not None and S._skx_diag(layer, m, ch):
+                print(f"m={m} {layer}: diagnostic config routed: {ch}"); bad += 1
+            for c in skx:   # the self-test / autotune guard must classify every candidate
+                S._skx_diag(layer, m, c)
         except Exception as e:   # noqa: BLE001
             print(f"m={m} {layer}: {type(e).__name__}: {e}"); bad += 1
 src = S._skx_src(True)
 for (layer, bn), cfgs in S.SKX_CONFIGS.items():
-    for ns, fix, tiled in cfgs:
-        tag = f"launch_skx<{bn}, {ns}, {fix}, {str(bool(tiled)).lower()}>"
+    for ns, fix, tiled, diag in cfgs:
+        tag = f"launch_skx<{bn}, {ns}, {fix}, {str(bool(tiled)).lower()}, {diag}>"
         if src.count(tag) != 1:
             print(f"dispatch for {(layer, bn, ns, fix, tiled)}: {src.count(tag)} occurrences of {tag}"); bad += 1
 if "skx" not in S.CPP_SRC or '"skx"' not in open(root / "muse_bf16_proj/submission.py").read().split("functions=")[1][:400]:
