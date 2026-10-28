@@ -10391,7 +10391,7 @@ def moe__scales_prmt_exact(*sfs):
 moe__EXTS = {}
 moe_MAIN_DEFINES = ("-DOKC_NW=16", "-DOKC_FAST1=0", "-DOKC_EPI4=0", "-DOKC_WGS=1")          # compile-time variant used by kernel_fn
 # M <= TINY_MAX_M runs a skinny-only build with 16 warps per CTA (a job never has more than M tokens, so no fat units)
-moe_TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2", "-DOKC_FINPF=1")  # bf16 WSB at NW=8 + WSBL tail (Oct 26: bs1 +2.5% / +3.5%); L2 hints on (Oct 27 judge: -DOKC_L2H=0 was 2.4 us slower at bs1: phase-A straggler spread 3.9 -> 2.3 us with evict_first weights)
+moe_TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_L2H=0", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2", "-DOKC_FINPF=1")  # bf16 WSB at NW=8 + WSBL tail (Oct 26: bs1 +2.5% / +3.5%). Oct 27: without -DOKC_L2H=0 the DIAG harness is 2.4 us faster at bs1 (28.6 vs 31.0) but two judged samples gave bs1 24.89 / 24.62 vs the shipped 24.6-26.1 band (~-0.5 us): below the lock threshold, kept as the author scored it
 moe_TINY_MAX_M = 4
 # TINY_MAX_M < M <= TINY2_MAX_M runs a second skinny-only build (empty: skipped); TINY2_MAX_M must stay <= 8
 moe_TINY2_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=1', '-DOKC_FINPF=1')  # bf16 WSB (Oct 26: bs8 +2.0..2.5%)
@@ -12757,6 +12757,8 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       }
     }
     OutT* o = out + (size_t)tt * N + cta * R + row;
+    if (COMP && ptab_s[0].y != 0)   // escape-balanced row order (the standalone's v135, qkv only): 4-row groups moved
+      o = out + (size_t)tt * N + reinterpret_cast<const int*>(ptab_s + ptab_s[0].y)[row];   // whole, so they stay contiguous
     if constexpr (sizeof(OutT) == 4) {
       *reinterpret_cast<float4*>(o) = v;
     } else {
@@ -14462,22 +14464,29 @@ bfp_SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC
     ('slice8_r192', 'unpooler', 1024, 8, 1, 1, 8, 2, 2, 1),
     ('unpooler16h_r100', 'unpooler', 8192, 32, 4, 1, 4, 1, 2, 1),
     ('unpooler32_r144', 'unpooler', 8192, 64, 4, 2, 2, 2, 1, 1),
+    # the standalone's retimed winners (its Oct-25 pair timings vs the configs above: pooler16 -0.43, unpooler16 -0.60,
+    # o16 -0.15, qkv8 -0.12, qkv16 -0.08 us); the fused pooler+router launch keeps the 'pooler' config
+    ('pooler16t_r192', 'pooler', 4096, 32, 2, 2, 2, 4, 1, 1),
+    ('unpooler16t_r72', 'unpooler', 8192, 32, 2, 2, 2, 2, 1, 1),
+    ('qkv8t_r144', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),
+    ('qkv16t_r200', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),
+    ('o16t_r68', 'o', 8192, 32, 2, 2, 1, 4, 2, 1),
 ]
 bfp_SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
-    ('o', 16): 'o8h_r88',
+    ('o', 16): 'o16t_r68',
     ('o', 32): 'o32h_r100',
     ('pooler', 8): 'pooler8h_r72',
-    ('pooler', 16): 'pooler',
+    ('pooler', 16): 'pooler16t_r192',
     ('pooler', 32): 'pooler32_r144',
-    ('qkv_gate', 8): 'qkv8_r176',
-    ('qkv_gate', 16): 'qkv16_r176',
+    ('qkv_gate', 8): 'qkv8t_r144',
+    ('qkv_gate', 16): 'qkv16t_r200',
     ('qkv_gate', 32): 'qkv32_r208',
     ('router', 8): 'router',
     ('router', 16): 'router',
     ('router', 32): 'router',
     ('unpooler', 8): 'slice8_r192',
-    ('unpooler', 16): 'unpooler16h_r100',
+    ('unpooler', 16): 'unpooler16h_r100',   # (the standalone's unpooler16t_r72 ran 18.2 vs 15.5 us in this kernel: b73aff83)
     ('unpooler', 32): 'unpooler32_r144',
 }
 bfp_SK2_ROT = False
@@ -14652,6 +14661,46 @@ def bfp_sk2_stream(tub, n_cfg, R, NT, NWR, WSK, UPW):
     return tub[tile, unit].contiguous()
 
 
+bfp_SK2_BALANCE = True   # the standalone's v135: deal 4-row groups to sk2 row blocks so every block carries ~the same number of escapes
+bfp_SK2_BALANCE_LAYERS = {"qkv_gate"}   # v136: only where it measured a gain (qkv m=8/16 -0.5 us; o/unpooler m=32 lost)
+
+
+def bfp_sk2_balance_perm(w, n_rows, R):
+    """Row order for R-row sk2 blocks over the first n_rows rows of w: rows sorted by escape count and snake-dealt, so
+    every block holds ~the same number of escapes (the escape warps' work sets the CTA tail). perm[p] = original row."""
+    wl = w[:n_rows]
+    bits = wl.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    e71 = (bits >> 8) & 0x7F
+    hist = torch.bincount(e71.flatten(), minlength=128)
+    win = torch.stack([hist[b:b + 8].sum() for b in range(121)])
+    base = int(win.argmax())
+    cnt = ((e71 < base) | (e71 > base + 7)).sum(1)
+    # 4-row groups are dealt (keeps 4-column output groups contiguous: vector stores in the epilogue)
+    G4 = 4
+    tcnt = cnt.view(n_rows // G4, G4).sum(1)
+    order = torch.argsort(tcnt, descending=True, stable=True)
+    TB = R // G4                                   # groups per block
+    nb = n_rows // R
+    i = torch.arange(n_rows // G4, device=w.device)
+    rnd, pos = i // nb, i % nb
+    blk = torch.where(rnd % 2 == 0, pos, nb - 1 - pos)
+    tperm = torch.empty(n_rows // G4, dtype=torch.long, device=w.device)
+    tperm[blk * TB + rnd] = order
+    return (tperm.view(-1, 1) * G4 + torch.arange(G4, device=w.device).view(1, G4)).reshape(-1)
+
+
+def bfp_sk2_table_add_perm(tab, pmax, perm, R):
+    """Append each CTA's row map (R int32 output columns) after its escapes; entry 0 .y = the map's int2 offset."""
+    ncta = tab.shape[0]
+    pm2 = pmax + R // 2
+    pm2 += pm2 % 2
+    out = torch.zeros(ncta, pm2, 2, dtype=torch.int32, device=tab.device)
+    out[:, :pmax] = tab
+    out[:, pmax:pmax + R // 2] = perm.to(torch.int32).view(ncta, R // 2, 2)
+    out[:, 0, 1] = pmax
+    return out.contiguous(), pm2
+
+
 def bfp_sk2_table(comp, n_cfg, R):
     """Per-CTA escape table int2 [ncta][pmax]: entry 0 = (count, 0); entries ((row_local << 16) | k, delta bits)."""
     dev = comp["rows"].device
@@ -14693,19 +14742,34 @@ def bfp_sk2_prepare(weights, state):
             stream = bfp_sk2_stream(tub, n_rows, R, NT, NWR, WSK, UPW)
             tab, pmax, b4 = state["dummy"], 0, 0
         else:
-            comp = state.setdefault("sk2_comp", {}).get(layer)
-            if comp is None:
-                comp = bfp_sk2_compress(w.contiguous())
-                state["sk2_comp"][layer] = comp
+            perm = None
+            if bfp_SK2_BALANCE and CL == 1 and layer in bfp_SK2_BALANCE_LAYERS:   # escape-balanced row order (one per rows/CTA)
+                pkey = (layer, n_rows, R)
+                bal = state.setdefault("sk2_bal", {})
+                if pkey not in bal:
+                    pr = bfp_sk2_balance_perm(w, n_rows, R)
+                    bal[pkey] = (pr, bfp_sk2_compress(w[:n_rows][pr].contiguous()))
+                perm, comp = bal[pkey]
+                if comp is None:
+                    perm = None
+            if perm is None:
+                comp = state.setdefault("sk2_comp", {}).get(layer)
+                if comp is None:
+                    comp = bfp_sk2_compress(w.contiguous())
+                    state["sk2_comp"][layer] = comp
             if comp is None:
                 continue
-            lkey = (layer, n_rows, R, NT, NWR, WSK, UPW)   # configs differing only in NACC / ring depth share a stream
+            lkey = (layer, n_rows, R, NT, NWR, WSK, UPW, perm is not None)   # configs differing only in NACC / ring depth share a stream
             if lkey not in shared:
-                shared[lkey] = (bfp_sk2_stream(comp["packed"], n_rows, R, NT, NWR, WSK, UPW),) + tuple(bfp_sk2_table(comp, n_rows, R))
+                tab, pmax = bfp_sk2_table(comp, n_rows, R)
+                if perm is not None:
+                    tab, pmax = bfp_sk2_table_add_perm(tab, pmax, perm, R)
+                shared[lkey] = (bfp_sk2_stream(comp["packed"], n_rows, R, NT, NWR, WSK, UPW), tab, pmax)
             stream, tab, pmax = shared[lkey]
             b4 = comp["base4"]
         state["sk2"][name] = (ci, stream, tab, pmax, b4, n_rows)
     state.pop("sk2_comp", None)
+    state.pop("sk2_bal", None)
 
 
 def bfp__run_sk2(x, layer, m, n, k, state, dg=0, dbg=None):
@@ -15362,6 +15426,7 @@ def _boundary_selftest(st):
 FUSE_BND1 = True   # the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
                    # output (every CTA redundantly, before its x boxes; the weight ring is already streaming): no
                    # _boundary1 launch at T <= BND1_MAX_T. Enabled only when the prepare-time self-test matches.
+PRFORM_MAX_T = 32  # the pooler + router form (separate / fused [/ fused + prologue]) is chosen on the chain per T up to here
 BND1_MAX_T = 8     # cooperative prologue: CTA c owns its 64 columns of every row (<= 3 KB per CTA), two grid tickets
                    # at the kernel start, the weight ring streams meanwhile (the per-CTA whole-row versions were
                    # load-issue bound: +10..13 us isolated)
@@ -16834,10 +16899,11 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
-        if T <= BND1_MAX_T and st.get("bfp") is not None:
+        if T <= PRFORM_MAX_T and st.get("bfp") is not None:
             # the pooler + router form at this T, on the chain: separate launches (pooler cgemv / sk2 + router rgemv /
-            # sk2) + _boundary1, the fused launch + _boundary1, or the fused launch computing the boundary in its
-            # prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each other
+            # sk2) + _boundary1, the fused launch + _boundary1, or (T <= BND1_MAX_T) the fused launch computing the
+            # boundary in its prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each
+            # other (1d2eac51: separate won by 3 us at T = 1)
             cands = [("bfp", False), ("bfpf", False)] + ([("bfpf", True)] if T in st.get("fuse_bnd1_ok_T", ()) else [])
             btimes = {}
             for pr_pick, flag in cands:
@@ -16946,8 +17012,8 @@ def prepare(weights):
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
-        if k[1] == "pr" and k[0] <= BND1_MAX_T:
-            continue   # the pooler + router form at T <= BND1_MAX_T is chosen on the chain in _tune ("prform")
+        if k[1] == "pr" and k[0] <= PRFORM_MAX_T:
+            continue   # the pooler + router form at T <= PRFORM_MAX_T is chosen on the chain in _tune ("prform")
         if isinstance(v, tuple):
             times = st.get("mm_times", {}).get(k, {})
             v = min(v, key=lambda p: times.get(p, 1e30))

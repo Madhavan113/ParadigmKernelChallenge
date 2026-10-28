@@ -1630,6 +1630,8 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       }
     }
     OutT* o = out + (size_t)tt * N + cta * R + row;
+    if (COMP && ptab_s[0].y != 0)   // escape-balanced row order (the standalone's v135, qkv only): 4-row groups moved
+      o = out + (size_t)tt * N + reinterpret_cast<const int*>(ptab_s + ptab_s[0].y)[row];   // whole, so they stay contiguous
     if constexpr (sizeof(OutT) == 4) {
       *reinterpret_cast<float4*>(o) = v;
     } else {
@@ -3335,22 +3337,29 @@ SK2_CONFIGS = [  # (name, layer, n_rows, R rows/CTA, NT, NWR, WSK, UPW, NACC, CL
     ('slice8_r192', 'unpooler', 1024, 8, 1, 1, 8, 2, 2, 1),
     ('unpooler16h_r100', 'unpooler', 8192, 32, 4, 1, 4, 1, 2, 1),
     ('unpooler32_r144', 'unpooler', 8192, 64, 4, 2, 2, 2, 1, 1),
+    # the standalone's retimed winners (its Oct-25 pair timings vs the configs above: pooler16 -0.43, unpooler16 -0.60,
+    # o16 -0.15, qkv8 -0.12, qkv16 -0.08 us); the fused pooler+router launch keeps the 'pooler' config
+    ('pooler16t_r192', 'pooler', 4096, 32, 2, 2, 2, 4, 1, 1),
+    ('unpooler16t_r72', 'unpooler', 8192, 32, 2, 2, 2, 2, 1, 1),
+    ('qkv8t_r144', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),
+    ('qkv16t_r200', 'qkv_gate', 2304, 24, 3, 1, 4, 2, 2, 1),
+    ('o16t_r68', 'o', 8192, 32, 2, 2, 1, 4, 2, 1),
 ]
 SK2_PICK = {  # (layer, tokr) -> config name
     ('o', 8): 'o8h_r88',
-    ('o', 16): 'o8h_r88',
+    ('o', 16): 'o16t_r68',
     ('o', 32): 'o32h_r100',
     ('pooler', 8): 'pooler8h_r72',
-    ('pooler', 16): 'pooler',
+    ('pooler', 16): 'pooler16t_r192',
     ('pooler', 32): 'pooler32_r144',
-    ('qkv_gate', 8): 'qkv8_r176',
-    ('qkv_gate', 16): 'qkv16_r176',
+    ('qkv_gate', 8): 'qkv8t_r144',
+    ('qkv_gate', 16): 'qkv16t_r200',
     ('qkv_gate', 32): 'qkv32_r208',
     ('router', 8): 'router',
     ('router', 16): 'router',
     ('router', 32): 'router',
     ('unpooler', 8): 'slice8_r192',
-    ('unpooler', 16): 'unpooler16h_r100',
+    ('unpooler', 16): 'unpooler16h_r100',   # (the standalone's unpooler16t_r72 ran 18.2 vs 15.5 us in this kernel: b73aff83)
     ('unpooler', 32): 'unpooler32_r144',
 }
 SK2_ROT = False
@@ -3525,6 +3534,46 @@ def sk2_stream(tub, n_cfg, R, NT, NWR, WSK, UPW):
     return tub[tile, unit].contiguous()
 
 
+SK2_BALANCE = True   # the standalone's v135: deal 4-row groups to sk2 row blocks so every block carries ~the same number of escapes
+SK2_BALANCE_LAYERS = {"qkv_gate"}   # v136: only where it measured a gain (qkv m=8/16 -0.5 us; o/unpooler m=32 lost)
+
+
+def sk2_balance_perm(w, n_rows, R):
+    """Row order for R-row sk2 blocks over the first n_rows rows of w: rows sorted by escape count and snake-dealt, so
+    every block holds ~the same number of escapes (the escape warps' work sets the CTA tail). perm[p] = original row."""
+    wl = w[:n_rows]
+    bits = wl.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    e71 = (bits >> 8) & 0x7F
+    hist = torch.bincount(e71.flatten(), minlength=128)
+    win = torch.stack([hist[b:b + 8].sum() for b in range(121)])
+    base = int(win.argmax())
+    cnt = ((e71 < base) | (e71 > base + 7)).sum(1)
+    # 4-row groups are dealt (keeps 4-column output groups contiguous: vector stores in the epilogue)
+    G4 = 4
+    tcnt = cnt.view(n_rows // G4, G4).sum(1)
+    order = torch.argsort(tcnt, descending=True, stable=True)
+    TB = R // G4                                   # groups per block
+    nb = n_rows // R
+    i = torch.arange(n_rows // G4, device=w.device)
+    rnd, pos = i // nb, i % nb
+    blk = torch.where(rnd % 2 == 0, pos, nb - 1 - pos)
+    tperm = torch.empty(n_rows // G4, dtype=torch.long, device=w.device)
+    tperm[blk * TB + rnd] = order
+    return (tperm.view(-1, 1) * G4 + torch.arange(G4, device=w.device).view(1, G4)).reshape(-1)
+
+
+def sk2_table_add_perm(tab, pmax, perm, R):
+    """Append each CTA's row map (R int32 output columns) after its escapes; entry 0 .y = the map's int2 offset."""
+    ncta = tab.shape[0]
+    pm2 = pmax + R // 2
+    pm2 += pm2 % 2
+    out = torch.zeros(ncta, pm2, 2, dtype=torch.int32, device=tab.device)
+    out[:, :pmax] = tab
+    out[:, pmax:pmax + R // 2] = perm.to(torch.int32).view(ncta, R // 2, 2)
+    out[:, 0, 1] = pmax
+    return out.contiguous(), pm2
+
+
 def sk2_table(comp, n_cfg, R):
     """Per-CTA escape table int2 [ncta][pmax]: entry 0 = (count, 0); entries ((row_local << 16) | k, delta bits)."""
     dev = comp["rows"].device
@@ -3566,19 +3615,34 @@ def sk2_prepare(weights, state):
             stream = sk2_stream(tub, n_rows, R, NT, NWR, WSK, UPW)
             tab, pmax, b4 = state["dummy"], 0, 0
         else:
-            comp = state.setdefault("sk2_comp", {}).get(layer)
-            if comp is None:
-                comp = sk2_compress(w.contiguous())
-                state["sk2_comp"][layer] = comp
+            perm = None
+            if SK2_BALANCE and CL == 1 and layer in SK2_BALANCE_LAYERS:   # escape-balanced row order (one per rows/CTA)
+                pkey = (layer, n_rows, R)
+                bal = state.setdefault("sk2_bal", {})
+                if pkey not in bal:
+                    pr = sk2_balance_perm(w, n_rows, R)
+                    bal[pkey] = (pr, sk2_compress(w[:n_rows][pr].contiguous()))
+                perm, comp = bal[pkey]
+                if comp is None:
+                    perm = None
+            if perm is None:
+                comp = state.setdefault("sk2_comp", {}).get(layer)
+                if comp is None:
+                    comp = sk2_compress(w.contiguous())
+                    state["sk2_comp"][layer] = comp
             if comp is None:
                 continue
-            lkey = (layer, n_rows, R, NT, NWR, WSK, UPW)   # configs differing only in NACC / ring depth share a stream
+            lkey = (layer, n_rows, R, NT, NWR, WSK, UPW, perm is not None)   # configs differing only in NACC / ring depth share a stream
             if lkey not in shared:
-                shared[lkey] = (sk2_stream(comp["packed"], n_rows, R, NT, NWR, WSK, UPW),) + tuple(sk2_table(comp, n_rows, R))
+                tab, pmax = sk2_table(comp, n_rows, R)
+                if perm is not None:
+                    tab, pmax = sk2_table_add_perm(tab, pmax, perm, R)
+                shared[lkey] = (sk2_stream(comp["packed"], n_rows, R, NT, NWR, WSK, UPW), tab, pmax)
             stream, tab, pmax = shared[lkey]
             b4 = comp["base4"]
         state["sk2"][name] = (ci, stream, tab, pmax, b4, n_rows)
     state.pop("sk2_comp", None)
+    state.pop("sk2_bal", None)
 
 
 def _run_sk2(x, layer, m, n, k, state, dg=0, dbg=None):
