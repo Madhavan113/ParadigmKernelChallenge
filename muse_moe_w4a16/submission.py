@@ -2601,6 +2601,11 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
       const int n0 = rb * 16 + gg;
       const float gsc = S.hgs[1][ce] * TWO62;
       const float nw0 = 1.f + __bfloat162float(S.hnw[n0]), nw1 = 1.f + __bfloat162float(S.hnw[n0 + 8]);
+#elif OKC_WSH0
+      // (statement order of the MID build measured on the H200, Oct 28: ptxas schedules the two orders differently)
+      const int n0 = rb * 16 + gg;
+      const float gsc = p.gsB[ce] * TWO62;
+      const float nw0 = 1.f + __bfloat162float(p.normw[n0]), nw1 = 1.f + __bfloat162float(p.normw[n0 + 8]);
 #else
       const float gsc = p.gsB[ce] * TWO62;
       const int n0 = rb * 16 + gg;
