@@ -5,7 +5,7 @@ moe_fused<false|true> and optionally a SASS dump. Run from the host under the sh
       lmsysorg/sglang:dev-muse-spark-open python3 tools/nvcc_pub_moe.py [build ...] [--sass] [--extra=-DOKC_X=1,...]
 builds: TINY TINY2 MID MAIN (from submission.py) or NAME=-DOKC_A=1,-DOKC_B=2 (custom)."""
 import subprocess, sys, pathlib, re, ast
-src_path = pathlib.Path("/work/muse_moe_w4a16/submission.py")
+src_path = pathlib.Path(next((a[6:] for a in sys.argv[1:] if a.startswith("--src=")), "/work/muse_moe_w4a16/submission.py"))  # --src=: another copy (e.g. a committed version)
 tree = ast.parse(src_path.read_text())
 consts = {}
 for node in tree.body:
