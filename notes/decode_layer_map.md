@@ -399,3 +399,10 @@ seed-rows under 1 us, no loss anywhere). PDL at T > 32 with the CUDA glue (ab10b
 against ~14 us of Triton glue: most of the Triton programs' time was already under PDL overlap (their exposed parts
 were ~1.5-3 us each per the nsys timeline), and the new kernels keep ~1.2 us of exposed critical path each (the
 producer row's L2 load after the wait, one block reduction, the stores) plus the routing's 256 x 256 rank (~0.7 us).
+ncu of v4 (glue3, cold L2, isolated): bnd 4.8 us (9.4K cycles, 345 instr/warp, 15 cycles per issue, No-Eligible
+75%: two dependent DRAM rounds under ncu - weights then the producer row - that the chain overlaps / serves from L2),
+route 5.3 us (10.3K cycles, 467 instr/warp: the rank loop is ~320 of them = ~3.7K issue cycles on 32 warps, the
+largest remaining exposed piece); at T=128 bnd 6.3-6.7 us at 1 TB/s (bandwidth), route 6.0. Next steps if wanted:
+a 16-bit SIMD pre-pass for the rank (vset/vcmp on 4 packed ordered keys, exact rank only for candidates) ~-1 us at
+T=1/8; the boundaries' remaining ~1 us is the L2 round trip + reduction + stores and would need folding into the
+producers' epilogues (the ticket-tail territory that lost before).
