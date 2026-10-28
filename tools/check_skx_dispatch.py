@@ -31,8 +31,9 @@ for m in (1, 5, 7, 8, 9, 16, 32, 33, 128, 130, 200, 256, 512, 1000):
             if len(set(keys)) != len(keys):
                 print(f"m={m} {layer}: duplicate candidate keys {keys}"); bad += 1
             # pretend the autotuner picked skx[0] for the scored m of this bucket, then route an untuned m
-            if want:   # the autotuner only ever picks a non-diagnostic candidate
-                state["choice"][(layer, 128 if m <= 128 else 256)] = [c for c in skx if not S._skx_diag(layer, m, c)][0]
+            real = [c for c in skx if not S._skx_diag(layer, m, c)]
+            if want and real:   # the autotuner only ever picks a non-diagnostic candidate
+                state["choice"][(layer, 128 if m <= 128 else 256)] = real[0]
             ch = S._nearby_choice(layer, m, state)
             if ch is not None and ch[0] == "skx" and not (32 < m <= 256 and (m in (128, 256) or m <= 128)):
                 print(f"m={m} {layer}: untuned m routed to skx: {ch}"); bad += 1

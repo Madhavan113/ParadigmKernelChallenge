@@ -70,3 +70,28 @@ main loop is ingest-bound as modeled, qkv ~9 us) + ~18 us for the first segment'
 segment. The same +6-11 us "partial stores & ticket" cost was seen in the w12/g12 rounds; all three used a per-thread
 __threadfence() (fence.sc.gpu) before the ticket. Round 2: CUTLASS-style release (CTA barrier, one thread
 fence.acq_rel.gpu + atomics) and DIAG levels 1/2/3 (main loop only / + export / + fence + tickets) to attribute.
+
+### Check 2: bcdae43fe30442e7 (commit 38fd64d), 1.4620x (CI 1.440-1.484), 9/9, nothing disabled
+
+CUTLASS-style release/acquire (CTA barrier, one thread fence.acq_rel.gpu + atomics) and DIAG levels (timed, never
+self-tested / picked / routed; accumulators kept live). Bench us at m=128 (judge table carries the unchanged picks:
+qkv 14.70, o 7.33, pooler 21.74, unpooler 19.22):
+
+| layer | D1 main loop only | D2 + export | D3 + fence + tickets | full fix1 | full fix0 | current pick |
+|---|---|---|---|---|---|---|
+| qkv | 16.70 | 18.08 | 19.33 | 27.84 | 30.62 | gqx 18.08 |
+| o | 10.40 | 13.06 | 14.30 | 24.64 | 25.28 | torchT 10.43 |
+| pooler | 23.62 | 25.25 | 26.53 | 35.78 | 37.22 | gq 25.22 |
+| unpooler | 22.82 | 24.93 | 26.37 | 37.34 | 37.41 | torchT 22.72 |
+
+Reading:
+- The fence pattern was not it: the tail (fix 1: wait + distributed reduce; fix 0: red.add export + last-arriver
+  epilogue) still costs ~9-11 us on every layer, nearly independent of N, K, P and units; the export 1.4-2.7 us; the
+  fence + tickets ~1.3 us.
+- Decisive: the main loop ALONE (D1) beats the picks by only 1.4-1.6 us (qkv, pooler) and ties (o, unpooler). After
+  ~2 us of fixed cost it runs 0.58 us per 32 KB unit = W streamed at ~3.3-3.5 TB/s = ~48% tensor utilization (2.1
+  MFLOP per unit). The 2-warpgroup BM=128 form halves the x traffic as designed but the per-unit time is set by
+  compute / DRAM rather than the 70 GB/s per-SM ingest the gqx / gq rows suggested (those are x-traffic-bound).
+- D2 (main loop + plain export, no reduce at all) already only ties the picks, so no fixup can make this form win at
+  m=128 unless the main loop itself gets ~30% faster. Round 3 attributes the main loop (no wgmma / W only / W only +
+  wgmma / tiled W) and the fix-1 tail (wait only / reduce without stores).
