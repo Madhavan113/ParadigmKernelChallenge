@@ -406,3 +406,12 @@ largest remaining exposed piece); at T=128 bnd 6.3-6.7 us at 1 TB/s (bandwidth),
 a 16-bit SIMD pre-pass for the rank (vset/vcmp on 4 packed ordered keys, exact rank only for candidates) ~-1 us at
 T=1/8; the boundaries' remaining ~1 us is the L2 round trip + reduction + stores and would need folding into the
 producers' epilogues (the ticket-tail territory that lost before).
+
+Locked build (1e5ea1e: CUDA glue at every T, PDL_MAX_T 128, MoE 1455abe as in b7520fb; submission md5 ae9e8405).
+Confirmation on the VM: the judge's check ALL OK at seeds 2/3 on the 12 scored shapes (eager + graph), the graph
+diagnosis 16/16 at T=128/256 with PDL on, and all 13 TASK.md tests ok eager + graph at seeds 2 and 3 (T = 1, 8, 9,
+24, 40, 33, 16, 32; spread mixed, dist outliers, kv_scale 1/64, ctx 1048576). Before/after (ab11, paired, seeds
+0-2; "before" = Triton glue + PDL_MAX_T 32 as overrides; before minus locked, us, s0/s1/s2): d1s +2.9/+2.6/+2.8,
+d1f +3.2/+2.8/+2.5, d16s +0.8/+2.8/+2.0, d16f +1.6/+1.3/+1.6, d32s +2.5/+2.5/+2.7, d32f +1.8/+2.5/+1.6, v1s
++2.5/+2.9/+2.9, v1f +2.9/+3.7/+3.0, v16s +3.1/+4.4/+2.8, v16f +3.0/+1.9/+2.0, v32s +1.4/+2.1/+0.5, v32f
++0.8/+0.6/+1.5 (order check within +-0.9). Handed to main for a scored run (checks were exhausted that day).
