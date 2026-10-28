@@ -15953,11 +15953,12 @@ if "bfp_CUTLASS_LAYERS" in globals():   # standalone proj composition: no CUTLAS
     bfp_CUTLASS_LAYERS = set()
 
 
-M1_ROUTE_PIN = {"qkv_gate": "sk2", "o": "sk2"}   # the fork's m = 1 route per layer, pinned: its isolated autotuner flips
-                                                 # between sk2 and the compressed GEMV (cgemv) from one prepare to the
-                                                 # next, and on the chain the GEMV costs +6.5 us at T = 1 (H200 paired,
-                                                 # seeds 0-2, vm_ab/ab16: sk2 streams its weights under the attention's
-                                                 # / boundary's tail through PDL, the plain-launched GEMV cannot)
+M1_ROUTE_PIN = {"qkv_gate": "sk2", "o": "sk2", "unpooler": "sk2"}
+# the fork's m = 1 route per layer, pinned: its isolated autotuner flips between sk2 and the GEMVs (cgemv / sgemv)
+# from one prepare to the next; on the chain the qkv / o GEMVs cost +6.5 us at T = 1 (H200 paired, seeds 0-2,
+# vm_ab/ab16: sk2 streams its weights under the previous kernel's tail through PDL, the plain-launched GEMV cannot)
+# and the unpooler slice as sk2 (slice8_r192) is 0.9-1.4 us faster than the GEMVs (ab18: rows -1.6/-1.3/-0.8 d1s,
+# -0.7/-1.6/-0.6 d1f; the GEMVs as PDL launches recover at most 1.0 of it)
 
 
 def _pin_m1_routes(bst):
