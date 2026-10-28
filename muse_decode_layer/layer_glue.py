@@ -1413,27 +1413,23 @@ def _boundary2(P, S: tl.constexpr, T, NU: tl.constexpr, S1, A2, B2, GPOST, GNEXT
 # warps that runs ~790 instructions per warp with 4 warps per scheduler (No Eligible 61%, 10.6 cycles per issued
 # instruction, 14 GB/s of memory traffic) = 6.2-6.6 us per boundary kernel and 5.6-5.8 us for the routing, the same
 # per program at T = 8 (one program per token): a latency / issue chain, not bandwidth and not the S loop (every
-# producer emits one reduced row, S = 1). Here a token's boundary is 8 CTAs x 256 threads x 4 columns, every load
-# issued before any use (the stream / s1 slice, the gate and the norm weights before griddepcontrol.wait, the
-# producer's slice after it), the row's four sums (sum x^2, sum (alpha st)^2, sum (alpha st)(beta x), sum (beta x)^2:
-# sum s^2 = A + 2 r B + r^2 D, so one exchange gives both norms) reduced per CTA and exchanged through a tiny per-token
-# ticket barrier (8 arrivals; monotonic tickets, no reset), the two scales formed identically in every CTA
-# (deterministic), then the slice is finished from registers. The routing is one 256-thread CTA per token: thread e
-# owns logit e (8 rounds of block argmax, ties to the lower index as tl.argmax) and 16 pooled columns.
-# The producer's buffers are read after griddepcontrol.wait through __ldcg and never through a `const __restrict__`
-# pointer: nvcc turns those into ld.global.nc, which ptxas hoisted above the wait (the first graph replay after a
-# capture then read the still-unwritten pool buffers: wrong routing, right from the second replay on).
-# Kept as a prepare-time self-tested alternative to the Triton kernels (st["glue_ok"]), per-T switch st["glue_on"].
+# producer emits one reduced row, S = 1). A first CUDA version (8 CTAs per token + a ticket barrier, gate math in
+# the kernel, 8 serial argmax rounds) measured no faster (glue2.ncu-rep: 5.6 / 7.5 / 5.3 us): the barrier and the
+# dependency chains cost what the parallelism bought. This version: boundaries = one 512-thread CTA per token, 16
+# coalesced columns per thread, alpha / beta of the residual gate precomputed at prepare (st["ab1"] / ["ab2"]: ~12
+# instructions per element), the four row sums in ONE block reduction (sum s^2 = A + 2rB + r^2 D gives both norms), no
+# inter-CTA traffic; routing = one 1024-thread CTA per token, top-8 by rank with 64-bit (ordered score, 255 - e) keys
+# in shared memory (4 threads per expert, 64 compares each, no serial rounds; ties to the lower index as tl.argmax),
+# the pre-expert norm fused. Weights and inputs load before griddepcontrol.wait, the producer's data after it.
 GLUE_CUDA = True
 GLUE_MAX_T = 256
-GLUE_NC = 8          # column blocks per token (8192 / (256 threads x 4 columns))
 GLUE_MODE = 0        # PDL placement bits: 1 = launch_dependents after the stores (not at the start), 2 = wait before the prologue
 glue__MOD = None
 
 GLUE_CPP_SRC = r"""
-void glue_bnd(int64_t kind, torch::Tensor a, int64_t nu, torch::Tensor st, torch::Tensor gate, torch::Tensor g1,
-              torch::Tensor g2, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
-              int64_t T, int64_t pdl, int64_t mode);
+void glue_bnd(int64_t kind, torch::Tensor a, int64_t nu, torch::Tensor st, torch::Tensor alpha, torch::Tensor beta,
+              torch::Tensor g1, torch::Tensor g2, torch::Tensor sout, torch::Tensor hout, int64_t T, int64_t pdl,
+              int64_t mode);
 void glue_route(torch::Tensor pooled, std::optional<torch::Tensor> logits, torch::Tensor bias, torch::Tensor gpre,
                 torch::Tensor ids, torch::Tensor wts, torch::Tensor xm, torch::Tensor ls, torch::Tensor lids,
                 int64_t T, int64_t pdl, int64_t mode);
@@ -1451,7 +1447,9 @@ GLUE_CUDA_SRC = r"""
 namespace okc_glue {
 
 constexpr int HID = 8192, DEX = 4096, NEXP = 256, PRW = 4608;
-constexpr int NTH = 256, EPT = 4, NC = HID / (NTH * EPT);   // 8 column blocks of 1024 per token
+constexpr int BNT = 512;            // boundary: one CTA per token, 512 threads x 16 columns (4 coalesced chunks of 4)
+constexpr int BCH = HID / (4 * BNT);   // = 4 chunks per thread
+constexpr int RNT = 1024;           // routing: one CTA per token, 4 threads per expert, 4 pooled columns per thread
 
 __device__ __forceinline__ void pdl_wait() {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
@@ -1470,98 +1468,94 @@ __device__ __forceinline__ uint32_t pack_bf2(float a, float b) {
   return *reinterpret_cast<uint32_t*>(&p);
 }
 __device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }
-// alpha, beta of a residual gate from its BF16 weight (the Triton _gate_ab)
-__device__ __forceinline__ void gate_ab(float gw, float& alpha, float& beta) {
-  const float w = gw / 0.3f;
-  beta = sigm(w);
-  alpha = sqrtf(fmaxf(sigm(-w) * (1.f + beta), 1e-3f));
-}
-template <typename T> __device__ __forceinline__ void load4(const T* p, float* v);
-template <> __device__ __forceinline__ void load4<float>(const float* p, float* v) {
-  const float4 q = *reinterpret_cast<const float4*>(p);
-  v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
-}
-template <> __device__ __forceinline__ void load4<__nv_bfloat16>(const __nv_bfloat16* p, float* v) {
-  const uint2 q = *reinterpret_cast<const uint2*>(p);
-  v[0] = bf_lo(q.x); v[1] = bf_hi(q.x); v[2] = bf_lo(q.y); v[3] = bf_hi(q.y);
-}
-// the producer's data (written by the grid this one may overlap under PDL): L2-coherent loads, never ld.global.nc
-template <typename T> __device__ __forceinline__ void load4_cg(const T* p, float* v);
-template <> __device__ __forceinline__ void load4_cg<float>(const float* p, float* v) {
-  const float4 q = __ldcg(reinterpret_cast<const float4*>(p));
-  v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
-}
-template <> __device__ __forceinline__ void load4_cg<__nv_bfloat16>(const __nv_bfloat16* p, float* v) {
-  const uint2 q = __ldcg(reinterpret_cast<const uint2*>(p));
-  v[0] = bf_lo(q.x); v[1] = bf_hi(q.x); v[2] = bf_lo(q.y); v[3] = bf_hi(q.y);
-}
 __device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
   for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
   return v;
 }
+// four floats / four bf16 at p (16 B / 8 B aligned); weights and inputs: plain loads (may be ld.global.nc); the
+// producer's data (written by the grid this one may overlap under PDL): __ldcg, never ld.global.nc (ptxas hoists
+// those above griddepcontrol.wait)
+__device__ __forceinline__ void ld4f(const float* p, float* v) {
+  const float4 q = *reinterpret_cast<const float4*>(p);
+  v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
+}
+__device__ __forceinline__ void ld4bf(const __nv_bfloat16* p, float* v) {
+  const uint2 q = *reinterpret_cast<const uint2*>(p);
+  v[0] = bf_lo(q.x); v[1] = bf_hi(q.x); v[2] = bf_lo(q.y); v[3] = bf_hi(q.y);
+}
+template <typename T> __device__ __forceinline__ void ld4cg(const T* p, float* v);
+template <> __device__ __forceinline__ void ld4cg<float>(const float* p, float* v) {
+  const float4 q = __ldcg(reinterpret_cast<const float4*>(p));
+  v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
+}
+template <> __device__ __forceinline__ void ld4cg<__nv_bfloat16>(const __nv_bfloat16* p, float* v) {
+  const uint2 q = __ldcg(reinterpret_cast<const uint2*>(p));
+  v[0] = bf_lo(q.x); v[1] = bf_hi(q.x); v[2] = bf_lo(q.y); v[3] = bf_hi(q.y);
+}
+__device__ __forceinline__ void st4f(float* p, const float* v) {
+  *reinterpret_cast<float4*>(p) = make_float4(v[0], v[1], v[2], v[3]);
+}
+__device__ __forceinline__ void st4bf(__nv_bfloat16* p, const float* v) {
+  *reinterpret_cast<uint2*>(p) = make_uint2(pack_bf2(v[0], v[1]), pack_bf2(v[2], v[3]));
+}
 
-// KIND 1 (post-attention): a = o-projection output [T, lda], st = the layer's input stream fp32 [T, 8192], gate =
-//   attn_residual_gate, g1 = pre_ffn_norm: s = alpha st + beta a rstd(a); h = s rstd(s) (1 + g1).
+// KIND 1 (post-attention): a = o-projection output [T, lda], st = the layer's input stream fp32 [T, 8192], alpha /
+//   beta fp32 [8192] of attn_residual_gate (prepare-time _gate_coeffs), g1 = pre_ffn_norm:
+//   s = alpha st + beta a rstd(a); h = s rstd(s) (1 + g1).
 // KIND 2 (post-FFN): a = unpooler output [T, lda] (columns >= nu are zero: the 1024-row slice at T <= 8), st = s1,
-//   gate = ffn_residual_gate, g1 = post_ffn_norm (scales a before its norm), g2 = next_pre_attn_norm:
+//   alpha / beta of ffn_residual_gate, g1 = post_ffn_norm (scales a before its norm), g2 = next_pre_attn_norm:
 //   f = a (1 + g1); s = alpha st + beta f rstd(f); h = s rstd(s) (1 + g2).
-// Grid (NC, T), 256 threads x 4 columns. Every launch adds exactly NC tickets per token, so ticket blocks of NC are
-// aligned and the counters never need a reset; the NC partials are summed by the same tree in every CTA.
+// One 512-thread CTA per token, thread tid owns chunks 4 (tid + k 512), k < 4 (coalesced). The four row sums
+// (sum x^2, A = sum (alpha st)^2, B = sum (alpha st)(beta x), D = sum (beta x)^2) in ONE block reduction;
+// sum s^2 = A + 2 r B + r^2 D gives the second norm without a second pass. No inter-CTA traffic.
 template <int KIND, typename AT>
-__global__ void __launch_bounds__(NTH) bnd_kernel(const AT* a, int lda, int nu, const float* __restrict__ st,
-    const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ g1, const __nv_bfloat16* __restrict__ g2,
-    float* __restrict__ sout, __nv_bfloat16* __restrict__ hout, float4* __restrict__ part, unsigned* __restrict__ cnt,
-    int pdl, int mode) {
-  const int t = blockIdx.y, c = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  const int col = (c * NTH + tid) * EPT;
-  __shared__ float red[NTH / 32][4];
+__global__ void __launch_bounds__(BNT) bnd_kernel(const AT* a, int lda, int nu, const float* __restrict__ st,
+    const float* __restrict__ alpha, const float* __restrict__ beta, const __nv_bfloat16* __restrict__ g1,
+    const __nv_bfloat16* __restrict__ g2, float* sout, __nv_bfloat16* hout, int pdl, int mode) {
+  const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  __shared__ float red[BNT / 32][4];
   __shared__ float scl[2];
   if (pdl && !(mode & 1)) pdl_trigger();
   if (pdl && (mode & 2)) pdl_wait();
-  float sv[4], gv[4], g1v[4], g2v[4] = {0.f, 0.f, 0.f, 0.f};
-  load4<float>(st + (size_t)t * HID + col, sv);
-  load4<__nv_bfloat16>(gate + col, gv);
-  load4<__nv_bfloat16>(g1 + col, g1v);
-  if (KIND == 2) load4<__nv_bfloat16>(g2 + col, g2v);
-  float al[4], be[4];
+  float sv[BCH][4], al[BCH][4], be[BCH][4], gw[BCH][4], gn[BCH][4];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) gate_ab(gv[i], al[i], be[i]);
+  for (int k = 0; k < BCH; ++k) {
+    const int col = 4 * (tid + k * BNT);
+    ld4f(st + (size_t)t * HID + col, sv[k]);
+    ld4f(alpha + col, al[k]);
+    ld4f(beta + col, be[k]);
+    ld4bf(g1 + col, gw[k]);
+    if (KIND == 2) ld4bf(g2 + col, gn[k]);
+  }
   if (pdl) pdl_wait();
-  float x[4] = {0.f, 0.f, 0.f, 0.f};
-  if (KIND == 1 || col < nu) load4_cg<AT>(a + (size_t)t * lda + col, x);
-  if (KIND == 2) {
+  float x[BCH][4];
 #pragma unroll
-    for (int i = 0; i < 4; ++i) x[i] *= 1.f + g1v[i];
+  for (int k = 0; k < BCH; ++k) {
+    const int col = 4 * (tid + k * BNT);
+    x[k][0] = x[k][1] = x[k][2] = x[k][3] = 0.f;
+    if (KIND == 1 || col < nu) ld4cg<AT>(a + (size_t)t * lda + col, x[k]);
+    if (KIND == 2) {
+#pragma unroll
+      for (int i = 0; i < 4; ++i) x[k][i] *= 1.f + gw[k][i];
+    }
   }
   float q0 = 0.f, q1 = 0.f, q2 = 0.f, q3 = 0.f;
-  float as[4], bx[4];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    as[i] = al[i] * sv[i];
-    bx[i] = be[i] * x[i];
-    q0 = fmaf(x[i], x[i], q0); q1 = fmaf(as[i], as[i], q1); q2 = fmaf(as[i], bx[i], q2); q3 = fmaf(bx[i], bx[i], q3);
-  }
+  for (int k = 0; k < BCH; ++k)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float as = al[k][i] * sv[k][i], bx = be[k][i] * x[k][i];
+      q0 = fmaf(x[k][i], x[k][i], q0); q1 = fmaf(as, as, q1); q2 = fmaf(as, bx, q2); q3 = fmaf(bx, bx, q3);
+    }
   q0 = warp_sum(q0); q1 = warp_sum(q1); q2 = warp_sum(q2); q3 = warp_sum(q3);
   if (lane == 0) { red[warp][0] = q0; red[warp][1] = q1; red[warp][2] = q2; red[warp][3] = q3; }
   __syncthreads();
-  if (tid == 0) {
-    float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
-#pragma unroll
-    for (int w = 0; w < NTH / 32; ++w) { p.x += red[w][0]; p.y += red[w][1]; p.z += red[w][2]; p.w += red[w][3]; }
-    part[(size_t)t * NC + c] = p;
-    __threadfence();
-    const unsigned ticket = atomicAdd(cnt + t, 1u);
-    const unsigned target = (ticket & ~(unsigned)(NC - 1)) + (unsigned)NC;
-    while ((int)(*reinterpret_cast<volatile unsigned*>(cnt + t) - target) < 0) __nanosleep(40);
-    __threadfence();
-  }
-  __syncthreads();
   if (warp == 0) {
     float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (lane < NC) p = __ldcg(part + (size_t)t * NC + lane);
+    if (lane < BNT / 32) p = make_float4(red[lane][0], red[lane][1], red[lane][2], red[lane][3]);
 #pragma unroll
-    for (int o = NC / 2; o > 0; o >>= 1) {   // the same tree in every CTA of the token
+    for (int o = (BNT / 32) / 2; o > 0; o >>= 1) {
       p.x += __shfl_xor_sync(0xffffffffu, p.x, o); p.y += __shfl_xor_sync(0xffffffffu, p.y, o);
       p.z += __shfl_xor_sync(0xffffffffu, p.z, o); p.w += __shfl_xor_sync(0xffffffffu, p.w, o);
     }
@@ -1573,118 +1567,103 @@ __global__ void __launch_bounds__(NTH) bnd_kernel(const AT* a, int lda, int nu, 
   }
   __syncthreads();
   const float r = scl[0], r1 = scl[1];
-  float s[4], h[4];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) {
-    s[i] = fmaf(bx[i], r, as[i]);
-    h[i] = s[i] * r1 * (1.f + (KIND == 1 ? g1v[i] : g2v[i]));
+  for (int k = 0; k < BCH; ++k) {
+    const int col = 4 * (tid + k * BNT);
+    float s[4], h[4];
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float as = al[k][i] * sv[k][i], bx = be[k][i] * x[k][i];
+      s[i] = fmaf(bx, r, as);
+      h[i] = s[i] * r1 * (1.f + (KIND == 1 ? gw[k][i] : gn[k][i]));
+    }
+    st4f(sout + (size_t)t * HID + col, s);
+    st4bf(hout + (size_t)t * HID + col, h);
   }
-  *reinterpret_cast<float4*>(sout + (size_t)t * HID + col) = make_float4(s[0], s[1], s[2], s[3]);
-  *reinterpret_cast<uint2*>(hout + (size_t)t * HID + col) = make_uint2(pack_bf2(h[0], h[1]), pack_bf2(h[2], h[3]));
-  if (pdl && (mode & 1)) { __threadfence(); pdl_trigger(); }
 }
 
-// One 256-thread CTA per token: thread e owns logit e and pooled columns 16 e .. 16 e + 15.
-// SPLIT: pooled bf16 [T, 4096] and logits fp32 [T, 256] (the proj module's two GEMMs); else the combined fp32
-// pooler + router GEMM output P [T, 4608] (pooled = P[:, :4096], logits = P[:, 4096:4352] + P[:, 4352:4608]).
+// order-preserving map of a float to a uint32 (NaN-free inputs)
+__device__ __forceinline__ uint32_t ordered(float f) {
+  const uint32_t u = __float_as_uint(f);
+  return u ^ ((u >> 31) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+// One 1024-thread CTA per token. Routing: thread tid owns expert e = tid & 255 and compares its key against quarter
+// (tid >> 8) of the 256 keys; key = (ordered score, 255 - e) so equal scores rank the lower index first (tl.argmax);
+// rank r < 8 means slot r of the top-8 (no serial rounds). Pre-expert norm: 4 pooled columns per thread, one block
+// reduction. SPLIT: pooled bf16 [T, 4096] + logits fp32 [T, 256]; else the combined fp32 pooler + router GEMM output
+// P [T, 4608] (pooled = P[:, :4096], logits = P[:, 4096:4352] + P[:, 4352:4608]).
 template <bool SPLIT>
-__global__ void __launch_bounds__(NTH) route_kernel(const void* pooled_, const float* logits,
-    const float* __restrict__ bias, const __nv_bfloat16* __restrict__ gpre, int* __restrict__ ids,
-    float* __restrict__ wts, __nv_bfloat16* __restrict__ xm, const int* __restrict__ ls, int* __restrict__ lids,
-    int pdl, int mode) {
-  const int t = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
-  __shared__ float wred[NTH / 32];
-  __shared__ int ired[NTH / 32];
-  __shared__ float qred[NTH / 32];
+__global__ void __launch_bounds__(RNT) route_kernel(const void* pooled_, const float* logits,
+    const float* __restrict__ bias, const __nv_bfloat16* __restrict__ gpre, int* ids, float* wts,
+    __nv_bfloat16* xm, const int* __restrict__ ls, int* lids, int pdl, int mode) {
+  const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int e = tid & (NEXP - 1), quarter = tid >> 8;
+  const int col = 4 * tid;   // pooled columns of this thread
+  __shared__ unsigned long long key_s[NEXP];
+  __shared__ int rk_s[4][NEXP];
   __shared__ int sel_idx[8];
   __shared__ float sel_val[8];
+  __shared__ float qred[RNT / 32];
   __shared__ float scl;
   if (pdl && !(mode & 1)) pdl_trigger();
   if (pdl && (mode & 2)) pdl_wait();
   const float bv = bias[e];
   const int lsv = *ls;
-  float gp[16];
-  {
-    const uint4* gq = reinterpret_cast<const uint4*>(gpre + 16 * e);
-    const uint4 q0 = gq[0], q1 = gq[1];
-    const uint32_t w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
-#pragma unroll
-    for (int i = 0; i < 8; ++i) { gp[2 * i] = 1.f + bf_lo(w[i]); gp[2 * i + 1] = 1.f + bf_hi(w[i]); }
-  }
+  float gp[4];
+  ld4bf(gpre + col, gp);
   if (pdl) pdl_wait();
-  float lg, pv[16];
+  float lg, pv[4];
   if (SPLIT) {
     lg = __ldcg(logits + (size_t)t * NEXP + e);
-    const uint4* pq = reinterpret_cast<const uint4*>(reinterpret_cast<const __nv_bfloat16*>(pooled_) + (size_t)t * DEX + 16 * e);
-    const uint4 q0 = __ldcg(pq), q1 = __ldcg(pq + 1);
-    const uint32_t w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
-#pragma unroll
-    for (int i = 0; i < 8; ++i) { pv[2 * i] = bf_lo(w[i]); pv[2 * i + 1] = bf_hi(w[i]); }
+    ld4cg<__nv_bfloat16>(reinterpret_cast<const __nv_bfloat16*>(pooled_) + (size_t)t * DEX + col, pv);
   } else {
     const float* P = reinterpret_cast<const float*>(pooled_) + (size_t)t * PRW;
     lg = __ldcg(P + DEX + e) + __ldcg(P + DEX + NEXP + e);
-    const float4* pq = reinterpret_cast<const float4*>(P + 16 * e);
-#pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const float4 q = __ldcg(pq + i);
-      pv[4 * i] = q.x; pv[4 * i + 1] = q.y; pv[4 * i + 2] = q.z; pv[4 * i + 3] = q.w;
-    }
+    ld4cg<float>(P + col, pv);
   }
   float q = 0.f;
 #pragma unroll
-  for (int i = 0; i < 16; ++i) q = fmaf(pv[i], pv[i], q);
+  for (int i = 0; i < 4; ++i) q = fmaf(pv[i], pv[i], q);
   q = warp_sum(q);
   if (lane == 0) qred[warp] = q;
   const float sc = sigm(lg * 0.1767766952966369f);
-  float sel = sc + bv;
-  for (int k = 0; k < 8; ++k) {   // block argmax, ties to the lower index
-    float v = sel;
-    int idx = e;
-#pragma unroll
-    for (int o = 16; o > 0; o >>= 1) {
-      const float v2 = __shfl_xor_sync(0xffffffffu, v, o);
-      const int i2 = __shfl_xor_sync(0xffffffffu, idx, o);
-      if (v2 > v || (v2 == v && i2 < idx)) { v = v2; idx = i2; }
-    }
-    if (lane == 0) { wred[warp] = v; ired[warp] = idx; }
-    __syncthreads();
-    if (e == 0) {
-      float bv_ = wred[0];
-      int bi = ired[0];
-#pragma unroll
-      for (int w = 1; w < NTH / 32; ++w)
-        if (wred[w] > bv_ || (wred[w] == bv_ && ired[w] < bi)) { bv_ = wred[w]; bi = ired[w]; }
-      sel_idx[k] = bi;
-    }
-    __syncthreads();
-    if (e == sel_idx[k]) { sel_val[k] = sc; sel = -INFINITY; }
-  }
+  const float sel = sc + bv;
+  if (quarter == 0) key_s[e] = ((unsigned long long)ordered(sel) << 32) | (unsigned)(NEXP - 1 - e);
   __syncthreads();
-  if (e < 8) {
-    float tot = 0.f;
-#pragma unroll
-    for (int k = 0; k < 8; ++k) tot += sel_val[k];
-    const int id = sel_idx[e];
-    ids[t * 8 + e] = id;
-    wts[t * 8 + e] = sel_val[e] / (tot + 1e-15f);
-    const int lid = (id - lsv + 256) % 256;
-    lids[t * 8 + e] = lid < 32 ? lid : -1;
+  const unsigned long long mykey = key_s[e];
+  int rk = 0;
+  const unsigned long long* kq = key_s + quarter * (NEXP / 4);
+#pragma unroll 16
+  for (int j = 0; j < NEXP / 4; ++j) rk += kq[j] > mykey;
+  rk_s[quarter][e] = rk;
+  __syncthreads();
+  if (quarter == 0) {
+    const int r = rk_s[0][e] + rk_s[1][e] + rk_s[2][e] + rk_s[3][e];
+    if (r < 8) { sel_idx[r] = e; sel_val[r] = sc; }
   }
-  if (e == 0) {
+  if (tid == 0) {
     float qs = 0.f;
 #pragma unroll
-    for (int w = 0; w < NTH / 32; ++w) qs += qred[w];
+    for (int w = 0; w < RNT / 32; ++w) qs += qred[w];
     scl = rsqrtf(qs / (float)DEX + 1e-5f);
   }
   __syncthreads();
-  const float r = scl;
-  uint32_t o[8];
+  if (tid < 8) {
+    float tot = 0.f;
 #pragma unroll
-  for (int i = 0; i < 8; ++i) o[i] = pack_bf2(pv[2 * i] * r * gp[2 * i], pv[2 * i + 1] * r * gp[2 * i + 1]);
-  uint4* xq = reinterpret_cast<uint4*>(xm + (size_t)t * DEX + 16 * e);
-  xq[0] = make_uint4(o[0], o[1], o[2], o[3]);
-  xq[1] = make_uint4(o[4], o[5], o[6], o[7]);
-  if (pdl && (mode & 1)) { __threadfence(); pdl_trigger(); }
+    for (int k = 0; k < 8; ++k) tot += sel_val[k];
+    const int id = sel_idx[tid];
+    ids[t * 8 + tid] = id;
+    wts[t * 8 + tid] = sel_val[tid] / (tot + 1e-15f);
+    const int lid = (id - lsv + 256) % 256;
+    lids[t * 8 + tid] = lid < 32 ? lid : -1;
+  }
+  const float r = scl;
+  float xo[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) xo[i] = pv[i] * r * gp[i];
+  st4bf(xm + (size_t)t * DEX + col, xo);
 }
 
 static void set_pdl(cudaLaunchConfig_t& lc, cudaLaunchAttribute* at_, int pdl) {
@@ -1700,19 +1679,18 @@ static void set_pdl(cudaLaunchConfig_t& lc, cudaLaunchAttribute* at_, int pdl) {
 }
 
 template <int KIND, typename AT>
-static void launch_bnd(const torch::Tensor& a, int lda, int nu, const torch::Tensor& st, const torch::Tensor& gate,
-                       const torch::Tensor& g1, const torch::Tensor& g2, torch::Tensor& sout, torch::Tensor& hout,
-                       torch::Tensor& part, torch::Tensor& cnt, int T, int pdl, int mode) {
+static void launch_bnd(const torch::Tensor& a, int lda, int nu, const torch::Tensor& st, const torch::Tensor& alpha,
+                       const torch::Tensor& beta, const torch::Tensor& g1, const torch::Tensor& g2, torch::Tensor& sout,
+                       torch::Tensor& hout, int T, int pdl, int mode) {
   cudaLaunchConfig_t lc = {};
   cudaLaunchAttribute at_[1];
-  lc.gridDim = dim3(NC, T);
-  lc.blockDim = dim3(NTH);
+  lc.gridDim = dim3(T);
+  lc.blockDim = dim3(BNT);
   set_pdl(lc, at_, pdl);
   C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, bnd_kernel<KIND, AT>, reinterpret_cast<const AT*>(a.data_ptr()), lda, nu,
-      st.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr()),
+      st.data_ptr<float>(), alpha.data_ptr<float>(), beta.data_ptr<float>(),
       reinterpret_cast<const __nv_bfloat16*>(g1.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr()),
-      sout.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(hout.data_ptr()),
-      reinterpret_cast<float4*>(part.data_ptr()), reinterpret_cast<unsigned*>(cnt.data_ptr()), pdl, mode));
+      sout.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(hout.data_ptr()), pdl, mode));
 }
 
 template <bool SPLIT>
@@ -1722,7 +1700,7 @@ static void launch_route(const void* pooled, const float* logits, const torch::T
   cudaLaunchConfig_t lc = {};
   cudaLaunchAttribute at_[1];
   lc.gridDim = dim3(T);
-  lc.blockDim = dim3(NTH);
+  lc.blockDim = dim3(RNT);
   set_pdl(lc, at_, pdl);
   C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, route_kernel<SPLIT>, pooled, logits, bias.data_ptr<float>(),
       reinterpret_cast<const __nv_bfloat16*>(gpre.data_ptr()), ids.data_ptr<int>(), wts.data_ptr<float>(),
@@ -1731,27 +1709,28 @@ static void launch_route(const void* pooled, const float* logits, const torch::T
 
 }  // namespace okc_glue
 
-void glue_bnd(int64_t kind, torch::Tensor a, int64_t nu, torch::Tensor st, torch::Tensor gate, torch::Tensor g1,
-              torch::Tensor g2, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
-              int64_t T, int64_t pdl, int64_t mode) {
+void glue_bnd(int64_t kind, torch::Tensor a, int64_t nu, torch::Tensor st, torch::Tensor alpha, torch::Tensor beta,
+              torch::Tensor g1, torch::Tensor g2, torch::Tensor sout, torch::Tensor hout, int64_t T, int64_t pdl,
+              int64_t mode) {
   using namespace okc_glue;
   TORCH_CHECK(kind == 1 || kind == 2, "glue_bnd: kind");
   TORCH_CHECK(a.is_contiguous() && st.is_contiguous() && sout.is_contiguous() && hout.is_contiguous(), "glue_bnd: contiguous");
+  TORCH_CHECK(alpha.is_contiguous() && beta.is_contiguous() && alpha.numel() == HID && beta.numel() == HID, "glue_bnd: alpha/beta");
+  TORCH_CHECK(alpha.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat, "glue_bnd: alpha/beta fp32");
   TORCH_CHECK(a.dim() == 2 && a.size(0) == T && st.size(0) == T && sout.size(0) == T && hout.size(0) == T, "glue_bnd: rows");
   TORCH_CHECK(st.scalar_type() == at::kFloat && sout.scalar_type() == at::kFloat && hout.scalar_type() == at::kBFloat16, "glue_bnd: dtypes");
-  TORCH_CHECK(gate.scalar_type() == at::kBFloat16 && g1.scalar_type() == at::kBFloat16 && g2.scalar_type() == at::kBFloat16, "glue_bnd: weights bf16");
+  TORCH_CHECK(g1.scalar_type() == at::kBFloat16 && g2.scalar_type() == at::kBFloat16 && g1.numel() == HID && g2.numel() == HID, "glue_bnd: norm weights");
   TORCH_CHECK(st.size(1) == HID && sout.size(1) == HID && hout.size(1) == HID, "glue_bnd: width");
-  TORCH_CHECK(nu > 0 && nu <= HID && nu % (NTH * EPT) == 0 && a.size(1) >= nu, "glue_bnd: nu");
-  TORCH_CHECK(part.numel() >= T * NC * 4 && cnt.numel() >= T && cnt.scalar_type() == at::kInt, "glue_bnd: scratch");
+  TORCH_CHECK(nu > 0 && nu <= HID && nu % 4 == 0 && a.size(1) >= nu, "glue_bnd: nu");
   const int lda = (int)a.size(1);
   const bool bf = a.scalar_type() == at::kBFloat16;
   TORCH_CHECK(bf || a.scalar_type() == at::kFloat, "glue_bnd: a dtype");
   if (kind == 1) {
-    if (bf) launch_bnd<1, __nv_bfloat16>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl, (int)mode);
-    else launch_bnd<1, float>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl, (int)mode);
+    if (bf) launch_bnd<1, __nv_bfloat16>(a, lda, (int)nu, st, alpha, beta, g1, g2, sout, hout, (int)T, (int)pdl, (int)mode);
+    else launch_bnd<1, float>(a, lda, (int)nu, st, alpha, beta, g1, g2, sout, hout, (int)T, (int)pdl, (int)mode);
   } else {
-    if (bf) launch_bnd<2, __nv_bfloat16>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl, (int)mode);
-    else launch_bnd<2, float>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl, (int)mode);
+    if (bf) launch_bnd<2, __nv_bfloat16>(a, lda, (int)nu, st, alpha, beta, g1, g2, sout, hout, (int)T, (int)pdl, (int)mode);
+    else launch_bnd<2, float>(a, lda, (int)nu, st, alpha, beta, g1, g2, sout, hout, (int)T, (int)pdl, (int)mode);
   }
 }
 
@@ -1782,7 +1761,7 @@ def _glue_build():
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
     return load_inline(
-        name=f"okc_glue_v3_{arch}",
+        name=f"okc_glue_v4_{arch}",
         cpp_sources=GLUE_CPP_SRC,
         cuda_sources=GLUE_CUDA_SRC,
         functions=["glue_bnd", "glue_route"],
@@ -1807,9 +1786,10 @@ def _glue_ok(state, T, kind="r"):
             and state.get("glue_on", {}).get(T, True) and kind in state.get("glue_kinds", (1, 2, "r")))
 
 
-def _glue_bnd(kind, a, nu, st_in, gate, g1, g2, sout, hout, state, T):
-    glue__MOD.glue_bnd(kind, a, nu, st_in, gate, g1, g2, sout, hout, state["glue_part"][kind - 1],
-                       state["glue_cnt"][kind - 1], T, int(_pdl(T)), GLUE_MODE if state.get("glue_mode") is None else state["glue_mode"])
+def _glue_bnd(kind, a, nu, st_in, ab, g1, g2, sout, hout, state, T):
+    """ab = (alpha, beta) fp32 [8192] of the boundary's residual gate (state["ab1"] / ["ab2"], prepare-time)."""
+    glue__MOD.glue_bnd(kind, a, nu, st_in, ab[0], ab[1], g1, g2, sout, hout, T, int(_pdl(T)),
+                       GLUE_MODE if state.get("glue_mode") is None else state["glue_mode"])
 
 
 def _glue_route(pooled, logits, state, ls, ids, wts, xm, lids, T):
@@ -1827,8 +1807,6 @@ def _glue_selftest(st):
         return
     dev = st["qkv"].device
     f32 = dict(device=dev, dtype=torch.float32)
-    st["glue_part"] = torch.zeros((2, GLUE_MAX_T * GLUE_NC, 4), **f32)
-    st["glue_cnt"] = torch.zeros((2, GLUE_MAX_T), device=dev, dtype=torch.int32)
     g = torch.Generator(device=dev).manual_seed(781)
     ls = torch.zeros(1, device=dev, dtype=torch.int32)
     rel = lambda x, y: float(((x.float() - y.float()).norm() / (y.float().norm() + 1e-30)).item())  # noqa: E731
@@ -1843,7 +1821,7 @@ def _glue_selftest(st):
             s1r, hr = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
             s1, h = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
             _boundary1[(T,)](a.view(1, T, HIDDEN), 1, T, stream, st["gate1"], st["gate1"], st["g_preffn"], s1r, hr, num_warps=16)
-            _glue_bnd(1, a, HIDDEN, stream, st["gate1"], st["g_preffn"], st["g_preffn"], s1, h, st, T)
+            _glue_bnd(1, a, HIDDEN, stream, st["ab1"], st["g_preffn"], st["g_preffn"], s1, h, st, T)
             e1, e2 = rel(s1, s1r), rel(h, hr)
             nu = 1024 if T <= 8 else HIDDEN
             u = (torch.randn(T, nu, generator=g, device=dev) * 0.1).to(torch.bfloat16)
@@ -1854,7 +1832,7 @@ def _glue_selftest(st):
             s2, out = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
             _boundary2[(T,)](u.view(1, T, nu), 1, T, nu, s1x, st["gate2"], st["gate2"], st["g_postffn"], st["g_next"],
                              s2r, outr, num_warps=16)
-            _glue_bnd(2, u, nu, s1x, st["gate2"], st["g_postffn"], st["g_next"], s2, out, st, T)
+            _glue_bnd(2, u, nu, s1x, st["ab2"], st["g_postffn"], st["g_next"], s2, out, st, T)
             e3, e4 = rel(s2, s2r), rel(out, outr)
             worst = max(worst, e1, e3, e2 / 8, e4 / 8)   # bf16 outputs: a few 1-ulp flips are 1e-3..1e-2 of rel L2
             report.append(f"T{T}{'f' if a_f32 else ''} b1 {e1:.1e}/{e2:.1e} b2 {e3:.1e}/{e4:.1e}")
@@ -2645,7 +2623,7 @@ def _after_attention(data, state, o_in, gate, T):
             bnd1 = (P.view(T, HIDDEN), data["stream"], state["ab1"][0], state["ab1"][1], state["g_preffn"], s1)
         elif (S == 1 and P.dtype in (torch.bfloat16, torch.float32) and _glue_ok(state, T, 1)
               and data["stream"].dtype == torch.float32 and data["stream"].is_contiguous()):
-            _glue_bnd(1, P.view(T, HIDDEN), HIDDEN, data["stream"], state["gate1"], state["g_preffn"], state["g_preffn"],
+            _glue_bnd(1, P.view(T, HIDDEN), HIDDEN, data["stream"], state["ab1"], state["g_preffn"], state["g_preffn"],
                       s1, h, state, T)
         else:
             _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
@@ -2762,7 +2740,7 @@ def _after_attention(data, state, o_in, gate, T):
         _bnd2_apply[(T, HIDDEN // BC2)](fbuf, sums2, s1, state["gate2"], state["gate2"], state["g_next"], s2, out,
                                         N=HIDDEN, BC=BC2, num_warps=8)
     elif S == 1 and P.dtype in (torch.bfloat16, torch.float32) and P.shape[-1] == nu and _glue_ok(state, T, 2):
-        _glue_bnd(2, P.view(T, nu), nu, s1, state["gate2"], state["g_postffn"], state["g_next"], s2, out, state, T)
+        _glue_bnd(2, P.view(T, nu), nu, s1, state["ab2"], state["g_postffn"], state["g_next"], s2, out, state, T)
     else:
         _boundary2[(T,)](P, S, T, nu, s1, state["gate2"], state["gate2"], state["g_postffn"], state["g_next"],
                          s2, out, num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))

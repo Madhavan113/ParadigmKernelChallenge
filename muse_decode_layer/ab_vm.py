@@ -67,7 +67,7 @@ def apply(S, st, spec, saved):
     """Apply an override spec to the module / state; record what it replaced in `saved` (for restore)."""
     for item in [s for s in spec.split(";") if s and s != "base"]:
         key, val = item.split("=", 1)
-        kind, sel = key.split(":", 1)
+        kind, sel = key.split(":", 1) if ":" in key else (key, "")
         if kind == "pr":
             T = int(sel)
             saved.append(("mm", (T, "pr"), st["mm_pick"].get((T, "pr"))))
