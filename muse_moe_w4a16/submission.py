@@ -3840,11 +3840,18 @@ __device__ __forceinline__ int wgs_stage_at(const Smem& S, int nj, int pb, uint3
 __device__ __forceinline__ void wgs_range(const Smem& S, int nj, int pb, int c, int G, int& g0, int& g1) {
   const uint32_t tot = pb ? S.wtotB : S.wtot;
 #if OKC_WGSDYN
-  // static ranges over the first (1 - 2^-WGSDYNS) of the cost; the stages from stage_at(tots) on are the pool
+  // static ranges over the first (1 - 2^-WGSDYNS) of the cost; the pool starts at the next UNIT boundary after
+  // stage_at(tots) (a unit straddling the boundary would get two designated finishers: deadlock), and the last
+  // CTA's static range extends to it so no stage is left unissued
   if (nj == 0) { g0 = g1 = 0; return; }
   const uint32_t tots = tot - (tot >> OKC_WGSDYNS);
+  const int T = nj << (9 - pb);
+  int Ts = ((wgs_stage_at(S, nj, pb, tots) + 15) >> 4) << 4;
+  if (Ts > T) Ts = T;
   g0 = wgs_stage_at(S, nj, pb, tots * (uint32_t)c / (uint32_t)G);
-  g1 = wgs_stage_at(S, nj, pb, tots * (uint32_t)(c + 1) / (uint32_t)G);
+  g1 = c == G - 1 ? Ts : wgs_stage_at(S, nj, pb, tots * (uint32_t)(c + 1) / (uint32_t)G);
+  if (g0 > Ts) g0 = Ts;
+  if (g1 > Ts) g1 = Ts;
 #else
   g0 = wgs_stage_at(S, nj, pb, tot * (uint32_t)c / (uint32_t)G);
   g1 = c == G - 1 ? (nj << (9 - pb)) : wgs_stage_at(S, nj, pb, tot * (uint32_t)(c + 1) / (uint32_t)G);
@@ -3857,10 +3864,10 @@ __device__ __noinline__ void wgs_ranges(const Params& p, Smem& S) {
   wgs_range(S, nj, 0, blockIdx.x, gridDim.x, S.wgr[0], S.wgr[1]);
   wgs_range(S, nj, 1, blockIdx.x, gridDim.x, S.wgr[2], S.wgr[3]);
 #if OKC_WGSDYN
-  S.wgd[0] = nj ? wgs_stage_at(S, nj, 0, S.wtot - (S.wtot >> OKC_WGSDYNS)) : 0;
   S.wgd[1] = nj << 9;
-  S.wgd[2] = nj ? wgs_stage_at(S, nj, 1, S.wtotB - (S.wtotB >> OKC_WGSDYNS)) : 0;
   S.wgd[3] = nj << 8;
+  S.wgd[0] = nj ? min(S.wgd[1], ((wgs_stage_at(S, nj, 0, S.wtot - (S.wtot >> OKC_WGSDYNS)) + 15) >> 4) << 4) : 0;
+  S.wgd[2] = nj ? min(S.wgd[3], ((wgs_stage_at(S, nj, 1, S.wtotB - (S.wtotB >> OKC_WGSDYNS)) + 15) >> 4) << 4) : 0;
 #endif
 #if OKC_DEBUG && OKC_WGSFIT
   if (p.dbg) {  // per-phase stage counts by n-tiles (bytes 0..7), for the cost-model fit
@@ -5047,9 +5054,9 @@ DIAG_VARIANT_SETS = {
     "P": {  # tails: WGSDYN pool segments (static cost-weighted ranges + segments claimed by the weights producer) with the
             # last-stage finisher and unit-indexed fixup slots (check D ran the last-arriver finisher), SEG 4 / 8
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
-        "dyn4": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSSEG=4"), "shapes": _WGS_SHAPES},
-        "dyn8": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSSEG=8"), "shapes": _WGS_SHAPES},
-        "dyn8_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSSEG=8", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "dyn4": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSSEG=4", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
+        "dyn8": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSSEG=8", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
+        "dyn8_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSDYN=1", "-DOKC_WGSSEG=8", "-DOKC_WGSDBG=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
     },
     "O": {  # WGS phase-A x gather by whole n8 tiles through smem (OKC_GATHT) vs the per-row gather
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
