@@ -11,7 +11,7 @@ per-round differences), and a final table of means over seeds.
 Override keys (T = token count): pr:T=bfp|bfpf (the pooler+router form), rmode:T=split|sk2f|moe|moe_nb,
 bnd1:T=0|1 (boundary-1 prologue in the fused launch), pdl:T=N (sk2 pre-wait weight stages), btail:T.o=0|1,
 btail:T.unpooler=0|1 (boundary tails), sk2:layer.tokr=config (needs OKC_SK2_ALL=1 at build), mm:T.name=pick
-(dense pick: False|True|bfp|mm16|torchT|bfq). A spec "s0:<overrides>|s1:<overrides>" applies per seed (e.g. an earlier
+(dense pick: False|True|bfp|mm16|torchT|bfq), glue:T=0|1 (CUDA vs Triton glue kernels), pdlmax=N (PDL_MAX_T). A spec "s0:<overrides>|s1:<overrides>" applies per seed (e.g. an earlier
 prepare's picks as the "before" of a before/after). Run inside the judge image with the repo at /work (cwd = /work).
 """
 import argparse, importlib, os, re, statistics, sys, time
@@ -103,6 +103,9 @@ def apply(S, st, spec, saved):
             T = int(sel)
             saved.append(("glue_on", T, st.setdefault("glue_on", {}).get(T)))
             st["glue_on"][T] = val in ("1", "True")
+        elif kind == "pdlmax":   # PDL_MAX_T: programmatic launches (attention, MoE, glue, sk2) up to this T
+            saved.append(("pdlmax", None, S.PDL_MAX_T))
+            S.PDL_MAX_T = int(val)
         else:
             raise ValueError(item)
 
@@ -121,6 +124,8 @@ def restore(S, st, saved):
                 S._PDL_N_BY_T[k] = old
         elif kind == "sk2":
             S.bfp_SK2_PICK[k] = old
+        elif kind == "pdlmax":
+            S.PDL_MAX_T = old
         else:
             d = st[kind]
             if old is None:
