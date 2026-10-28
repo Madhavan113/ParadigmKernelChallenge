@@ -146,15 +146,21 @@ def main():
             apply(S, st, spec, saved)
             for name in args.shapes:
                 data = datas[name]
-                s = torch.cuda.Stream()
-                with torch.cuda.stream(s):
-                    for _ in range(2):
+                try:
+                    s = torch.cuda.Stream()
+                    with torch.cuda.stream(s):
+                        for _ in range(2):
+                            S.kernel_fn(data, st)
+                    torch.cuda.synchronize()
+                    g = torch.cuda.CUDAGraph()
+                    with torch.cuda.graph(g, stream=s):
                         S.kernel_fn(data, st)
-                torch.cuda.synchronize()
-                g = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(g, stream=s):
-                    S.kernel_fn(data, st)
-                torch.cuda.synchronize()
+                    torch.cuda.synchronize()
+                except Exception as ex:  # noqa: BLE001  (a variant this build cannot run: keep the batch going)
+                    torch.cuda.synchronize()
+                    results[(vi, name, seed)] = float("nan")
+                    print(f"[fail] v{vi} seed {seed} {name}: {repr(ex)[:300]} ({spec})", flush=True)
+                    continue
                 ts = []
                 for _ in range(args.iters):
                     flush_buf.view(torch.int32).sum()
