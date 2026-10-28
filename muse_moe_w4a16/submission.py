@@ -3520,6 +3520,18 @@ __device__ __forceinline__ void wgs_flush(const Params& p, Smem& S, WgsPend& pd)
     if (wt == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(p.doneAs + j * 16 + (ub >> 1)), "r"(1) : "memory");
   }
 }
+// the designated finisher of a split unit: phase A the share holding its last stage (the next CTA's first piece, run
+// first there by the reorder), phase B the share holding stage 0 (the previous CTA's last piece); OKC_WGSDYN pool
+// pieces (stage >= the pool start) are claimed in stage order, so the share holding the last stage finishes in both phases
+template <bool PB>
+__device__ __forceinline__ bool wgs_is_fin(const Smem& S, int u, int s0, int s1) {
+#if OKC_WGSDYN
+  if ((u << 4) + s0 >= S.wgd[2 * (PB ? 1 : 0)]) return s1 == 16;
+#else
+  (void)S; (void)u;
+#endif
+  return PB ? s0 == 0 : s1 == 16;
+}
 // one segment (stages [s0, s1) of unit u) on NTT n-tiles: accumulate, then finish (whole unit) or hand off (split)
 template <bool PB, int NTT>
 __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char* ring, int u, int s0, int s1, int slot,
@@ -3651,7 +3663,7 @@ __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char*
                    "f"(d[nt][2]), "f"(d[nt][3]) : "memory");
     // kind 3: this share finishes the unit (designated finisher, OKC_WGSDFIN): phase A the share holding stage 15,
     // phase B the one holding stage 0
-    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && (OKC_WGSDYN ? s1 == 16 : (PB ? s0 == 0 : s1 == 16))) ? 3 : 2, u, slot, s1 - s0};
+    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && wgs_is_fin<PB>(S, u, s0, s1)) ? 3 : 2, u, slot, s1 - s0};
     return;
   }
   const int j = u >> UBL, r16 = (u & ((1 << UBL) - 1)) * 16 + wg * 4 + wp;
@@ -3739,7 +3751,7 @@ __device__ __forceinline__ void wgs_seg_mma(const Params& p, Smem& S, unsigned c
     for (int nt = 0; nt < NTT; ++nt)
       asm volatile("red.global.add.v4.f32 [%0], {%1, %2, %3, %4};\n" ::"l"(fb + nt * 512), "f"(d[nt][0]), "f"(d[nt][1]),
                    "f"(d[nt][2]), "f"(d[nt][3]) : "memory");
-    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && (OKC_WGSDYN ? s1 == 16 : (PB ? s0 == 0 : s1 == 16))) ? 3 : 2, u, slot, s1 - s0};
+    pd = WgsPend{(((OKC_WGSDFIN >> (PB ? 1 : 0)) & 1) && wgs_is_fin<PB>(S, u, s0, s1)) ? 3 : 2, u, slot, s1 - s0};
     return;
   }
   const int j = u >> UBL, r16 = (u & ((1 << UBL) - 1)) * 16 + wg * 4 + wp;
