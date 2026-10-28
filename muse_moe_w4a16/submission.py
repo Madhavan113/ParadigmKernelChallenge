@@ -5063,11 +5063,15 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "Q"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "R"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 def _fast1(defs, n):  # a tiny define tuple with another FAST1 pre-issue depth (units issued before routing, <= OKC_NS)
     return tuple(f"-DOKC_FAST1={n}" if d.startswith("-DOKC_FAST1=") else d for d in defs)
+
+
+def _nw(defs, n):  # a tiny define tuple with n compute warps (16: half a K slice per warp, 4 warps per SM quadrant)
+    return tuple(f"-DOKC_NW={n}" if d.startswith("-DOKC_NW=") else d for d in defs)
 
 
 DIAG_VARIANT_SETS = {
@@ -5078,6 +5082,20 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "R": {  # small-batch item: the per-unit compute of the 8-warp tiny loop (set Q: 1.0-1.35 us per 36 KB unit, 2 warps per
+            # SM quadrant, latency-bound; the stream runs 1.35 us/unit): 16 compute warps (96 registers, no spills), NACC 2/4,
+            # dequant ablation; the MID build (bs16) with 16 warps too
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1, 4]},
+        "tiny_nw16": {"defines": _nw(TINY_DEFINES, 16), "shapes": [1, 4]},
+        "tiny_nw16_dbg": {"defines": _nw(TINY_DEFINES, 16) + ("-DOKC_DEBUG=1",), "shapes": [1, 4]},
+        "tiny_nw16_na2": {"defines": tuple("-DOKC_NACC=2" if d == "-DOKC_NACC=4" else d for d in _nw(TINY_DEFINES, 16)), "shapes": [1]},
+        "tiny_xnodq": {"defines": TINY_DEFINES + ("-DOKC_XNODQ=1",), "shapes": [1]},  # (wrong results: the dequant's share)
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_nw16": {"defines": _nw(TINY2_DEFINES, 16), "shapes": [8]},
+        "tiny2_nw16_dbg": {"defines": _nw(TINY2_DEFINES, 16) + ("-DOKC_DEBUG=1",), "shapes": [8]},
+        "mid": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_nw16": {"defines": _nw(MID_DEFINES, 16), "shapes": [16]},
     },
     "Q": {  # small-batch latency: TINY (bs1, bs4) and TINY2 (bs8) stamps (min/med/max over CTAs) and the weights-only
             # stream floor of the same expert set (OKC_WSNOC: ring, x loads, handoffs, epilogues, no dequant / MMA)
@@ -5211,11 +5229,11 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET == "Q" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET == "Q" else [1, 4, 8, 16] if DIAG_SET == "R" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 # (bs, touched local experts) cases: the input seed is searched (DIAG_SEED + bs + 1000 k) for the judge's typical draw
 # (tools/moe_routing_stats.py, 60 seeds: bs1 p10/p50/p90 2/3/3, bs4 4/6/8, bs8 5/8/11); None: the fixed seed
-DIAG_CASES = [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET == "Q" else [(bs, None) for bs in DIAG_SHAPES]
+DIAG_CASES = [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET == "Q" else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET == "R" else [(bs, None) for bs in DIAG_SHAPES]
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
 
