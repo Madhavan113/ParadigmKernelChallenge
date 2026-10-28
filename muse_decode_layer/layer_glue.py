@@ -244,6 +244,7 @@ def _boundary_selftest(st):
 FUSE_BND1 = True   # the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
                    # output (every CTA redundantly, before its x boxes; the weight ring is already streaming): no
                    # _boundary1 launch at T <= BND1_MAX_T. Enabled only when the prepare-time self-test matches.
+PRFORM_MAX_T = 32  # the pooler + router form (separate / fused [/ fused + prologue]) is chosen on the chain per T up to here
 BND1_MAX_T = 8     # cooperative prologue: CTA c owns its 64 columns of every row (<= 3 KB per CTA), two grid tickets
                    # at the kernel start, the weight ring streams meanwhile (the per-CTA whole-row versions were
                    # load-issue bound: +10..13 us isolated)
@@ -1716,10 +1717,11 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
-        if T <= BND1_MAX_T and st.get("bfp") is not None:
+        if T <= PRFORM_MAX_T and st.get("bfp") is not None:
             # the pooler + router form at this T, on the chain: separate launches (pooler cgemv / sk2 + router rgemv /
-            # sk2) + _boundary1, the fused launch + _boundary1, or the fused launch computing the boundary in its
-            # prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each other
+            # sk2) + _boundary1, the fused launch + _boundary1, or (T <= BND1_MAX_T) the fused launch computing the
+            # boundary in its prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each
+            # other (1d2eac51: separate won by 3 us at T = 1)
             cands = [("bfp", False), ("bfpf", False)] + ([("bfpf", True)] if T in st.get("fuse_bnd1_ok_T", ()) else [])
             btimes = {}
             for pr_pick, flag in cands:
@@ -1828,8 +1830,8 @@ def prepare(weights):
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
-        if k[1] == "pr" and k[0] <= BND1_MAX_T:
-            continue   # the pooler + router form at T <= BND1_MAX_T is chosen on the chain in _tune ("prform")
+        if k[1] == "pr" and k[0] <= PRFORM_MAX_T:
+            continue   # the pooler + router form at T <= PRFORM_MAX_T is chosen on the chain in _tune ("prform")
         if isinstance(v, tuple):
             times = st.get("mm_times", {}).get(k, {})
             v = min(v, key=lambda p: times.get(p, 1e30))
