@@ -213,13 +213,15 @@ CUDA_SRC = r'''
                        // warpgroups can grow (inc OKC_WGSREG): per SM quadrant 4 x OKC_WGSREG + 24 <= 512 -> up to 120
 #endif
 #ifndef OKC_WGSREGP
-#define OKC_WGSREGP 24  // registers kept by the producer warpgroup (its TMA loops use R0..R15; the ranges run before)
+#define OKC_WGSREGP 32  // registers kept by the producer warpgroup (its TMA loops use R0..R15). The setmaxnreg pool holds
+                        // only what the CTA released: 4 x (96 - OKC_WGSREGP) must cover 16 x (OKC_WGSREG - 96), i.e.
+                        // OKC_WGSREG <= 112 at 32 (120 with 24 released only 288 of the 384 needed: TRY_ALLOC spins forever)
 #endif
 #if OKC_WGSREG
 #undef OKC_WGSPR
 #define OKC_WGSPR 0    // (the x producer must not call wgs_ranges after its dealloc: thread 0 computes the ranges)
-static_assert(4 * OKC_WGSREG + OKC_WGSREGP <= 512 && OKC_WGSREG % 8 == 0 && OKC_WGSREGP % 8 == 0 && OKC_WGSREGP >= 24,
-              "OKC_WGSREG: 4 x consumers + producers <= 512 per quadrant, multiples of 8");
+static_assert(16 * (OKC_WGSREG - 96) <= 4 * (96 - OKC_WGSREGP) && OKC_WGSREG % 8 == 0 && OKC_WGSREGP % 8 == 0 && OKC_WGSREGP >= 24,
+              "OKC_WGSREG: the consumers can only take what the producer warpgroup released (launch allocation 96)");
 #endif
 #ifndef OKC_WGSFOLD
 #define OKC_WGSFOLD 0  // WGS: no producer warps: lane 0 of warp 0 issues the weight and x TMAs between its own k16
@@ -4982,10 +4984,8 @@ DIAG_VARIANT_SETS = {
     },
     "M": {  # WGS with setmaxnreg: producer warpgroup dec 24, consumers inc 120; wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
-        "reg120": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
-        "reg120_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
-        "reg120_gs4_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
-        "reg120_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "reg112": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=112", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
+        "reg112_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=112", "-DOKC_WGSDBG=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
     },
     "L": {  # WGS with the producers folded into warp 0 (16-warp CTA, 128 registers): wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
