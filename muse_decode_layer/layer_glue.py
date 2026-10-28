@@ -1409,6 +1409,459 @@ def _boundary2(P, S: tl.constexpr, T, NU: tl.constexpr, S1, A2, B2, GPOST, GNEXT
 
 
 # ----------------------------------------------------------------------------------------------
+# The three glue kernels as CUDA. ncu on the H200 (glue.ncu-rep, T = 1 and 8): each Triton program is ONE CTA of 16
+# warps that runs ~790 instructions per warp with 4 warps per scheduler (No Eligible 61%, 10.6 cycles per issued
+# instruction, 14 GB/s of memory traffic) = 6.2-6.6 us per boundary kernel and 5.6-5.8 us for the routing, the same
+# per program at T = 8 (one program per token): a latency / issue chain, not bandwidth and not the S loop (every
+# producer emits one reduced row, S = 1). Here a token's boundary is 8 CTAs x 256 threads x 4 columns, every load
+# issued before any use (the stream / s1 slice, the gate and the norm weights before griddepcontrol.wait, the
+# producer's slice after it), the row's four sums (sum x^2, sum (alpha st)^2, sum (alpha st)(beta x), sum (beta x)^2:
+# sum s^2 = A + 2 r B + r^2 D, so one exchange gives both norms) reduced per CTA and exchanged through a tiny per-token
+# ticket barrier (8 arrivals; monotonic tickets, no reset), the two scales formed identically in every CTA
+# (deterministic), then the slice is finished from registers. The routing is one 256-thread CTA per token: thread e
+# owns logit e (8 rounds of block argmax, ties to the lower index as tl.argmax) and 16 pooled columns.
+# Kept as a prepare-time self-tested alternative to the Triton kernels (st["glue_ok"]), per-T switch st["glue_on"].
+GLUE_CUDA = True
+GLUE_MAX_T = 256
+GLUE_NC = 8          # column blocks per token (8192 / (256 threads x 4 columns))
+glue__MOD = None
+
+GLUE_CPP_SRC = r"""
+void glue_bnd(int64_t kind, torch::Tensor a, int64_t nu, torch::Tensor st, torch::Tensor gate, torch::Tensor g1,
+              torch::Tensor g2, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
+              int64_t T, int64_t pdl);
+void glue_route(torch::Tensor pooled, std::optional<torch::Tensor> logits, torch::Tensor bias, torch::Tensor gpre,
+                torch::Tensor ids, torch::Tensor wts, torch::Tensor xm, torch::Tensor ls, torch::Tensor lids,
+                int64_t T, int64_t pdl);
+"""
+
+GLUE_CUDA_SRC = r"""
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
+#include <cuda_bf16.h>
+#include <cuda_runtime.h>
+#include <cstdint>
+#include <optional>
+
+namespace okc_glue {
+
+constexpr int HID = 8192, DEX = 4096, NEXP = 256, PRW = 4608;
+constexpr int NTH = 256, EPT = 4, NC = HID / (NTH * EPT);   // 8 column blocks of 1024 per token
+
+__device__ __forceinline__ void pdl_wait() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.wait;" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void pdl_trigger() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("griddepcontrol.launch_dependents;");
+#endif
+}
+__device__ __forceinline__ float bf_lo(uint32_t v) { return __uint_as_float(v << 16); }
+__device__ __forceinline__ float bf_hi(uint32_t v) { return __uint_as_float(v & 0xFFFF0000u); }
+__device__ __forceinline__ uint32_t pack_bf2(float a, float b) {
+  __nv_bfloat162 p = __floats2bfloat162_rn(a, b);
+  return *reinterpret_cast<uint32_t*>(&p);
+}
+__device__ __forceinline__ float sigm(float x) { return 1.f / (1.f + expf(-x)); }
+// alpha, beta of a residual gate from its BF16 weight (the Triton _gate_ab)
+__device__ __forceinline__ void gate_ab(float gw, float& alpha, float& beta) {
+  const float w = gw / 0.3f;
+  beta = sigm(w);
+  alpha = sqrtf(fmaxf(sigm(-w) * (1.f + beta), 1e-3f));
+}
+template <typename T> __device__ __forceinline__ void load4(const T* p, float* v);
+template <> __device__ __forceinline__ void load4<float>(const float* p, float* v) {
+  const float4 q = *reinterpret_cast<const float4*>(p);
+  v[0] = q.x; v[1] = q.y; v[2] = q.z; v[3] = q.w;
+}
+template <> __device__ __forceinline__ void load4<__nv_bfloat16>(const __nv_bfloat16* p, float* v) {
+  const uint2 q = *reinterpret_cast<const uint2*>(p);
+  v[0] = bf_lo(q.x); v[1] = bf_hi(q.x); v[2] = bf_lo(q.y); v[3] = bf_hi(q.y);
+}
+__device__ __forceinline__ float warp_sum(float v) {
+#pragma unroll
+  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+  return v;
+}
+
+// KIND 1 (post-attention): a = o-projection output [T, lda], st = the layer's input stream fp32 [T, 8192], gate =
+//   attn_residual_gate, g1 = pre_ffn_norm: s = alpha st + beta a rstd(a); h = s rstd(s) (1 + g1).
+// KIND 2 (post-FFN): a = unpooler output [T, lda] (columns >= nu are zero: the 1024-row slice at T <= 8), st = s1,
+//   gate = ffn_residual_gate, g1 = post_ffn_norm (scales a before its norm), g2 = next_pre_attn_norm:
+//   f = a (1 + g1); s = alpha st + beta f rstd(f); h = s rstd(s) (1 + g2).
+// Grid (NC, T), 256 threads x 4 columns. Every launch adds exactly NC tickets per token, so ticket blocks of NC are
+// aligned and the counters never need a reset; the NC partials are summed by the same tree in every CTA.
+template <int KIND, typename AT>
+__global__ void __launch_bounds__(NTH) bnd_kernel(const AT* __restrict__ a, int lda, int nu, const float* __restrict__ st,
+    const __nv_bfloat16* __restrict__ gate, const __nv_bfloat16* __restrict__ g1, const __nv_bfloat16* __restrict__ g2,
+    float* __restrict__ sout, __nv_bfloat16* __restrict__ hout, float4* __restrict__ part, unsigned* __restrict__ cnt,
+    int pdl) {
+  const int t = blockIdx.y, c = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int col = (c * NTH + tid) * EPT;
+  __shared__ float red[NTH / 32][4];
+  __shared__ float scl[2];
+  if (pdl) pdl_trigger();
+  float sv[4], gv[4], g1v[4], g2v[4] = {0.f, 0.f, 0.f, 0.f};
+  load4<float>(st + (size_t)t * HID + col, sv);
+  load4<__nv_bfloat16>(gate + col, gv);
+  load4<__nv_bfloat16>(g1 + col, g1v);
+  if (KIND == 2) load4<__nv_bfloat16>(g2 + col, g2v);
+  float al[4], be[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) gate_ab(gv[i], al[i], be[i]);
+  if (pdl) pdl_wait();
+  float x[4] = {0.f, 0.f, 0.f, 0.f};
+  if (KIND == 1 || col < nu) load4<AT>(a + (size_t)t * lda + col, x);
+  if (KIND == 2) {
+#pragma unroll
+    for (int i = 0; i < 4; ++i) x[i] *= 1.f + g1v[i];
+  }
+  float q0 = 0.f, q1 = 0.f, q2 = 0.f, q3 = 0.f;
+  float as[4], bx[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    as[i] = al[i] * sv[i];
+    bx[i] = be[i] * x[i];
+    q0 = fmaf(x[i], x[i], q0); q1 = fmaf(as[i], as[i], q1); q2 = fmaf(as[i], bx[i], q2); q3 = fmaf(bx[i], bx[i], q3);
+  }
+  q0 = warp_sum(q0); q1 = warp_sum(q1); q2 = warp_sum(q2); q3 = warp_sum(q3);
+  if (lane == 0) { red[warp][0] = q0; red[warp][1] = q1; red[warp][2] = q2; red[warp][3] = q3; }
+  __syncthreads();
+  if (tid == 0) {
+    float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
+#pragma unroll
+    for (int w = 0; w < NTH / 32; ++w) { p.x += red[w][0]; p.y += red[w][1]; p.z += red[w][2]; p.w += red[w][3]; }
+    part[(size_t)t * NC + c] = p;
+    __threadfence();
+    const unsigned ticket = atomicAdd(cnt + t, 1u);
+    const unsigned target = (ticket & ~(unsigned)(NC - 1)) + (unsigned)NC;
+    while ((int)(*reinterpret_cast<volatile unsigned*>(cnt + t) - target) < 0) __nanosleep(40);
+    __threadfence();
+  }
+  __syncthreads();
+  if (warp == 0) {
+    float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
+    if (lane < NC) p = __ldcg(part + (size_t)t * NC + lane);
+#pragma unroll
+    for (int o = NC / 2; o > 0; o >>= 1) {   // the same tree in every CTA of the token
+      p.x += __shfl_xor_sync(0xffffffffu, p.x, o); p.y += __shfl_xor_sync(0xffffffffu, p.y, o);
+      p.z += __shfl_xor_sync(0xffffffffu, p.z, o); p.w += __shfl_xor_sync(0xffffffffu, p.w, o);
+    }
+    if (lane == 0) {
+      const float r = rsqrtf(p.x / (float)HID + 1e-8f);
+      scl[0] = r;
+      scl[1] = rsqrtf((p.y + 2.f * r * p.z + r * r * p.w) / (float)HID + 1e-5f);
+    }
+  }
+  __syncthreads();
+  const float r = scl[0], r1 = scl[1];
+  float s[4], h[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    s[i] = fmaf(bx[i], r, as[i]);
+    h[i] = s[i] * r1 * (1.f + (KIND == 1 ? g1v[i] : g2v[i]));
+  }
+  *reinterpret_cast<float4*>(sout + (size_t)t * HID + col) = make_float4(s[0], s[1], s[2], s[3]);
+  *reinterpret_cast<uint2*>(hout + (size_t)t * HID + col) = make_uint2(pack_bf2(h[0], h[1]), pack_bf2(h[2], h[3]));
+}
+
+// One 256-thread CTA per token: thread e owns logit e and pooled columns 16 e .. 16 e + 15.
+// SPLIT: pooled bf16 [T, 4096] and logits fp32 [T, 256] (the proj module's two GEMMs); else the combined fp32
+// pooler + router GEMM output P [T, 4608] (pooled = P[:, :4096], logits = P[:, 4096:4352] + P[:, 4352:4608]).
+template <bool SPLIT>
+__global__ void __launch_bounds__(NTH) route_kernel(const void* __restrict__ pooled_, const float* __restrict__ logits,
+    const float* __restrict__ bias, const __nv_bfloat16* __restrict__ gpre, int* __restrict__ ids,
+    float* __restrict__ wts, __nv_bfloat16* __restrict__ xm, const int* __restrict__ ls, int* __restrict__ lids,
+    int pdl) {
+  const int t = blockIdx.x, e = threadIdx.x, lane = e & 31, warp = e >> 5;
+  __shared__ float wred[NTH / 32];
+  __shared__ int ired[NTH / 32];
+  __shared__ float qred[NTH / 32];
+  __shared__ int sel_idx[8];
+  __shared__ float sel_val[8];
+  __shared__ float scl;
+  if (pdl) pdl_trigger();
+  const float bv = bias[e];
+  const int lsv = *ls;
+  float gp[16];
+  {
+    const uint4* gq = reinterpret_cast<const uint4*>(gpre + 16 * e);
+    const uint4 q0 = gq[0], q1 = gq[1];
+    const uint32_t w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { gp[2 * i] = 1.f + bf_lo(w[i]); gp[2 * i + 1] = 1.f + bf_hi(w[i]); }
+  }
+  if (pdl) pdl_wait();
+  float lg, pv[16];
+  if (SPLIT) {
+    lg = logits[(size_t)t * NEXP + e];
+    const uint4* pq = reinterpret_cast<const uint4*>(reinterpret_cast<const __nv_bfloat16*>(pooled_) + (size_t)t * DEX + 16 * e);
+    const uint4 q0 = pq[0], q1 = pq[1];
+    const uint32_t w[8] = {q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w};
+#pragma unroll
+    for (int i = 0; i < 8; ++i) { pv[2 * i] = bf_lo(w[i]); pv[2 * i + 1] = bf_hi(w[i]); }
+  } else {
+    const float* P = reinterpret_cast<const float*>(pooled_) + (size_t)t * PRW;
+    lg = P[DEX + e] + P[DEX + NEXP + e];
+    const float4* pq = reinterpret_cast<const float4*>(P + 16 * e);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const float4 q = pq[i];
+      pv[4 * i] = q.x; pv[4 * i + 1] = q.y; pv[4 * i + 2] = q.z; pv[4 * i + 3] = q.w;
+    }
+  }
+  float q = 0.f;
+#pragma unroll
+  for (int i = 0; i < 16; ++i) q = fmaf(pv[i], pv[i], q);
+  q = warp_sum(q);
+  if (lane == 0) qred[warp] = q;
+  const float sc = sigm(lg * 0.1767766952966369f);
+  float sel = sc + bv;
+  for (int k = 0; k < 8; ++k) {   // block argmax, ties to the lower index
+    float v = sel;
+    int idx = e;
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) {
+      const float v2 = __shfl_xor_sync(0xffffffffu, v, o);
+      const int i2 = __shfl_xor_sync(0xffffffffu, idx, o);
+      if (v2 > v || (v2 == v && i2 < idx)) { v = v2; idx = i2; }
+    }
+    if (lane == 0) { wred[warp] = v; ired[warp] = idx; }
+    __syncthreads();
+    if (e == 0) {
+      float bv_ = wred[0];
+      int bi = ired[0];
+#pragma unroll
+      for (int w = 1; w < NTH / 32; ++w)
+        if (wred[w] > bv_ || (wred[w] == bv_ && ired[w] < bi)) { bv_ = wred[w]; bi = ired[w]; }
+      sel_idx[k] = bi;
+    }
+    __syncthreads();
+    if (e == sel_idx[k]) { sel_val[k] = sc; sel = -INFINITY; }
+  }
+  __syncthreads();
+  if (e < 8) {
+    float tot = 0.f;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) tot += sel_val[k];
+    const int id = sel_idx[e];
+    ids[t * 8 + e] = id;
+    wts[t * 8 + e] = sel_val[e] / (tot + 1e-15f);
+    const int lid = (id - lsv + 256) % 256;
+    lids[t * 8 + e] = lid < 32 ? lid : -1;
+  }
+  if (e == 0) {
+    float qs = 0.f;
+#pragma unroll
+    for (int w = 0; w < NTH / 32; ++w) qs += qred[w];
+    scl = rsqrtf(qs / (float)DEX + 1e-5f);
+  }
+  __syncthreads();
+  const float r = scl;
+  uint32_t o[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) o[i] = pack_bf2(pv[2 * i] * r * gp[2 * i], pv[2 * i + 1] * r * gp[2 * i + 1]);
+  uint4* xq = reinterpret_cast<uint4*>(xm + (size_t)t * DEX + 16 * e);
+  xq[0] = make_uint4(o[0], o[1], o[2], o[3]);
+  xq[1] = make_uint4(o[4], o[5], o[6], o[7]);
+}
+
+static void set_pdl(cudaLaunchConfig_t& lc, cudaLaunchAttribute* at_, int pdl) {
+  lc.stream = at::cuda::getCurrentCUDAStream();
+  lc.dynamicSmemBytes = 0;
+  lc.numAttrs = 0;
+  lc.attrs = at_;
+  if (pdl) {   // programmatic dependent launch: may start while the previous kernel in the stream finishes
+    at_[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    at_[0].val.programmaticStreamSerializationAllowed = 1;
+    lc.numAttrs = 1;
+  }
+}
+
+template <int KIND, typename AT>
+static void launch_bnd(const torch::Tensor& a, int lda, int nu, const torch::Tensor& st, const torch::Tensor& gate,
+                       const torch::Tensor& g1, const torch::Tensor& g2, torch::Tensor& sout, torch::Tensor& hout,
+                       torch::Tensor& part, torch::Tensor& cnt, int T, int pdl) {
+  cudaLaunchConfig_t lc = {};
+  cudaLaunchAttribute at_[1];
+  lc.gridDim = dim3(NC, T);
+  lc.blockDim = dim3(NTH);
+  set_pdl(lc, at_, pdl);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, bnd_kernel<KIND, AT>, reinterpret_cast<const AT*>(a.data_ptr()), lda, nu,
+      st.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(g1.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr()),
+      sout.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(hout.data_ptr()),
+      reinterpret_cast<float4*>(part.data_ptr()), reinterpret_cast<unsigned*>(cnt.data_ptr()), pdl));
+}
+
+template <bool SPLIT>
+static void launch_route(const void* pooled, const float* logits, const torch::Tensor& bias, const torch::Tensor& gpre,
+                         torch::Tensor& ids, torch::Tensor& wts, torch::Tensor& xm, const torch::Tensor& ls,
+                         torch::Tensor& lids, int T, int pdl) {
+  cudaLaunchConfig_t lc = {};
+  cudaLaunchAttribute at_[1];
+  lc.gridDim = dim3(T);
+  lc.blockDim = dim3(NTH);
+  set_pdl(lc, at_, pdl);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, route_kernel<SPLIT>, pooled, logits, bias.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(gpre.data_ptr()), ids.data_ptr<int>(), wts.data_ptr<float>(),
+      reinterpret_cast<__nv_bfloat16*>(xm.data_ptr()), ls.data_ptr<int>(), lids.data_ptr<int>(), pdl));
+}
+
+}  // namespace okc_glue
+
+void glue_bnd(int64_t kind, torch::Tensor a, int64_t nu, torch::Tensor st, torch::Tensor gate, torch::Tensor g1,
+              torch::Tensor g2, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
+              int64_t T, int64_t pdl) {
+  using namespace okc_glue;
+  TORCH_CHECK(kind == 1 || kind == 2, "glue_bnd: kind");
+  TORCH_CHECK(a.is_contiguous() && st.is_contiguous() && sout.is_contiguous() && hout.is_contiguous(), "glue_bnd: contiguous");
+  TORCH_CHECK(a.dim() == 2 && a.size(0) == T && st.size(0) == T && sout.size(0) == T && hout.size(0) == T, "glue_bnd: rows");
+  TORCH_CHECK(st.scalar_type() == at::kFloat && sout.scalar_type() == at::kFloat && hout.scalar_type() == at::kBFloat16, "glue_bnd: dtypes");
+  TORCH_CHECK(gate.scalar_type() == at::kBFloat16 && g1.scalar_type() == at::kBFloat16 && g2.scalar_type() == at::kBFloat16, "glue_bnd: weights bf16");
+  TORCH_CHECK(st.size(1) == HID && sout.size(1) == HID && hout.size(1) == HID, "glue_bnd: width");
+  TORCH_CHECK(nu > 0 && nu <= HID && nu % (NTH * EPT) == 0 && a.size(1) >= nu, "glue_bnd: nu");
+  TORCH_CHECK(part.numel() >= T * NC * 4 && cnt.numel() >= T && cnt.scalar_type() == at::kInt, "glue_bnd: scratch");
+  const int lda = (int)a.size(1);
+  const bool bf = a.scalar_type() == at::kBFloat16;
+  TORCH_CHECK(bf || a.scalar_type() == at::kFloat, "glue_bnd: a dtype");
+  if (kind == 1) {
+    if (bf) launch_bnd<1, __nv_bfloat16>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl);
+    else launch_bnd<1, float>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl);
+  } else {
+    if (bf) launch_bnd<2, __nv_bfloat16>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl);
+    else launch_bnd<2, float>(a, lda, (int)nu, st, gate, g1, g2, sout, hout, part, cnt, (int)T, (int)pdl);
+  }
+}
+
+void glue_route(torch::Tensor pooled, std::optional<torch::Tensor> logits, torch::Tensor bias, torch::Tensor gpre,
+                torch::Tensor ids, torch::Tensor wts, torch::Tensor xm, torch::Tensor ls, torch::Tensor lids,
+                int64_t T, int64_t pdl) {
+  using namespace okc_glue;
+  TORCH_CHECK(pooled.is_contiguous() && xm.is_contiguous() && ids.is_contiguous() && wts.is_contiguous() && lids.is_contiguous(), "glue_route: contiguous");
+  TORCH_CHECK(pooled.dim() == 2 && pooled.size(0) == T && xm.size(0) == T && xm.size(1) == DEX, "glue_route: shapes");
+  TORCH_CHECK(bias.scalar_type() == at::kFloat && bias.numel() == NEXP && gpre.scalar_type() == at::kBFloat16 && gpre.numel() == DEX, "glue_route: weights");
+  TORCH_CHECK(ids.scalar_type() == at::kInt && lids.scalar_type() == at::kInt && wts.scalar_type() == at::kFloat && ls.scalar_type() == at::kInt, "glue_route: outputs");
+  TORCH_CHECK(xm.scalar_type() == at::kBFloat16, "glue_route: xm bf16");
+  if (logits.has_value()) {
+    const torch::Tensor lg = logits.value();
+    TORCH_CHECK(lg.is_contiguous() && lg.scalar_type() == at::kFloat && lg.size(0) == T && lg.size(1) == NEXP, "glue_route: logits");
+    TORCH_CHECK(pooled.scalar_type() == at::kBFloat16 && pooled.size(1) == DEX, "glue_route: pooled bf16 [T, 4096]");
+    launch_route<true>(pooled.data_ptr(), lg.data_ptr<float>(), bias, gpre, ids, wts, xm, ls, lids, (int)T, (int)pdl);
+  } else {
+    TORCH_CHECK(pooled.scalar_type() == at::kFloat && pooled.size(1) == PRW, "glue_route: P fp32 [T, 4608]");
+    launch_route<false>(pooled.data_ptr(), nullptr, bias, gpre, ids, wts, xm, ls, lids, (int)T, (int)pdl);
+  }
+}
+"""
+
+
+def _glue_build():
+    from torch.utils.cpp_extension import load_inline
+    major, minor = torch.cuda.get_device_capability()
+    arch = f"{major}{minor}" + ("a" if major >= 9 else "")
+    return load_inline(
+        name=f"okc_glue_v1_{arch}",
+        cpp_sources=GLUE_CPP_SRC,
+        cuda_sources=GLUE_CUDA_SRC,
+        functions=["glue_bnd", "glue_route"],
+        extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}"],
+        verbose=False,
+    )
+
+
+def _glue7():
+    """Build the glue extension (in prepare's build thread pool); a failure only disables it."""
+    global glue__MOD
+    if GLUE_CUDA and glue__MOD is None:
+        try:
+            glue__MOD = _glue_build()
+        except Exception as ex:  # noqa: BLE001
+            print("glue kernels: build failed:", repr(ex)[:300], flush=True)
+
+
+def _glue_ok(state, T):
+    return (GLUE_CUDA and glue__MOD is not None and state.get("glue_ok") and T <= GLUE_MAX_T
+            and state.get("glue_on", {}).get(T, True))
+
+
+def _glue_bnd(kind, a, nu, st_in, gate, g1, g2, sout, hout, state, T):
+    glue__MOD.glue_bnd(kind, a, nu, st_in, gate, g1, g2, sout, hout, state["glue_part"][kind - 1],
+                       state["glue_cnt"][kind - 1], T, int(_pdl(T)))
+
+
+def _glue_route(pooled, logits, state, ls, ids, wts, xm, lids, T):
+    glue__MOD.glue_route(pooled, logits, state["bias"], state["g_preexp"], ids, wts, xm, ls, lids, T, int(_pdl(T)))
+
+
+def _glue_selftest(st):
+    """The CUDA glue kernels against the Triton ones at T = 1, 8, 32, 128 on synthetic inputs (bf16 and fp32
+    producers, the 1024-wide unpooler slice, the split and the combined routing inputs); any mismatch or exception
+    disables them (st["glue_ok"]); printed."""
+    st["glue_ok"] = False
+    if not GLUE_CUDA or glue__MOD is None:
+        print("glue kernels: not available", flush=True)
+        return
+    dev = st["qkv"].device
+    f32 = dict(device=dev, dtype=torch.float32)
+    st["glue_part"] = torch.zeros((2, GLUE_MAX_T * GLUE_NC, 4), **f32)
+    st["glue_cnt"] = torch.zeros((2, GLUE_MAX_T), device=dev, dtype=torch.int32)
+    g = torch.Generator(device=dev).manual_seed(781)
+    ls = torch.zeros(1, device=dev, dtype=torch.int32)
+    rel = lambda x, y: float(((x.float() - y.float()).norm() / (y.float().norm() + 1e-30)).item())  # noqa: E731
+    report, worst = [], 0.0
+    ids_ok = True
+    for T in (1, 8, 32, 128):
+        for a_f32 in ((False,) if T < 128 else (False, True)):
+            a = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+            if a_f32:
+                a = a.float()
+            stream = torch.randn(T, HIDDEN, generator=g, device=dev)
+            s1r, hr = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            s1, h = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            _boundary1[(T,)](a.view(1, T, HIDDEN), 1, T, stream, st["gate1"], st["gate1"], st["g_preffn"], s1r, hr, num_warps=16)
+            _glue_bnd(1, a, HIDDEN, stream, st["gate1"], st["g_preffn"], st["g_preffn"], s1, h, st, T)
+            e1, e2 = rel(s1, s1r), rel(h, hr)
+            nu = 1024 if T <= 8 else HIDDEN
+            u = (torch.randn(T, nu, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+            if a_f32:
+                u = u.float()
+            s1x = torch.randn(T, HIDDEN, generator=g, device=dev)
+            s2r, outr = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            s2, out = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
+            _boundary2[(T,)](u.view(1, T, nu), 1, T, nu, s1x, st["gate2"], st["gate2"], st["g_postffn"], st["g_next"],
+                             s2r, outr, num_warps=16)
+            _glue_bnd(2, u, nu, s1x, st["gate2"], st["g_postffn"], st["g_next"], s2, out, st, T)
+            e3, e4 = rel(s2, s2r), rel(out, outr)
+            worst = max(worst, e1, e3, e2 / 8, e4 / 8)   # bf16 outputs: a few 1-ulp flips are 1e-3..1e-2 of rel L2
+            report.append(f"T{T}{'f' if a_f32 else ''} b1 {e1:.1e}/{e2:.1e} b2 {e3:.1e}/{e4:.1e}")
+        pooled = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
+        logits = torch.randn(T, N_EXPERTS, generator=g, device=dev) * 3.0
+        outs = [(torch.empty((T, 8), device=dev, dtype=torch.int32), torch.empty((T, 8), **f32),
+                 torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16), torch.empty((T, 8), device=dev, dtype=torch.int32))
+                for _ in range(4)]
+        _route_split[(T,)](pooled, logits, st["bias"], st["g_preexp"], outs[0][0], outs[0][1], outs[0][2], ls, outs[0][3],
+                           PERMUTED=False, num_warps=8)
+        _glue_route(pooled, logits, st, ls, outs[1][0], outs[1][1], outs[1][2], outs[1][3], T)
+        P = torch.randn(T, 4608, generator=g, device=dev)
+        P[:, :D_EXPERT] *= 0.1
+        _route[(T,)](P.view(1, T, 4608), 1, T, st["bias"], st["g_preexp"], outs[2][0], outs[2][1], outs[2][2], ls, outs[2][3],
+                     PERMUTED=False, num_warps=8)
+        _glue_route(P, None, st, ls, outs[3][0], outs[3][1], outs[3][2], outs[3][3], T)
+        for ref, mine in ((outs[0], outs[1]), (outs[2], outs[3])):
+            ids_ok &= bool(torch.equal(ref[0], mine[0]) and torch.equal(ref[3], mine[3]))
+            e5, e6 = rel(mine[1], ref[1]), rel(mine[2], ref[2])
+            worst = max(worst, e5, e6 / 8)
+            report.append(f"T{T} route w {e5:.1e} x {e6:.1e}")
+    torch.cuda.synchronize()
+    st["glue_ok"] = ids_ok and worst < 1e-3
+    print(f"glue kernels {'ok' if st['glue_ok'] else 'MISMATCH'}: ids {'equal' if ids_ok else 'DIFFER'}; " + " ".join(report), flush=True)
+
+
+# ----------------------------------------------------------------------------------------------
 
 def _marlin_bank(weights):
     """The local experts in Marlin's layout (SGLang's own loader step), as baseline.py builds them."""
@@ -1874,7 +2327,7 @@ def prepare(weights):
             errs.append(ex)
 
     sfx = _moe_sfx(weights)
-    builds = [_att7] + [(lambda d=d: moe__ext(d)) for d in _moe_builds(sfx)]
+    builds = [_att7, _glue7] + [(lambda d=d: moe__ext(d)) for d in _moe_builds(sfx)]
     ths = [threading.Thread(target=_build, args=(f,)) for f in builds]  # ~85 s of nvcc, in parallel
     for th in ths:
         th.start()
@@ -1887,7 +2340,7 @@ def prepare(weights):
     _ph("moe prepare")
     _bfp_prepare(weights, st)
     _ph("proj prepare")
-    for selftest in (_route_selftest, _boundary_selftest, _bnd1_selftest, _norm_selftest):   # the fused paths, each enabled only when it matches
+    for selftest in (_route_selftest, _boundary_selftest, _bnd1_selftest, _norm_selftest, _glue_selftest):   # the fused paths, each enabled only when it matches
         try:
             selftest(st)
         except Exception as ex:  # noqa: BLE001
@@ -2170,6 +2623,10 @@ def _after_attention(data, state, o_in, gate, T):
                 and data["stream"].dtype == torch.float32 and data["stream"].is_contiguous()):
             # deferred: the fused pooler + router launch computes h (its own x) and s1 in its prologue (no launch)
             bnd1 = (P.view(T, HIDDEN), data["stream"], state["ab1"][0], state["ab1"][1], state["g_preffn"], s1)
+        elif (S == 1 and P.dtype in (torch.bfloat16, torch.float32) and _glue_ok(state, T)
+              and data["stream"].dtype == torch.float32 and data["stream"].is_contiguous()):
+            _glue_bnd(1, P.view(T, HIDDEN), HIDDEN, data["stream"], state["gate1"], state["g_preffn"], state["g_preffn"],
+                      s1, h, state, T)
         else:
             _boundary1[(T,)](P, S, T, data["stream"], state["gate1"], state["gate1"], state["g_preffn"], s1, h,
                              num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
@@ -2231,8 +2688,12 @@ def _after_attention(data, state, o_in, gate, T):
         pooled, logits = P
     elif S == -1:  # pooler and router came from the bf16_proj kernels as two separate tensors
         pooled, logits = P
-        _route_split[(T,)](pooled, logits, state["bias"], state["g_preexp"], ids, wts, xm,
-                           data["local_start"], lids, PERMUTED=not (use_marlin or use_ma), num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
+        if ((use_marlin or use_ma) and _glue_ok(state, T) and pooled.dtype == torch.bfloat16
+                and logits.dtype == torch.float32 and data["local_start"].dtype == torch.int32):
+            _glue_route(pooled, logits, state, data["local_start"], ids, wts, xm, lids, T)
+        else:
+            _route_split[(T,)](pooled, logits, state["bias"], state["g_preexp"], ids, wts, xm,
+                               data["local_start"], lids, PERMUTED=not (use_marlin or use_ma), num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
     elif v2:
         pool = torch.empty((T, D_EXPERT), **f32)
         psum = torch.zeros((T,), **f32)
@@ -2241,6 +2702,9 @@ def _after_attention(data, state, o_in, gate, T):
                                        BC=BCR, num_warps=8)
         _route_b[(T, D_EXPERT // BCR)](pool, psum, state["g_preexp"], xm, BC=BCR,
                                        PERMUTED=not (use_marlin or use_ma), num_warps=8)
+    elif (S == 1 and (use_marlin or use_ma) and _glue_ok(state, T) and P.dtype == torch.float32
+          and P.shape[-1] == 4608 and data["local_start"].dtype == torch.int32):
+        _glue_route(P.view(T, 4608), None, state, data["local_start"], ids, wts, xm, lids, T)
     else:
         _route[(T,)](P, S, T, state["bias"], state["g_preexp"], ids, wts, xm, data["local_start"], lids,
                      PERMUTED=not (use_marlin or use_ma), num_warps=8, USE_PDL=_pdl(T), launch_pdl=_pdl(T))
@@ -2277,6 +2741,8 @@ def _after_attention(data, state, o_in, gate, T):
                                        BC=BC2, num_warps=8)
         _bnd2_apply[(T, HIDDEN // BC2)](fbuf, sums2, s1, state["gate2"], state["gate2"], state["g_next"], s2, out,
                                         N=HIDDEN, BC=BC2, num_warps=8)
+    elif S == 1 and P.dtype in (torch.bfloat16, torch.float32) and P.shape[-1] == nu and _glue_ok(state, T):
+        _glue_bnd(2, P.view(T, nu), nu, s1, state["gate2"], state["g_postffn"], state["g_next"], s2, out, state, T)
     else:
         _boundary2[(T,)](P, S, T, nu, s1, state["gate2"], state["gate2"], state["g_postffn"], state["g_next"],
                          s2, out, num_warps=16, USE_PDL=_pdl(T), launch_pdl=_pdl(T))

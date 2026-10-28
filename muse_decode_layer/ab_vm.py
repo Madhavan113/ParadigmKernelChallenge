@@ -99,6 +99,10 @@ def apply(S, st, spec, saved):
             k = (layer, int(tokr))
             saved.append(("sk2", k, S.bfp_SK2_PICK.get(k)))
             S.bfp_SK2_PICK[k] = val
+        elif kind == "glue":   # the CUDA glue kernels (boundaries + routing) vs the Triton ones at this T
+            T = int(sel)
+            saved.append(("glue_on", T, st.setdefault("glue_on", {}).get(T)))
+            st["glue_on"][T] = val in ("1", "True")
         else:
             raise ValueError(item)
 
