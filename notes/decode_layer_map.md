@@ -343,3 +343,13 @@ ab3 (attention build flags, one prepare per flag set and seed, unpaired: floor ~
 the decode shapes (d1s +1.6/+1.0, d16s +1.3/+2.3, d32s +2.3/+1.5); QDIRECT=0 / PK2=0 / W0ENABLE=1 mixed within the
 floor (all three show v1f -1.2..-1.4 = the default run's draw; v16f/v32f +1.3..+4.3 under PK2=0 and W0ENABLE=1).
 Defaults stay.
+
+ab7 (the tokr-16 pair o8h_r88 + unpooler32_r144 vs the picks, paired, 30 replays, d16s/d16f): -0.8/-0.8 (s0) and
+-0.4/-0.8 (s1) with the repeated base itself at -0.1/-0.8 and 0.0/-0.4: ~0.5 us net, under the bar. Not locked.
+
+State at the end of the round: feb6313 (judged dcfee44f 2.1050x, tie with ea7cacb1); the VM says the locked picks
+are 1-5 us better per shape than the old tuner's losing draws and never worse; prepare 122 s on the judge. Lessons:
+(1) time picks with paired round-robin graph replays (the sequential capture-then-time harness handed the first
+variant 2.6-3.7 us at T=1); (2) a single judged run resolves ~2-4% per shape (MoE draw + the reference column's own
+drift), so sub-1% effects need the VM, not checks; (3) the 300 s prepare was dominated by Triton JIT of candidates
+the picks never use (unscored T rows, pinned layers, Marlin) - 80 s on the VM after the trim.
