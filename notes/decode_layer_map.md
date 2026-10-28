@@ -321,4 +321,20 @@ Prepare budget (300 s hard): the locked build took 307 s on the VM (seed 0; 241 
 Trim (feb6313): TUNED_T = the scored T only (2/4/64 take the next row's picks), Marlin never a candidate when the
 agent's kernel is present (12 timings per T, lost 30-50% everywhere), pinned / locked dense picks skip their isolated
 timing; prepare prints its phase wall times. check_vm.py = the judge's check (reference.collect + check_implementation)
-on eager and graph-replayed steps (tools/gpu_run.py's check passes the raw tuple and raises).
+on eager and graph-replayed steps (tools/gpu_run.py's check passes the raw tuple and raises). After the trim: VM 80 s
+(builds 57, marlin bank 14, tuner 8), judge 122.5 s (builds 75.8, proj extension 31.5, marlin bank 7.4, tuner 7.5);
+48/48 checks ok at seeds 2/3.
+
+Judged (job dcfee44fef1d406c, feb6313): 2.1050x (CI 2.073-2.137), 13/13 = a tie with ea7cacb1 (2.1064). Per shape
+vs ea7cacb1: d1s 77.22/77.24, d1f 82.69/83.16, d16s 136.52/131.27, d16f 208.96/213.84, d32s 157.88/154.25, d32f
+293.75/306.89, v1s 115.18/107.36, v1f 118.17/120.15, v16s 258.78/250.38, v16f 346.23/345.93, v32s 331.71/322.72,
+v32f 496.11/490.31: run-level scatter (v1s: every row within 0.6 us except the MoE row 72.1 vs 56.5 = the routing draw;
+d16s: profile totals 148.5 vs 147.4 while the timing column differs by 5.3; the sglang column moved 2-4% too). The
+picks show in the rows (T=16: fused pooler+router 19.0 us vs separate 15.5 + 4.8). A ~1% effect is under the judge's
+per-run resolution; the locks' value is removing the losing draws, not a new mechanism.
+
+ab2 (sk2 configs, OKC_SK2_ALL=1, paired, both seeds): no lockable win. tokr 16 leads under 1 us: o8h_r88 beats
+o16t_r68 by 0.2-1.3, unpooler32_r144 beats unpooler16h_r100 by 0.4-1.3 (ab7 tests the pair); unpooler16t_r72 +1.1
+at 16 (revert confirmed), +4.4 at 32; pooler8h_r72 outside tokr 8 +3-4; qkv8t_r144 at 32 +2.7; qkv configs otherwise
+ties within 0.7. Separate pooler at T=8 with the 'pooler' config trails the fused launch by only 0.5-0.7 (pooler8h_r72:
++2.8), moot while the fused form is locked there.
