@@ -1,0 +1,25 @@
+[route-logits] bs=  1: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/1, time plain   30.6 us vs in-kernel routing   32.9 us
+[route-logits] bs=  4: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/4, time plain   46.9 us vs in-kernel routing   49.2 us
+[route-logits] bs=  8: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 9.2e-06, random-logit tokens differing 0/8, time plain   80.2 us vs in-kernel routing   82.4 us
+[route-logits] bs= 16: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 5.1e-08, random-logit tokens differing 0/16, time plain  117.4 us vs in-kernel routing  122.4 us
+[route-logits] bs= 32: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/32, time plain  172.4 us vs in-kernel routing  181.2 us
+[route-logits] bs= 33: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/33, time plain  145.6 us vs in-kernel routing  156.1 us
+[route-logits] bs=128: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/128, time plain  198.2 us vs in-kernel routing  225.8 us
+[route-logits] bs=256: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/256, time plain  231.0 us vs in-kernel routing  285.4 us
+route tail ok: T1 ids0 w7.5e-09 x0.0e+00 T8 ids0 w3.0e-08 x0.0e+00 T16 ids0 w3.0e-08 x0.0e+00 T32 ids0 w4.5e-08 x8.1e-04
+boundary tails: not available
+boundary-1 prologue T1: fused launch 22.6 us -> with the prologue 34.8 us
+boundary-1 prologue T1: too costly (+12.2 us), off
+routing in the MoE kernel ok: T1 ids0 x0.0e+00 o0.0e+00 T8 ids0 x0.0e+00 o0.0e+00 T16 ids0 x0.0e+00 o4.2e-05 T32 ids0 x0.0e+00 o2.0e-10
+routing in the MoE kernel (no barrier): not available
+calib delta 0.276 routes/token 1.60 experts@32 16.8
+T1/3r3e qkvB:14 oB:10 pr[T30 M30 B27 F26] prF:26 unT:8 mcfg8a:45 mar2:99 mar1:90 age2:81 age1:71 pdl[2:71 3:72 4:72 6:72]->2 rmode[split:71 sk2f:77 moe:76]->split
+T2/4r3e qkvB:14 oB:10 pr[T32 M30 B26 F26] prF:26 unT:8 mcfg8a:52 mar2:100 mar1:90 age2:81 age1:72 pdl[2:73 3:72 4:74 6:74]->3 rmode[split:73 sk2f:77 moe:76]->split
+T4/8r5e qkvB:14 oB:9 pr[T32 M30 B27 F26] prF:26 unT:8 mcfg8a:75 mar2:123 mar1:113 age2:94 age1:86 pdl[2:87 3:87 4:88 6:88]->2 rmode[split:87 sk2f:90 moe:90]->split
+T8/14r11e qkvB:14 oB:10 pr[T32 M30 B28 F26] prF:26 unT:8 mcfg8a:108 mar2:185 mar1:176 age2:134 age1:126 pdl[2:126 3:126 4:126 6:127]->2 rmode[split:126 sk2f:130 moe:130]->split
+T16/25r14e qkvB:15 oB:10 pr[T33 M31 B26 F30] prB:26 unB:18 mcfg8a:101 mar2:229 mar1:218 age2:168 age1:157 pdl[2:157 3:158 4:160 6:160]->2 rmode[split:157 sk2f:157 moe:157]->sk2f
+T32/54r19e qkvB:15 oM:10 pr[T36 M31 B27 F31] prB:27 unB:19 mcfg8a:223 mar2:305 mar1:295 age2:209 age1:199 pdl[2:199 3:199 4:200 6:200]->3 rmode[split:200 sk2f:200 moe:200]->split
+T64/99r20e qkvM:18 ot:10 pr[T33 M33 B1000000000000000019884624838656 F1000000000000000019884624838656] prt:33 unm:23 mcfg8a:330 mar2:367 mar1:353 age2:240 age1:224
+T128/209r27e qkvm:20 qkv[T20.9 M20.7 m20.4 t20.4 q20.7] ot:11 o[T11.2 M12.3 m10.9 t10.7 q10.8] pr[T32 M33 B1000000000000000019884624838656 F1000000000000000019884624838656] prT:32 pr[T32.1 M32.5 t33.0 q39.5] unt:23 un[T23.7 M23.9 m24.2 t23.2 q23.6] mcfg8:351 mar2:531 mar1:503 age2:309 age1:282
+T256/437r29e qkvm:23 qkv[T23.6 M23.1 m23.0 t24.1 q23.1] oq:13 o[T14.8 M13.5 m12.6 t12.6 q12.6] pr[T39 M39 B1000000000000000019884624838656 F1000000000000000019884624838656] prM:39 pr[T38.6 M38.6 t43.0 q51.4] unt:27 un[T28.6 M28.5 m28.6 t27.5 q27.6] mcfg16:394 mar2:663 mar1:616 age2:391 age1:343
+tune: pbmax 0 moe {1: 'agent', 2: 'agent', 4: 'agent', 8: 'agent', 16: 'agent', 32: 'agent', 64: 'agent', 128: 'agent', 256: 'agent'} gluev2 {1: False, 2: False, 4: False, 8: False, 16: False, 32: False, 64: False, 128: False, 256: False}

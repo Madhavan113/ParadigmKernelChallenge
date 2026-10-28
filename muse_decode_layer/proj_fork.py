@@ -1131,6 +1131,21 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     }
   }
   if (tid >= 32 && tid < 64) reinterpret_cast<uint32_t*>(ptab_s + pmax)[tid - 32] = 0u;
+  if constexpr (FUSE) {
+    if (b_hout != nullptr) {
+      // boundary-1 prologue: the rows it reads after the wait that no kernel of this call writes (the input stream,
+      // alpha, beta, the gain) are cold in L2 on a judged replay; prefetch them NOW, before griddepcontrol.wait, so
+      // the prologue's load rounds hit L2 (check 1a4846de: +10.6 us with DRAM rounds). 112 KB: <= 2 lines per thread
+      // per array. (a, the o-projection output, is the preceding kernel's: left to its own L2 residency.)
+      const char* rows[4] = {reinterpret_cast<const char*>(b_sin), reinterpret_cast<const char*>(b_alpha),
+                             reinterpret_cast<const char*>(b_beta), reinterpret_cast<const char*>(b_gn)};
+      const int bytes[4] = {M * 8192 * 4, 8192 * 4, 8192 * 4, 8192 * 2};
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+        for (int off = tid * 128; off < bytes[r]; off += (int)blockDim.x * 128)
+          asm volatile("prefetch.global.L2 [%0];" :: "l"(rows[r] + off));
+    }
+  }
   // local barriers are all this CTA needs to start streaming; the cluster barrier (rank 0's qbar initialized before
   // ranks > 0 send into it) is only arrived at here and waited on right before the remote stores
   __syncthreads();

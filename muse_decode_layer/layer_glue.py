@@ -249,7 +249,7 @@ BND1_MAX_T = 1     # one row per CTA prologue is hidden behind the ring fill; 8 
 def _bnd1_fuse_ok(state, T):
     return (FUSE_BND1 and T <= BND1_MAX_T and state.get("fuse_bnd1_ok") and state.get("bfp") is not None
             and "bnd1" in bfp_fused_pooler_router.__code__.co_varnames and "ab1" in state
-            and state["g_preffn"].dtype == torch.bfloat16)
+            and state["g_preffn"].dtype == torch.bfloat16 and state.get("bnd1_on", {}).get(T, True))
 
 
 def _bnd1_selftest(st):
@@ -301,14 +301,14 @@ def _bnd1_selftest(st):
                              flush_, reps=9)
         del flush_
         print(f"boundary-1 prologue T{T}: fused launch {t_plain:.1f} us -> with the prologue {t_bnd1:.1f} us", flush=True)
-        if not (t_bnd1 - t_plain < BND1_MAX_COST_US):
+        if not (t_bnd1 - t_plain < BND1_MAX_COST_US):   # (the chain timing in _tune makes the final on/off choice)
             print(f"boundary-1 prologue T{T}: too costly (+{t_bnd1 - t_plain:.1f} us), off", flush=True)
             return
     print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
     st["fuse_bnd1_ok"] = True
 
 
-BND1_MAX_COST_US = 3.0
+BND1_MAX_COST_US = 6.0   # isolated gate (a guard against a broken prologue); the chain timing per T decides below it
 
 
 def _norm_selftest(st):
@@ -1711,6 +1711,19 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
+        if st.get("fuse_bnd1_ok") and T <= BND1_MAX_T:   # the boundary-1 prologue vs the _boundary1 launch, on the chain
+            btimes = {}
+            for flag in (False, True):
+                st.setdefault("bnd1_on", {})[T] = flag
+                try:
+                    btimes[flag] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                except Exception as ex:  # noqa: BLE001
+                    btimes[flag] = 1e30
+                    if log:
+                        msg.append(f"bnd1X:{repr(ex)[:80]}")
+            st["bnd1_on"][T] = btimes[True] < btimes[False]
+            if log:
+                msg.append(f"bnd1[{btimes[False]:.0f}/{btimes[True]:.0f}]->{int(st['bnd1_on'][T])}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)

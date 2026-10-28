@@ -12212,6 +12212,21 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     }
   }
   if (tid >= 32 && tid < 64) reinterpret_cast<uint32_t*>(ptab_s + pmax)[tid - 32] = 0u;
+  if constexpr (FUSE) {
+    if (b_hout != nullptr) {
+      // boundary-1 prologue: the rows it reads after the wait that no kernel of this call writes (the input stream,
+      // alpha, beta, the gain) are cold in L2 on a judged replay; prefetch them NOW, before griddepcontrol.wait, so
+      // the prologue's load rounds hit L2 (check 1a4846de: +10.6 us with DRAM rounds). 112 KB: <= 2 lines per thread
+      // per array. (a, the o-projection output, is the preceding kernel's: left to its own L2 residency.)
+      const char* rows[4] = {reinterpret_cast<const char*>(b_sin), reinterpret_cast<const char*>(b_alpha),
+                             reinterpret_cast<const char*>(b_beta), reinterpret_cast<const char*>(b_gn)};
+      const int bytes[4] = {M * 8192 * 4, 8192 * 4, 8192 * 4, 8192 * 2};
+#pragma unroll
+      for (int r = 0; r < 4; ++r)
+        for (int off = tid * 128; off < bytes[r]; off += (int)blockDim.x * 128)
+          asm volatile("prefetch.global.L2 [%0];" :: "l"(rows[r] + off));
+    }
+  }
   // local barriers are all this CTA needs to start streaming; the cluster barrier (rank 0's qbar initialized before
   // ranks > 0 send into it) is only arrived at here and waited on right before the remote stores
   __syncthreads();
@@ -14930,7 +14945,7 @@ BND1_MAX_T = 1     # one row per CTA prologue is hidden behind the ring fill; 8 
 def _bnd1_fuse_ok(state, T):
     return (FUSE_BND1 and T <= BND1_MAX_T and state.get("fuse_bnd1_ok") and state.get("bfp") is not None
             and "bnd1" in bfp_fused_pooler_router.__code__.co_varnames and "ab1" in state
-            and state["g_preffn"].dtype == torch.bfloat16)
+            and state["g_preffn"].dtype == torch.bfloat16 and state.get("bnd1_on", {}).get(T, True))
 
 
 def _bnd1_selftest(st):
@@ -14982,14 +14997,14 @@ def _bnd1_selftest(st):
                              flush_, reps=9)
         del flush_
         print(f"boundary-1 prologue T{T}: fused launch {t_plain:.1f} us -> with the prologue {t_bnd1:.1f} us", flush=True)
-        if not (t_bnd1 - t_plain < BND1_MAX_COST_US):
+        if not (t_bnd1 - t_plain < BND1_MAX_COST_US):   # (the chain timing in _tune makes the final on/off choice)
             print(f"boundary-1 prologue T{T}: too costly (+{t_bnd1 - t_plain:.1f} us), off", flush=True)
             return
     print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
     st["fuse_bnd1_ok"] = True
 
 
-BND1_MAX_COST_US = 3.0
+BND1_MAX_COST_US = 6.0   # isolated gate (a guard against a broken prologue); the chain timing per T decides below it
 
 
 def _norm_selftest(st):
@@ -16392,6 +16407,19 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
+        if st.get("fuse_bnd1_ok") and T <= BND1_MAX_T:   # the boundary-1 prologue vs the _boundary1 launch, on the chain
+            btimes = {}
+            for flag in (False, True):
+                st.setdefault("bnd1_on", {})[T] = flag
+                try:
+                    btimes[flag] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                except Exception as ex:  # noqa: BLE001
+                    btimes[flag] = 1e30
+                    if log:
+                        msg.append(f"bnd1X:{repr(ex)[:80]}")
+            st["bnd1_on"][T] = btimes[True] < btimes[False]
+            if log:
+                msg.append(f"bnd1[{btimes[False]:.0f}/{btimes[True]:.0f}]->{int(st['bnd1_on'][T])}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
