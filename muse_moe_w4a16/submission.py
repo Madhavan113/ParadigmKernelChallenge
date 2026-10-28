@@ -4761,7 +4761,7 @@ PDL = False
 # kernel_fn_logits(data, state) is the entry. ROUTE_LOGITS_SELFTEST runs the in-kernel selection against the host
 # selection on synthetic logits in prepare() (untimed) and prints the result.
 ROUTE_LOGITS_BUILDS = False
-ROUTE_LOGITS_SELFTEST = True
+ROUTE_LOGITS_SELFTEST = False
 ROUTER_MULTIPLIER = 0.1767766952966369
 # Scale decode with PRMT + IMAD instead of the smem LUT; exact only when every block-scale byte of the local experts
 # is a positive normal e4m3 value (0x08..0x7E). prepare() checks the actual weights and keeps the LUT build otherwise.
