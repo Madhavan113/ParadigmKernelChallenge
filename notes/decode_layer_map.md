@@ -254,3 +254,20 @@ fused pooler+router 19, qkv cgemv 9.2 (floor 7.9), attention 4.7, three glue ker
 | 1d2eac51 | + MoE aa9a8a4 (TINY/TINY2 builds with their L2 hints on; the phase-B prefetch OKC_PBPF measured a loss in the MoE agent's DIAG, dormant) | **2.1055 (2.074-2.137)** | highest judged layer: MoE rows d1 full 28.4 -> 22.0, d16 75.8/60.0 -> 61.8/52.4, v1 sliding 65.4 -> 56.7; at T=1 the separate cgemv pooler 13.7 + rgemv router 3.7 beat the fused launch 19.1 on the chain (prform bfp 70 / bfpf 73); per shape 77.8/83.0, 131.5/209.7, 154.8/295.8, 109.1/119.1, 259.1/335.7, 326.9/493.2. HEAD a9da5cd = the file to score |
 | b73aff83 | the standalone's retimed sk2 configs as the tokr 8/16 picks; the pooler+router form chain-timed per T to 32 | **2.1112 (2.080-2.143)** | highest judged; rows: unpooler16t_r72 18.2 us vs the old unpooler16h_r100 15.5 at d16 (reverted: the standalone's -0.6 does not transfer to this kernel), qkv16t 10.2 vs 10.3, o16t 6.2 vs 6.2, qkv8t 10.0 vs 10.1 (neutral); prform: fused at T <= 16 (T1 69 vs 71: a +-3 us coin flip between runs), separate at T=32 (214 vs 223); per shape 76.6/83.0, 136.8/208.5, 152.6/294.4, 114.5/116.5, 265.1/347.7, 329.8/493.7. Scored run of the 1d2eac51 file: 9f733a01 2.0754 (the MoE row is a +-10-20 us routing draw per run on half the shapes) |
 | ea7cacb1 | unpooler-16 pick reverted + SK2_BALANCE (qkv) + MoE 548cbc2 (hints revert) | 2.1064 (2.075-2.138) | rows as predicted: unpooler d16 18.2 -> 15.3, qkv T8 10.0 -> 9.8 / T16 10.2 -> 10.0; the rest is the MoE draw (d32 sliding 72 -> 94, v16 175 -> 159). The last three runs (2.1055 / 2.1112 / 2.1064) sit above the earlier 2.076-2.098 band: the per-row wins (m = 1 GEMVs, configs, BALANCE) moved it ~1%. HEAD d73566d = the file to score (b73aff83's content + the certain unpooler fix + BALANCE) |
+
+## 10. Ticket tails v2 (overnight, 2 checks): exact, chain-gated off; mechanism = single-CTA compute throughput
+
+| job | ticket | isolated with/without tail (T=1) | chain btail[none/un/o/both] | speedup |
+|---|---|---|---|---|
+| a15e0698 | atom.add.release.gpu | o launch 9.0 -> 49.2 us (256 CTAs); unpooler slice 7.5 -> 21.6 (128) | 70/83/106/118 -> none | 2.1049 |
+| a3816fbb | __threadfence + relaxed atomicAdd | o 8.8 -> 46.0; unpooler 7.2 -> 21.5 | 70/82/104/117 -> none | 2.0839 |
+
+Numerics: s1 5.8e-8 / h 0 / s2 6.4e-8 / out 0 (rel) vs the Triton kernels, both runs. The ticket flavor is not the cost
+(identical). The loads are in flight (zero spills, 154 / 103 registers = the whole row's loads + the row in registers).
+The cost is the tail body on ONE CTA: the same per-element gate math as the Triton kernel (2 sigmoid, sqrt, 2 fp32
+divisions, ~100+ instructions per element) over 8192 elements on 4 consumer warps (o kernel: 64 elements per thread)
+or 8 warps (slice kernel: 32 per thread) vs the Triton kernel's 16 warps x 16 elements: a 4-8x longer serial
+instruction stream with one warp per scheduler (~6.5 us x 2 and x 5 reproduce +14 / +37 us). Precomputed alpha/beta
+would cut ~70% of the instructions but adds 16-32 loads per thread (spills at the slice kernel's 157-register cap) and
+lands at ~2.5-3 us = the separate kernel's exposed cost: no win in the last-CTA structure at T=1. Left off
+(FUSE_BOUNDARY = False); code, self-test and chain pick kept.
