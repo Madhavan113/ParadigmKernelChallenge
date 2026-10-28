@@ -2192,6 +2192,14 @@ static_assert(!OKC_WS || !OKC_WSBL || OKC_WSBLK <= OKC_WSNR, "OKC_WSBLK must not
 #ifndef OKC_WSRF
 #define OKC_WSRF 0
 #endif
+#ifndef OKC_WSSTR
+#define OKC_WSSTR 0  // WS tiny builds: with up to this many skinny jobs, a CTA's units of each phase are the strided set
+                     // {c + i G} of the job-major unit space (its share of EVERY job, in job order; phase-A credits per job
+                     // as soon as the CTA's units of that job are done) instead of the contiguous range
+                     // [nS c / G, nS (c + 1) / G): the B units of all jobs but the last stream and compute while the last
+                     // job's phase A is still ending (set Q: at bs1 the 4 resident B units cost 5.4 us of compute after a
+                     // gate that opens 1.3 us after the slowest CTA's phase A)
+#endif
 #ifndef OKC_PBPF
 #define OKC_PBPF 0  // WS: L2 prefetch (evict_last) of this CTA's own phase-B units, in consumption order, issued by the
                     // helper warp a few lines per lane per phase-A unit; OKC_PBPF = grid-wide byte cap (per CTA: / G)
@@ -2202,6 +2210,17 @@ static_assert(!OKC_WS || !OKC_WSBL || OKC_WSBLK <= OKC_WSNR, "OKC_WSBLK must not
 #endif
 static_assert(!OKC_WSER || OKC_WSB, "OKC_WSER needs the WSB loop");
 __device__ __forceinline__ void ws_issue(const Params& p, Smem& S, int q, int nA, int a0, int b0, unsigned char* ring);
+// OKC_WSSTR: the strided unit order (see the define); ws_str(S): active for this launch
+__device__ __forceinline__ bool ws_str(const Smem& S) { return OKC_WSSTR && !OKC_SPLIT && S.njS <= OKC_WSSTR; }
+__device__ __forceinline__ int ws_str_cnt(int nS) {  // this CTA's unit count of a phase of nS units
+  const int c = blockIdx.x, G = gridDim.x;
+  return c < nS ? (nS - c + G - 1) / G : 0;
+}
+__device__ __forceinline__ int ws_str_jobcnt(int jr, int rbs) {  // this CTA's units of (skinny-relative) job jr
+  const int c = blockIdx.x, G = gridDim.x;
+  const int x0 = jr * rbs, x1 = x0 + rbs;  // (x - c + G - 1) / G = ceil((x - c) / G) for x > c - G
+  return (x1 - c + G - 1) / G - (x0 - c + G - 1) / G;
+}
 template <bool PB>
 __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigned char* ring, uint64_t* bars, int& seq) {
   const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
@@ -2218,7 +2237,7 @@ __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigne
   uint32_t lnw0 = 0u, lnw1 = 0u;                // (norm weights as raw bf16 bits)
 #endif
   for (int i = 0; i < nU; ++i) {
-    const int v = v0 + i;
+    const int v = (OKC_WSSTR && ws_str(S)) ? (int)blockIdx.x + i * (int)gridDim.x : v0 + i;
     const int j = njF + v / rbs;
 #if OKC_WSB && OKC_WSBL == 2
     if (PB && warp < OKC_WSBLK && i == nU - 1 - warp) {
@@ -2358,7 +2377,7 @@ __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigne
   if (PB && warp < OKC_WSBLK && warp < nU) {  // the CTA's last units: epilogues here, not behind the helper's queue
     const int ul = nU - 1 - warp;
     const int q = seq0 + ul, bb = q % NRB;
-    const int v = v0 + ul, j = njF + v / RB_B, rb = v - (v / RB_B) * RB_B;
+    const int v = (OKC_WSSTR && ws_str(S)) ? (int)blockIdx.x + ul * (int)gridDim.x : v0 + ul, j = njF + v / RB_B, rb = v - (v / RB_B) * RB_B;
     const int gg = lane >> 2, tt = lane & 3;
     float4 sm = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
@@ -2398,8 +2417,10 @@ __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigne
 __device__ __forceinline__ void ws_issue(const Params& p, Smem& S, int q, int nA, int a0, int b0, unsigned char* ring) {
   const int sl = q % OKC_NS;
   if (OKC_DEBUG) { if (q == 0) DBGPX(0); if (q == nA) DBGPX(3); }  // (debug) first unit / first phase-B unit issued
-  if (q < nA) ring_issue<false>(p, S, a0 + q, ring + sl * UNIT_BYTES, S.bars + sl);
-  else ring_issue<true>(p, S, b0 + (q - nA), ring + sl * UNIT_BYTES, S.bars + sl);
+  const bool st = OKC_WSSTR && ws_str(S);
+  const int G = (int)gridDim.x, c = (int)blockIdx.x;
+  if (q < nA) ring_issue<false>(p, S, st ? c + q * G : a0 + q, ring + sl * UNIT_BYTES, S.bars + sl);
+  else ring_issue<true>(p, S, st ? c + (q - nA) * G : b0 + (q - nA), ring + sl * UNIT_BYTES, S.bars + sl);
 }
 
 __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
@@ -2444,7 +2465,7 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
     if (q < nA) pf_issue(q == nA - 1 ? (pf_n - pf_i + 31) / 32 : pf_per);
 #endif
     const bool PB = q >= nA;
-    const int v = PB ? b0 + (q - nA) : a0 + q;
+    const int v = (OKC_WSSTR && ws_str(S)) ? (int)blockIdx.x + (PB ? q - nA : q) * (int)gridDim.x : (PB ? b0 + (q - nA) : a0 + q);
     const int rbs = PB ? RB_B : RB_A;
     const int j = njF + v / rbs, rb = v - (v / rbs) * rbs;
     const int bb = q % NRB;
@@ -2470,6 +2491,15 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
           st_keep_bf16(p.inter + ((size_t)(st + tk) * ID + rb * 8 + gg), __float2bfloat16(probe_q(SILU_DIV(gt, 1.f + __expf(-gt)) * up)));
         }
       }
+#if OKC_WSSTR
+      if (ws_str(S)) {  // strided order: job j is credited as soon as this CTA's last unit of it is done (its B can start)
+        if (q == nA - 1 || (((int)blockIdx.x + (q + 1) * (int)gridDim.x) >> RB_A_LOG) != (v >> RB_A_LOG)) {
+          __threadfence();
+          __syncwarp();
+          if (lane == 0) atomicAdd(p.doneA + j, ws_str_jobcnt(v >> RB_A_LOG, RB_A));
+        }
+      } else
+#endif
       if (q == nA - 1) {  // this CTA's phase A is done: credit its units to the jobs' counters
         __threadfence();
         __syncwarp();
@@ -3966,6 +3996,9 @@ __device__ __forceinline__ void run_phase(const Params& p, Smem& S, __nv_bfloat1
   if (!PB) skinny_ring_wsd(p, S, reinterpret_cast<unsigned char*>(xbuf));  // both phases in one dynamic sequence
 #elif OKC_WS
   (void)cpf; (void)cBn;
+#if OKC_WSSTR
+  if (ws_str(S)) { v0 = 0; v1 = ws_str_cnt(nS); }  // strided order: the loop indexes the CTA's units 0..count
+#endif
   skinny_ring_ws<PB>(p, S, v0, v1, reinterpret_cast<unsigned char*>(xbuf), S.bars, S.seq);
 #else
   skinny_ring<PB>(p, S, v0, v1, reinterpret_cast<unsigned char*>(xbuf), S.bars, S.seq,
@@ -4172,7 +4205,11 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
       const int nS = __popc(m) * RB_A - dyn_pool(__popc(m) * RB_A, gridDim.x);  // static part (pool tail claimed at run time)
       const float rG = __fdividef(1.f, (float)gridDim.x);
       const int v0 = muldiv_g(nS, blockIdx.x, gridDim.x, rG), v1 = muldiv_g(nS, blockIdx.x + 1, gridDim.x, rG);
-      const int n = min(OKC_FAST1, v1 - v0);
+      int n = min(OKC_FAST1, v1 - v0);
+#if OKC_WSSTR
+      const bool fstr = __popc(m) <= OKC_WSSTR;  // (= ws_str(S) once routing has set S.njS)
+      if (fstr) n = min(OKC_FAST1, ws_str_cnt(nS));
+#endif
 #endif
       asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
 #if OKC_WSDYN
@@ -4186,7 +4223,11 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
         const int e = fex[i];
 #else
       for (int i = 0; i < n; ++i) {
+#if OKC_WSSTR
+        const int v = fstr ? (int)blockIdx.x + i * (int)gridDim.x : v0 + i;
+#else
         const int v = v0 + i;
+#endif
         const int e = (int)__fns(m, 0, (v >> RB_A_LOG) + 1);
 #endif
         const unsigned char* src = p.wAu + ((size_t)e * RB_A + (v & (RB_A - 1))) * (size_t)UNIT_BYTES;
@@ -4283,6 +4324,9 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #else
     S.wsr[0] = muldiv_g(nA, c, G, rG); S.wsr[1] = muldiv_g(nA, c + 1, G, rG);
     S.wsr[2] = muldiv_g(nB, c, G, rG); S.wsr[3] = muldiv_g(nB, c + 1, G, rG);
+#if OKC_WSSTR
+    if (ws_str(S)) { S.wsr[0] = 0; S.wsr[1] = ws_str_cnt(nA); S.wsr[2] = 0; S.wsr[3] = ws_str_cnt(nB); }  // strided: counts
+#endif
 #endif
   }
   WS_JOIN();
@@ -5063,7 +5107,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "R"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "S"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 def _fast1(defs, n):  # a tiny define tuple with another FAST1 pre-issue depth (units issued before routing, <= OKC_NS)
@@ -5082,6 +5126,16 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "S": {  # small-batch item 2: OKC_WSSTR strided job-major unit order (phase-B units of all jobs but the last overlap the
+            # last job's phase-A tail; set R: 16 warps did not cut the per-unit compute, the loop is issue-bound near its floor)
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1, 4]},
+        "tiny_str": {"defines": TINY_DEFINES + ("-DOKC_WSSTR=4",), "shapes": [1, 4]},   # (bs4 x6 jobs: contiguous = control)
+        "tiny_str_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSSTR=4", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny_str6": {"defines": TINY_DEFINES + ("-DOKC_WSSTR=6",), "shapes": [4]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_str8": {"defines": TINY2_DEFINES + ("-DOKC_WSSTR=8",), "shapes": [8]},
+        "tiny2_str8_dbg": {"defines": TINY2_DEFINES + ("-DOKC_WSSTR=8", "-DOKC_DEBUG=1"), "shapes": [8]},
     },
     "R": {  # small-batch item: the per-unit compute of the 8-warp tiny loop (set Q: 1.0-1.35 us per 36 KB unit, 2 warps per
             # SM quadrant, latency-bound; the stream runs 1.35 us/unit): 16 compute warps (96 registers, no spills), NACC 2/4,
@@ -5229,11 +5283,11 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET == "Q" else [1, 4, 8, 16] if DIAG_SET == "R" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET in ("Q", "S") else [1, 4, 8, 16] if DIAG_SET == "R" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 # (bs, touched local experts) cases: the input seed is searched (DIAG_SEED + bs + 1000 k) for the judge's typical draw
 # (tools/moe_routing_stats.py, 60 seeds: bs1 p10/p50/p90 2/3/3, bs4 4/6/8, bs8 5/8/11); None: the fixed seed
-DIAG_CASES = [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET == "Q" else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET == "R" else [(bs, None) for bs in DIAG_SHAPES]
+DIAG_CASES = [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET in ("Q", "S") else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET == "R" else [(bs, None) for bs in DIAG_SHAPES]
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
 
