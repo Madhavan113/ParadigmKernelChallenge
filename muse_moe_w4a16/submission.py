@@ -3388,16 +3388,18 @@ __device__ void wgs_gather_t(const Params& p, Smem& S, unsigned char* stg) {
     const int r0 = tl << 3;
     while (S.jrow[j + 1] <= r0) ++j;
     const int cnt = S.jC[j], ntt = (cnt + 7) >> 3, nt = (r0 - S.jrow[j]) >> 3;
+    uint4 v[8];  // the tile's rows (padding rows zero), coalesced; all eight loads in flight before the stores
 #pragma unroll
-    for (int i = 0; i < 8; ++i) {  // the tile's rows (padding rows zero), coalesced
+    for (int i = 0; i < 8; ++i) {
       const int r = nt * 8 + i;
-      uint4 v = make_uint4(0u, 0u, 0u, 0u);
-      if (r < cnt) v = __ldg(reinterpret_cast<const uint4*>(p.x + (size_t)(S.ent[S.jS[j] + r] >> 3) * HD) + tid);
-      *reinterpret_cast<uint4*>(stg + i * RS + tid * 16) = v;
+      v[i] = make_uint4(0u, 0u, 0u, 0u);
+      if (r < cnt) v[i] = __ldg(reinterpret_cast<const uint4*>(p.x + (size_t)(S.ent[S.jS[j] + r] >> 3) * HD) + tid);
     }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) *reinterpret_cast<uint4*>(stg + i * RS + tid * 16) = v[i];
     CTA_SYNC();
     uint4* dst = reinterpret_cast<uint4*>(p.xA + (size_t)S.jrow[j] * HD);
-#pragma unroll
+#pragma unroll 2
     for (int m = 0; m < 8; ++m) {  // out in the per-stage wgmma B layout: per stage 32 k8 x 8 rows x 16 B contiguous
       const int L = tid + m * NT;
       const int st = L >> 8, kb = (L >> 3) & 31, i = L & 7;
