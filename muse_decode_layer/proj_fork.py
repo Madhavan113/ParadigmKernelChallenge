@@ -111,6 +111,13 @@ __device__ __forceinline__ void decode8(uint32_t lw0, uint32_t lw1, uint32_t nw,
 template <typename T> __device__ __forceinline__ T cvt_out(float v);
 template <> __device__ __forceinline__ float cvt_out<float>(float v) { return v; }
 template <> __device__ __forceinline__ __nv_bfloat16 cvt_out<__nv_bfloat16>(float v) { return __float2bfloat16_rn(v); }
+// escape correction from the stored original BF16 weight t (the m = 1 cgemv tables): its 12-bit decode keeps the sign
+// and low byte and clamps the exponent into [base, base + 7]; the exact difference is formed here in FP32
+__device__ __forceinline__ float esc_delta(uint32_t t, uint32_t bq) {
+  const uint32_t hi = (t >> 8) & 0xFFu, e71 = hi & 0x7Fu;
+  const uint32_t dhi = (hi & 0x80u) | (e71 < bq ? bq : bq + 7u);
+  return __uint_as_float(t << 16) - __uint_as_float(((dhi << 8) | (t & 0xFFu)) << 16);
+}
 
 // Weights, uncompressed (COMP=0): [num_rg][S][32 lanes][16 B] A fragments, S = Kp / 16.
 // Weights, compressed (COMP=1): [num_rg][S/4 units][3 parts][32 lanes][16 B]: parts 0,1 = low

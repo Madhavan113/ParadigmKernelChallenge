@@ -105,7 +105,8 @@ def _bfp_prepare(weights, st):
         w5 = {k: weights[k].contiguous() for k in ("qkv_gate", "o", "pooler", "unpooler", "router")}
         st["bfp"] = bfp_prepare(w5)
     except Exception as ex:  # noqa: BLE001
-        print("bfp disabled:", repr(ex)[:160], flush=True)
+        s = repr(ex)
+        print("bfp disabled:", s[:200] + (" ... " + s[-1500:] if len(s) > 1700 else s[200:]), flush=True)
 
 
 _BFP_LAYER = {"qkv": "qkv_gate", "o": "o", "un": "unpooler", "pool": "pooler", "router": "router"}
