@@ -443,5 +443,12 @@ Items (variant minus base, us; closed = under the bar):
 2b. (ab16, T=1, m=1 routes pinned via m1:<layer>=<kind>) the fork's m=1 autotuner flip is worth 6 us: qkv / o as
    cgemv (+ unpooler sgemv) +6.5/+6.5 vs the sk2 choice (rows +5.4/+7.6/+6.1, +8.9/+5.6/+5.2); with the GEMVs as
    PDL launches (pdlflags=512) +4.3/+5.3 (the GEMV-PDL path recovers 1.2-2.2 us when a GEMV is in the chain);
-   sk2 routes + sk2 entry trigger +2.2/+2.6; sk2 routes + unpooler cgemv +0.1/+0.4 (= base). ab18 isolates the
-   lock: qkv / o pinned to sk2, the unpooler slice as cgemv / sgemv (plain and PDL) / sk2.
+   sk2 routes + sk2 entry trigger +2.2/+2.6; sk2 routes + unpooler cgemv +0.1/+0.4 (= base). ab18 (qkv / o pinned
+   to sk2): unpooler cgemv plain +0.4/+0.3, cgemv as a PDL launch -1.0/-0.7 (rows -1.6/-1.1/-0.6, +0.1/-0.9/-1.5),
+   sgemv plain -0.1/+0.1, sgemv PDL +0.1/-0.2, unpooler as sk2 (slice8_r192) -1.4/-0.9 (rows -1.6/-1.3/-0.8,
+   -0.7/-1.6/-0.6; check ok). LOCK (682afcb): M1_ROUTE_PIN = all sk2 at m = 1, applied after the fork's prepare and
+   printed; SK2_PDL_FLAGS stays 0 (the GEMV-PDL path kept for the fallback). Value: ~1 us at T=1 vs a prepare that
+   drew sk2 anyway, +7.7 us vs one that drew cgemv for qkv / o (the Oct 27 judge profile did).
+5. attention plans at B=1 sliding q1 (ab17, check ok for each): clusters cs 8 +5.5 (+5.0/+5.7/+5.7), cs 16 +5.8,
+   cooperative finalize over 4 copies +0.5, 16 two-tile splits +1.5, 64 splits +0.6 - the module's plain 32-split
+   plan is the chain's best; closed.
