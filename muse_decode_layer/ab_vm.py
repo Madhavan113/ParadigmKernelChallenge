@@ -106,6 +106,12 @@ def apply(S, st, spec, saved):
         elif kind == "pdlmax":   # PDL_MAX_T: programmatic launches (attention, MoE, glue, sk2) up to this T
             saved.append(("pdlmax", None, S.PDL_MAX_T))
             S.PDL_MAX_T = int(val)
+        elif kind == "gmode":    # the CUDA glue kernels' mode bits (1 late trigger, 2 early wait, 4 exact rank loop, 8 1024 threads)
+            saved.append(("gmode", None, st.get("glue_mode")))
+            st["glue_mode"] = int(val)
+        elif kind == "pdlflags":   # the proj fork's PDL word flags: 0x100 sk2 trigger at entry, 0x200 cgemv as a PDL launch
+            saved.append(("pdlflags", None, S.SK2_PDL_FLAGS))
+            S.SK2_PDL_FLAGS = int(val)
         else:
             raise ValueError(item)
 
@@ -126,6 +132,13 @@ def restore(S, st, saved):
             S.bfp_SK2_PICK[k] = old
         elif kind == "pdlmax":
             S.PDL_MAX_T = old
+        elif kind == "gmode":
+            if old is None:
+                st.pop("glue_mode", None)
+            else:
+                st["glue_mode"] = old
+        elif kind == "pdlflags":
+            S.SK2_PDL_FLAGS = old
         else:
             d = st[kind]
             if old is None:

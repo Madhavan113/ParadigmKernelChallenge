@@ -1097,7 +1097,9 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   const uint8_t* wsr = FUSE ? Wsr + (size_t)rt * WBYR : nullptr;
   const int nstt = nst + NSTR;
   // stages issued by the prologue: 1, or under PDL up to pdl (CL == 1 only; never past this CTA's own stages)
-  const int P = (CL == 1 && pdl > 0) ? min(pdl, min(NSTAGE, nst)) : 1;
+  const int pdlP = pdl & 0xFF;   // pre-wait weight stages; bit 8: launch_dependents at entry (dependents prefetch)
+  const int P = (CL == 1 && pdlP > 0) ? min(pdlP, min(NSTAGE, nst)) : 1;
+  if (pdl & 0x100) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
 
   if (tid == 0) {
     // stage 0 first of all (the first bytes' latency is the ramp of the whole kernel): the weight copy needs only
@@ -1123,7 +1125,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       mbar_expect_tx(full0 + 8 * st, (((dgv & 4) || HSM) ? 0 : XBYr) + WBY);
       bulk_g2s(sbase + st * SST + XBY, wsrc + (size_t)(gs0 + st) * wstride, WBY, full0 + 8 * st);
     }
-    if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
+    if (pdlP) asm volatile("griddepcontrol.wait;" ::: "memory");
     if (!(dgv & 4) && !HSM && !BND1)   // (BND1: the producer issues every x box once h exists in global memory)
       for (int st = 0; st < P; ++st) tma_load_3d(sbase + st * SST, &xmap, full0 + 8 * st, 0, 0, (gs0 + st) * UPS);
     if (COMP) {   // this CTA's escape table
@@ -1165,7 +1167,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   // local barriers are all this CTA needs to start streaming; the cluster barrier (rank 0's qbar initialized before
   // ranks > 0 send into it) is only arrived at here and waited on right before the remote stores
   __syncthreads();
-  if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");   // every thread: x and the outputs are ours from here
+  if (pdlP) asm volatile("griddepcontrol.wait;" ::: "memory");   // every thread: x and the outputs are ours from here
   if constexpr (CL > 1) asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");   // inits fenced above
 
   if (warp == NW) {
@@ -1448,7 +1450,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
     }
     if (trace && warp == 0 && lane == 0) tr[16 + 3 * st + 2] = gtime();
   }
-  if (pdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the next kernel may start its prologue
+  if (pdlP && !(pdl & 0x100)) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // the next kernel may start its prologue
   if constexpr (FUSE) {
     // router piece: 8 rows (one tile) over 4 stages of 8 units; hi and lo BF16 tiles into two FP32 accumulators
     float accr[2][MT][4];
@@ -1919,7 +1921,8 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
     OutT* op = reinterpret_cast<OutT*>(out.data_ptr());
     const int2* tp = reinterpret_cast<const int2*>(ptab.data_ptr());
     const int pdl = g_sk2_pdl;
-    if (CL > 1 || pdl > 0) {
+    const int pdlP = pdl & 0xFF;
+    if (CL > 1 || pdlP > 0) {
       cudaLaunchConfig_t lc = {};
       lc.gridDim = dim3(N / R * CL);
       lc.blockDim = dim3((NW + 1 + NESC) * 32);
@@ -1934,7 +1937,7 @@ static void launch_sk2(const at::Tensor& Ws, const at::Tensor& x, at::Tensor& ou
         at_[na].val.clusterDim.z = 1;
         ++na;
       }
-      if (pdl > 0) {   // programmatic dependent launch: may start while the previous kernel in the stream finishes
+      if (pdlP > 0) {   // programmatic dependent launch: may start while the previous kernel in the stream finishes
         at_[na].id = cudaLaunchAttributeProgrammaticStreamSerialization;
         at_[na].val.programmaticStreamSerializationAllowed = 1;
         ++na;
@@ -2910,13 +2913,17 @@ __device__ __forceinline__ uint32_t cg_hib(uint32_t c, uint32_t base4) {
 template <int ROWS, int NTH, int K>
 __global__ void __launch_bounds__(NTH + 32) cgemv_kernel(const uint8_t* __restrict__ L, const uint8_t* __restrict__ C,
     const __nv_bfloat16* __restrict__ x, const int2* __restrict__ etab, int pmax,
-    __nv_bfloat16* __restrict__ out, uint32_t base4) {
+    __nv_bfloat16* __restrict__ out, uint32_t base4, int pdl) {
   constexpr int PER = K / (16 * NTH);
   constexpr int NWARP = NTH / 32;
   static_assert(PER >= 1, "cgemv: K >= 16 NTH");
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int r0 = blockIdx.x * ROWS;
   __shared__ float red[ROWS][NWARP + 1];
+  // programmatic dependent launch (pdl): the weights and the escape table never depend on the previous kernel and
+  // load first; x (its output) only after griddepcontrol.wait, through L2 (never ld.global.nc: ptxas may hoist those
+  // above the wait); dependents may start their own prologue at once
+  if (pdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");
   if (warp == NWARP) {   // escape warp: lane i takes entries 1 + i, 33 + i, ... (entry 0 = count); x[k] * delta per row
     const int2* tb = etab + (size_t)blockIdx.x * pmax;
     int2 mine = make_int2(0, 0);
@@ -2925,12 +2932,14 @@ __global__ void __launch_bounds__(NTH + 32) cgemv_kernel(const uint8_t* __restri
     float ec[ROWS];
 #pragma unroll
     for (int r = 0; r < ROWS; ++r) ec[r] = 0.f;
+    if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
     for (int i0 = 0; i0 <= cnt; i0 += 32) {
       const int i = i0 + lane;
       int2 en = mine;
       if (i0 > 0) en = (i <= cnt) ? __ldg(&tb[i]) : make_int2(0, 0);
       if (i >= 1 && i <= cnt) {
-        const float c = __bfloat162float(x[en.x & 0xFFFF]) * esc_delta((uint32_t)en.y, base4 & 0xFFu);
+        const unsigned short xb = __ldcg(reinterpret_cast<const unsigned short*>(x) + (en.x & 0xFFFF));
+        const float c = __uint_as_float((uint32_t)xb << 16) * esc_delta((uint32_t)en.y, base4 & 0xFFu);
         const int rl = en.x >> 16;
 #pragma unroll
         for (int r = 0; r < ROWS; ++r) ec[r] += (rl == r) ? c : 0.f;
@@ -2955,11 +2964,12 @@ __global__ void __launch_bounds__(NTH + 32) cgemv_kernel(const uint8_t* __restri
       lw[r][j] = __ldg(reinterpret_cast<const uint4*>(L + e0));
       cw[r][j] = __ldg(reinterpret_cast<const uint2*>(C + e0 / 2));
     }
+  if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");
 #pragma unroll
   for (int j = 0; j < PER; ++j) {
     const __nv_bfloat16* xp = x + j * 16 * NTH + 16 * tid;
-    xv[j][0] = __ldg(reinterpret_cast<const uint4*>(xp));
-    xv[j][1] = __ldg(reinterpret_cast<const uint4*>(xp + 8));
+    xv[j][0] = __ldcg(reinterpret_cast<const uint4*>(xp));
+    xv[j][1] = __ldcg(reinterpret_cast<const uint4*>(xp + 8));
   }
   float acc[ROWS];
 #pragma unroll
@@ -3021,6 +3031,7 @@ void cgemv(at::Tensor L, at::Tensor C, at::Tensor x, at::Tensor etab, int64_t pm
   auto op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
   const uint32_t b4 = (uint32_t)base4;
   const int pm = (int)pmax;
+  const int pdl = (g_sk2_pdl & 0x200) ? 1 : 0;   // PDL launch of the m = 1 GEMV (sk2_set_pdl bit 9)
   @@CG_DISPATCH@@
   TORCH_CHECK(false, "cgemv: no instantiation for K=", K, " rows=", rows, " nth=", nth);
   C10_CUDA_KERNEL_LAUNCH_CHECK();
@@ -3114,8 +3125,12 @@ def _rgemv_src():
     for layer in CG_CONFIGS:
         k = CG_K[layer]
         for rows, nth in _cg_configs(layer):
-            lines.append(f"if (K == {k} && rows == {rows} && nth == {nth}) {{ cgemv_kernel<{rows}, {nth}, {k}><<<N / {rows}, {nth} + 32, 0, st>>>"
-                         f"(a0, a1, xp, tp, pm, op, b4); C10_CUDA_KERNEL_LAUNCH_CHECK(); return; }}")
+            lines.append(f"if (K == {k} && rows == {rows} && nth == {nth}) {{ auto kern = cgemv_kernel<{rows}, {nth}, {k}>; "
+                         f"if (pdl) {{ cudaLaunchConfig_t lc = {{}}; lc.gridDim = dim3(N / {rows}); lc.blockDim = dim3({nth} + 32); "
+                         f"lc.dynamicSmemBytes = 0; lc.stream = st; cudaLaunchAttribute at_[1]; "
+                         f"at_[0].id = cudaLaunchAttributeProgrammaticStreamSerialization; at_[0].val.programmaticStreamSerializationAllowed = 1; "
+                         f"lc.attrs = at_; lc.numAttrs = 1; C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, kern, a0, a1, xp, tp, pm, op, b4, 1)); }} "
+                         f"else {{ kern<<<N / {rows}, {nth} + 32, 0, st>>>(a0, a1, xp, tp, pm, op, b4, 0); C10_CUDA_KERNEL_LAUNCH_CHECK(); }} return; }}")
     return RGEMV_SRC.replace("@@CG_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
 
 
@@ -3983,7 +3998,9 @@ def _run(choice, x, layer, m, n, k, state):
         rows, nth = choice[1] if len(choice) > 1 else CG_CONFIGS[layer]
         cg = state["cg"][(layer, rows)]
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-        _get_ext().cgemv(cg["L"], cg["C"], x, cg["tab"], cg["pmax"], out, cg["base4"], rows, nth)
+        ext = _get_ext()
+        ext.sk2_set_pdl(SK2_PDL)
+        ext.cgemv(cg["L"], cg["C"], x, cg["tab"], cg["pmax"], out, cg["base4"], rows, nth)
         return out
     if kind == "sgemv":   # unpooler slice, m = 1: BF16 weights straight from memory (4 rows per CTA)
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)

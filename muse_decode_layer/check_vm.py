@@ -11,7 +11,7 @@ import argparse, importlib, os, sys, time
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from ab_vm import SHAPES, parse_shape  # noqa: E402
+from ab_vm import SHAPES, parse_shape, apply  # noqa: E402
 
 
 def main():
@@ -20,6 +20,7 @@ def main():
     ap.add_argument("--shapes", nargs="*", default=list(SHAPES))
     ap.add_argument("--spec", action="append", default=[], help="raw shape spec k=v,... (added to --shapes)")
     ap.add_argument("--no-graph", action="store_true")
+    ap.add_argument("--override", action="append", default=[], help="ab_vm override spec applied after prepare")
     args = ap.parse_args()
     cases = [(n, SHAPES[n]) for n in args.shapes] + [(f"spec{i}", sp) for i, sp in enumerate(args.spec)]
     pdir = os.path.dirname(os.path.abspath(__file__))
@@ -34,6 +35,9 @@ def main():
         st = S.prepare(weights)
         torch.cuda.synchronize()
         print(f"[prepare] seed {seed}: {time.perf_counter() - t0:.1f} s", flush=True)
+        for spec in args.override:
+            apply(S, st, spec, [])
+            print(f"[override] {spec}", flush=True)
         for name, spec in cases:
             data = R.generate_input(seed=seed, **parse_shape(spec))
             T = data["config"]["tokens"] if "config" in data and "tokens" in data["config"] else -1
