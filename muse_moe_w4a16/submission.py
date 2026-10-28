@@ -513,6 +513,7 @@ __device__ __forceinline__ unsigned long long gtimer() {
 #else
 #define TOPKW(i) p.topk_w[i]
 #endif
+#define DBGP(k) do { if (OKC_DEBUG && threadIdx.x == 0 && p.dbg) p.dbg[(size_t)gridDim.x * 13 + (size_t)blockIdx.x * 4 + (k)] = gtimer(); } while (0)
 #define DBG(k) do { if (OKC_DEBUG && threadIdx.x == 0 && p.dbg) p.dbg[blockIdx.x * 8 + (k)] = gtimer(); } while (0)
 extern __shared__ __align__(16) unsigned char smem_raw[];
 __device__ __forceinline__ float* ss_cur();  // this launch's ss copy (defined after Smem users)
@@ -2821,6 +2822,12 @@ __device__ __forceinline__ int wgs_cost(int pb, int cnt) {
 #ifndef OKC_GATHB
 #define OKC_GATHB 8  // WGS: x rows gathered per batch (loads first, then stores); 0 = one row at a time
 #endif
+#ifndef OKC_GATHT
+#define OKC_GATHT 0  // WGS: phase-A x gather by whole n8 tiles (CTA c: tiles c, c + G, ...), the 8 rows staged through
+                     // the idle ring smem (coalesced 16 B loads, padded row stride) and written as 16 contiguous 4 KB
+                     // blocks, one release per tile: the per-row gather's release fence over scattered 16 B stores
+                     // ended 4-11 us after launch and gated every CTA's first x stage
+#endif
 #ifndef OKC_WGSPR
 #define OKC_WGSPR 1  // WGS: the x producer warp computes the stage ranges while the consumers gather
 #endif
@@ -3136,7 +3143,7 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
   // the routing tables are ready (the consumers arrive on barrier 7 right after routing): this idle warp computes the
   // stage ranges while the consumers gather phase A's x
   asm volatile("bar.sync 7, %0;\n" ::"n"(NT + (OKC_WGSEARLY ? 64 : 32)) : "memory");
-  if ((threadIdx.x & 31) == 0) wgs_ranges(p, S);
+  if ((threadIdx.x & 31) == 0) { wgs_ranges(p, S); if (OKC_DEBUG && p.dbg) p.dbg[(size_t)gridDim.x * 13 + (size_t)blockIdx.x * 4 + 3] = gtimer(); }
   __syncwarp();
 #endif
 #if OKC_WGSEARLY
@@ -3356,6 +3363,7 @@ __device__ void wgs_gather(const Params& p, Smem& S) {
     }
   }
 #endif
+  DBGP(1);  // this thread's gather copies done
   CTA_SYNC();
   if (tid == 0) {  // count this CTA's rows per job (release: the CTA's stores are ordered before by the barrier)
     int jj = 0;
@@ -3366,7 +3374,42 @@ __device__ void wgs_gather(const Params& p, Smem& S) {
       q = e;
     }
   }
+  DBGP(2);  // gather released
 }
+#if OKC_GATHT
+__device__ void wgs_gather_t(const Params& p, Smem& S, unsigned char* stg) {
+  const int tid = threadIdx.x, nj = S.njF + S.njS;
+  const int ntiles = S.jrow[nj] >> 3;
+  constexpr int RS = HD * 2 + 16;  // staged row stride (bytes): the 8 rows of a tile hit different bank groups
+  static_assert(NT * 16 == HD * 2, "one 16 B chunk per thread per row");
+  static_assert(8 * RS <= WGS_NS * UNIT_BYTES, "the staging tile fits in the weight ring");
+  int j = 0;
+  for (int tl = blockIdx.x; tl < ntiles; tl += gridDim.x) {
+    const int r0 = tl << 3;
+    while (S.jrow[j + 1] <= r0) ++j;
+    const int cnt = S.jC[j], ntt = (cnt + 7) >> 3, nt = (r0 - S.jrow[j]) >> 3;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {  // the tile's rows (padding rows zero), coalesced
+      const int r = nt * 8 + i;
+      uint4 v = make_uint4(0u, 0u, 0u, 0u);
+      if (r < cnt) v = __ldg(reinterpret_cast<const uint4*>(p.x + (size_t)(S.ent[S.jS[j] + r] >> 3) * HD) + tid);
+      *reinterpret_cast<uint4*>(stg + i * RS + tid * 16) = v;
+    }
+    CTA_SYNC();
+    uint4* dst = reinterpret_cast<uint4*>(p.xA + (size_t)S.jrow[j] * HD);
+#pragma unroll
+    for (int m = 0; m < 8; ++m) {  // out in the per-stage wgmma B layout: per stage 32 k8 x 8 rows x 16 B contiguous
+      const int L = tid + m * NT;
+      const int st = L >> 8, kb = (L >> 3) & 31, i = L & 7;
+      const uint4 v = *reinterpret_cast<const uint4*>(stg + i * RS + (st * 32 + kb) * 16);
+      dst[((st * ntt + nt) * 32 + kb) * 8 + i] = v;
+    }
+    CTA_SYNC();  // (the staging buffer is reused; the stores are ordered before the release)
+    if (tid == 0) asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(p.xready + j), "r"(8) : "memory");
+  }
+  DBGP(2);
+}
+#endif
 // Work left from the previous segment, done after the next segment's first wgmma group (so the stores and atomics it
 // waits for have long completed): kind 1 = release doneA for job j (phase A), kind 2 = add the stage count of a split
 // unit's share and, if that completes the unit, read the summed partials back and run its epilogue.
@@ -4206,10 +4249,15 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #if !OKC_WGSEARLY
   if (tid < 32) wgs_jrow(S);
   CTA_SYNC();
+  DBGP(0);  // jrow scan done
 #endif
   // phase A's x into xA (this CTA's share of the rows), before the producers start: its x reads do not queue behind
   // every CTA's first weight stages (OKC_WGSEARLY: the producers are already streaming)
+#if OKC_GATHT
+  wgs_gather_t(p, S, reinterpret_cast<unsigned char*>(xbuf));  // (the weight ring is idle until the producers start)
+#else
   wgs_gather(p, S);
+#endif
 #if !OKC_WGSFIT
   DBG(7);
 #endif
@@ -4969,8 +5017,8 @@ TINY2_MAX_M = 8
 # TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
-DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "M"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
+DIAG_SET = "O"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 DIAG_VARIANT_SETS = {
@@ -4981,6 +5029,16 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "O": {  # WGS phase-A x gather by whole n8 tiles through smem (OKC_GATHT) vs the per-row gather
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "gatht": {"defines": MAIN_DEFINES + ("-DOKC_GATHT=1",), "shapes": _WGS_SHAPES},
+        "gatht_dbg": {"defines": MAIN_DEFINES + ("-DOKC_GATHT=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+    },
+    "N": {  # WGS final pass: sum of squares fused into phase B's epilogue (OKC_WGSFINSS=0: one ybuf read) vs the shipped two-read pass
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "wgs_finss0": {"defines": MAIN_DEFINES + ("-DOKC_WGSFINSS=0",), "shapes": _WGS_SHAPES},
+        "wgs_finss0_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSFINSS=0", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
     },
     "M": {  # WGS with setmaxnreg: producer warpgroup dec 24, consumers inc 120; wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
@@ -5084,7 +5142,7 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
@@ -5672,7 +5730,7 @@ def _diag(state, weights):
         defs, vshapes = variants[dbgname]
         ext = _ext(defs)
         G = state["grid"]
-        dbg = torch.zeros(G * 8 + G * 8 * 4, dtype=torch.int64, device=dev)
+        dbg = torch.zeros(G * 17 + G * 8 * 4, dtype=torch.int64, device=dev)
         sc = list(state["scratch"]) + [dbg]
         names = ["start", "routed", "A done", "B done", "barrier", "final", "ranges", "gathered"]
         for bs in vshapes:
@@ -5695,6 +5753,14 @@ def _diag(state, weights):
                 col = tt[:, k][tt[:, k] > 0]
                 if col.numel():
                     parts.append(f"{n} {(col.min() - t00) / 1000:.1f}-{(col.max() - t00) / 1000:.1f}")
+            if "-DOKC_WGS=1" in defs:  # prologue stamps (us from start, min-max over CTAs): jrow / gather copies / gather release / ranges
+                pr = dbg[G * 13:G * 17].view(G, 4).cpu().double()
+                pp = []
+                for k, n in enumerate(["jrow", "gath", "rel", "ranges"]):
+                    col = pr[:, k][pr[:, k] > 0]
+                    if col.numel():
+                        pp.append(f"{n} {(col.min() - t00) / 1000:.1f}-{(col.max() - t00) / 1000:.1f}")
+                parts.append("prologue[" + " ".join(pp) + "]")
             if "-DOKC_WGS=1" in defs:  # producer stall counters (us): x gating phase A / B, phase-B stalls > 0.5 us, x-ring empty, weight-ring empty
                 xs_ = dbg[G * 8:G * 12].view(G, 4).cpu().double() / 1000
                 ws_ = dbg[G * 12:G * 13].cpu().double() / 1000
