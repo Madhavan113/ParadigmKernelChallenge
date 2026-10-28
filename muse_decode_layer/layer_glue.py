@@ -243,7 +243,9 @@ def _boundary_selftest(st):
 FUSE_BND1 = True   # the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
                    # output (every CTA redundantly, before its x boxes; the weight ring is already streaming): no
                    # _boundary1 launch at T <= BND1_MAX_T. Enabled only when the prepare-time self-test matches.
-BND1_MAX_T = 1     # one row per CTA prologue is hidden behind the ring fill; 8 rows are not (measured design limit)
+BND1_MAX_T = 8     # cooperative prologue: CTA c owns its 64 columns of every row (<= 3 KB per CTA), two grid tickets
+                   # at the kernel start, the weight ring streams meanwhile (the per-CTA whole-row versions were
+                   # load-issue bound: +10..13 us isolated)
 
 
 def _bnd1_fuse_ok(state, T):
@@ -264,7 +266,7 @@ def _bnd1_selftest(st):
     g = torch.Generator(device=dev).manual_seed(779)
     f32 = dict(device=dev, dtype=torch.float32)
     report = []
-    for T in (1,):   # the prologue keeps h in 16 KB of shared memory: M = 1 only
+    for T in (1, 8):   # the cooperative prologue handles M <= 8 rows
         a = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
         s = torch.randn(T, HIDDEN, generator=g, device=dev)
         h = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
