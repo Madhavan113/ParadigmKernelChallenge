@@ -13441,7 +13441,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
   }
   if constexpr (BT) {
     if (b_cnt != nullptr) {
-      // ---- boundary tail v2 (decode layer, M = 1): the LAST CTA by atomic ticket (no grid barrier) computes the
+      // ---- boundary tail (decode layer, M <= 8; v3 math below): the LAST CTA by atomic ticket (no grid barrier) computes the
       // layer's residual / norm boundary from the whole 8192-wide row with EVERY load in flight before any use:
       //   r = rsqrt(mean((a g)^2) + 1e-8),  s = alpha sin + beta (a g) r,  c = rsqrt(mean(s^2) + 1e-5),  h = s c (1 + gn)
       // a = this launch's output (N columns, 0 beyond), g = 1 + gp where gp is given, alpha / beta from the residual
@@ -13466,45 +13466,43 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       }
       named_bar(1, NC);
       if (!s_blast) return;
-      if (M == 1) {
-        float4 sv[CH][2];
-        uint4 gtv[CH], gnv[CH], av[CH], gpv[CH];
+      // ---- tail v3 (M <= 8): the v4 glue's math per token row. alpha / beta of the residual gate are precomputed
+      // (prepare-time _gate_coeffs), the four row sums are reduced ONCE (sum s^2 = A + 2rB + r^2 D), as = alpha sin
+      // and bx = beta a g stay in registers between the two passes; pass 2 loads gn and stores s and h.
+      for (int row = 0; row < M; ++row) {
+        const float* sin_r = b_sin + (size_t)row * 8192;
+        const OutT* a_r = out + (size_t)row * N;
         const bool hg = b_gp != nullptr;
-#pragma unroll
-        for (int j = 0; j < CH; ++j) {
-          const int c8 = (tid + j * NC) * 8;
-          sv[j][0] = __ldg(reinterpret_cast<const float4*>(b_sin + c8));
-          sv[j][1] = __ldg(reinterpret_cast<const float4*>(b_sin + c8 + 4));
-          gtv[j] = __ldg(reinterpret_cast<const uint4*>(b_gate + c8));
-          gnv[j] = __ldg(reinterpret_cast<const uint4*>(b_gn + c8));
-          av[j] = (c8 < N) ? __ldcg(reinterpret_cast<const uint4*>(out + c8)) : make_uint4(0u, 0u, 0u, 0u);
-          gpv[j] = (hg && c8 < N) ? __ldg(reinterpret_cast<const uint4*>(b_gp + c8)) : make_uint4(0u, 0u, 0u, 0u);
-        }
-        float as_[CH][8], bg_[CH][8];
+        float as_[CH][8], bx_[CH][8];
         float pA = 0.f, pB = 0.f, pC = 0.f, pD = 0.f;
 #pragma unroll
         for (int j = 0; j < CH; ++j) {
           const int c8 = (tid + j * NC) * 8;
-          const float sl[8] = {sv[j][0].x, sv[j][0].y, sv[j][0].z, sv[j][0].w, sv[j][1].x, sv[j][1].y, sv[j][1].z, sv[j][1].w};
-          const __nv_bfloat162* g2 = reinterpret_cast<const __nv_bfloat162*>(&gtv[j]);
-          const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&av[j]);
-          const __nv_bfloat162* p2 = reinterpret_cast<const __nv_bfloat162*>(&gpv[j]);
+          const float4 s0 = __ldg(reinterpret_cast<const float4*>(sin_r + c8));
+          const float4 s1 = __ldg(reinterpret_cast<const float4*>(sin_r + c8 + 4));
+          const float4 al0 = __ldg(reinterpret_cast<const float4*>(b_alpha + c8));
+          const float4 al1 = __ldg(reinterpret_cast<const float4*>(b_alpha + c8 + 4));
+          const float4 be0 = __ldg(reinterpret_cast<const float4*>(b_beta + c8));
+          const float4 be1 = __ldg(reinterpret_cast<const float4*>(b_beta + c8 + 4));
+          const uint4 av = (c8 < N) ? __ldcg(reinterpret_cast<const uint4*>(a_r + c8)) : make_uint4(0u, 0u, 0u, 0u);
+          const uint4 gpv = (hg && c8 < N) ? __ldg(reinterpret_cast<const uint4*>(b_gp + c8)) : make_uint4(0u, 0u, 0u, 0u);
+          const float sl[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
+          const float alv[8] = {al0.x, al0.y, al0.z, al0.w, al1.x, al1.y, al1.z, al1.w};
+          const float bev[8] = {be0.x, be0.y, be0.z, be0.w, be1.x, be1.y, be1.z, be1.w};
+          const __nv_bfloat162* a2 = reinterpret_cast<const __nv_bfloat162*>(&av);
+          const __nv_bfloat162* p2 = reinterpret_cast<const __nv_bfloat162*>(&gpv);
 #pragma unroll
           for (int q = 0; q < 4; ++q) {
-            const float2 gf = __bfloat1622float2(g2[q]), af = __bfloat1622float2(a2[q]), pf = __bfloat1622float2(p2[q]);
-            const float gg[2] = {gf.x, gf.y}, aa[2] = {af.x, af.y}, pp[2] = {pf.x, pf.y};
+            const float2 af = __bfloat1622float2(a2[q]), pf = __bfloat1622float2(p2[q]);
+            const float aa[2] = {af.x, af.y}, pp[2] = {pf.x, pf.y};
 #pragma unroll
             for (int e = 0; e < 2; ++e) {
               const int i = 2 * q + e;
-              // the residual gate as _gate_ab: w = g / 0.3, beta = sigmoid(w), alpha = sqrt(max(sigmoid(-w) (1 + beta), 1e-3))
-              const float w = gg[e] * (1.f / 0.3f);
-              const float beta = 1.f / (1.f + __expf(-w));
-              const float alpha = sqrtf(fmaxf((1.f / (1.f + __expf(w))) * (1.f + beta), 1e-3f));
               float ag = (c8 < N) ? aa[e] : 0.f;
               if (hg) ag *= 1.f + pp[e];
-              const float as1 = alpha * sl[i], bg1 = beta * ag;
-              as_[j][i] = as1; bg_[j][i] = bg1;
-              pC += ag * ag; pA += as1 * as1; pB += as1 * bg1; pD += bg1 * bg1;
+              const float as1 = alv[i] * sl[i], bx1 = bev[i] * ag;
+              as_[j][i] = as1; bx_[j][i] = bx1;
+              pC = fmaf(ag, ag, pC); pA = fmaf(as1, as1, pA); pB = fmaf(as1, bx1, pB); pD = fmaf(bx1, bx1, pD);
             }
           }
         }
@@ -13518,17 +13516,21 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
         float A = 0.f, B = 0.f, C = 0.f, D = 0.f;
 #pragma unroll
         for (int w = 0; w < NW; ++w) { A += s_bred4[w][0]; B += s_bred4[w][1]; C += s_bred4[w][2]; D += s_bred4[w][3]; }
+        named_bar(1, NC);   // s_bred4 is reused by the next row
         const float r = rsqrtf(C * (1.f / 8192.f) + 1e-8f);
         const float c = rsqrtf((A + 2.f * r * B + r * r * D) * (1.f / 8192.f) + 1e-5f);
+        float* sout_r = b_sout + (size_t)row * 8192;
+        __nv_bfloat16* hout_r = b_hout + (size_t)row * 8192;
 #pragma unroll
         for (int j = 0; j < CH; ++j) {
           const int c8 = (tid + j * NC) * 8;
+          const uint4 gnv = __ldg(reinterpret_cast<const uint4*>(b_gn + c8));
           float s8[8];
 #pragma unroll
-          for (int i = 0; i < 8; ++i) s8[i] = as_[j][i] + bg_[j][i] * r;
-          *reinterpret_cast<float4*>(b_sout + c8) = make_float4(s8[0], s8[1], s8[2], s8[3]);
-          *reinterpret_cast<float4*>(b_sout + c8 + 4) = make_float4(s8[4], s8[5], s8[6], s8[7]);
-          const __nv_bfloat162* n2 = reinterpret_cast<const __nv_bfloat162*>(&gnv[j]);
+          for (int i = 0; i < 8; ++i) s8[i] = fmaf(bx_[j][i], r, as_[j][i]);
+          *reinterpret_cast<float4*>(sout_r + c8) = make_float4(s8[0], s8[1], s8[2], s8[3]);
+          *reinterpret_cast<float4*>(sout_r + c8 + 4) = make_float4(s8[4], s8[5], s8[6], s8[7]);
+          const __nv_bfloat162* n2 = reinterpret_cast<const __nv_bfloat162*>(&gnv);
           uint4 hv;
           __nv_bfloat162* h2 = reinterpret_cast<__nv_bfloat162*>(&hv);
 #pragma unroll
@@ -13536,7 +13538,7 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
             const float2 nf = __bfloat1622float2(n2[q]);
             h2[q] = __floats2bfloat162_rn(s8[2 * q] * c * (1.f + nf.x), s8[2 * q + 1] * c * (1.f + nf.y));
           }
-          *reinterpret_cast<uint4*>(b_hout + c8) = hv;
+          *reinterpret_cast<uint4*>(hout_r + c8) = hv;
         }
       }
     }
@@ -13747,9 +13749,11 @@ void sk2f(at::Tensor Ws, at::Tensor Wsr, at::Tensor x, at::Tensor out, at::Tenso
 
 // sk2 launch whose last CTA also computes a residual/norm boundary of the decode layer (see the BT tail): M <= 8 only
 void sk2b(at::Tensor Ws, at::Tensor x, at::Tensor out, at::Tensor ptab, int64_t pmax, int64_t base4, int64_t M, int64_t N,
-          int64_t K, int64_t cfg, int64_t tokr, at::Tensor gate, at::Tensor sin_, at::Tensor gp,
+          int64_t K, int64_t cfg, int64_t tokr, at::Tensor alpha, at::Tensor beta, at::Tensor sin_, at::Tensor gp,
           at::Tensor gn, at::Tensor sout, at::Tensor hout, at::Tensor part, at::Tensor cnt, int64_t has_gp) {
   TORCH_CHECK(M >= 1 && M <= 8, "sk2b: M <= 8");
+  TORCH_CHECK(alpha.scalar_type() == at::kFloat && beta.scalar_type() == at::kFloat && alpha.numel() == 8192 && beta.numel() == 8192, "sk2b: alpha / beta fp32 [8192]");
+  TORCH_CHECK(sin_.scalar_type() == at::kFloat && sout.scalar_type() == at::kFloat && sin_.size(0) >= M && sout.size(0) >= M && hout.size(0) >= M, "sk2b: rows");
   @@SK2B_DISPATCH@@
   TORCH_CHECK(false, "sk2b: no config");
 }
@@ -14137,7 +14141,7 @@ void sk2f(torch::Tensor Ws, torch::Tensor Wsr, torch::Tensor x, torch::Tensor ou
           torch::Tensor part2, torch::Tensor dcnt, int64_t fuse_route, torch::Tensor ba, torch::Tensor bs, torch::Tensor b1a,
           torch::Tensor b1b, torch::Tensor b1g, torch::Tensor b1s, int64_t fuse_bnd1, torch::Tensor b1p, torch::Tensor b1c);
 void sk2b(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor ptab, int64_t pmax, int64_t base4, int64_t M,
-          int64_t N, int64_t K, int64_t cfg, int64_t tokr, torch::Tensor gate, torch::Tensor sin_,
+          int64_t N, int64_t K, int64_t cfg, int64_t tokr, torch::Tensor alpha, torch::Tensor beta, torch::Tensor sin_,
           torch::Tensor gp, torch::Tensor gn, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
           int64_t has_gp);
 void sk2_set_pdl(int64_t n);
@@ -15206,7 +15210,7 @@ def bfp__sk2_src(sm90):
                 'at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
                 'at::Tensor, at::Tensor, int64_t, at::Tensor, at::Tensor) { TORCH_CHECK(false, "sk2f needs sm_90"); }\n'
                 'void sk2b(at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, int64_t, int64_t, int64_t, '
-                'int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
+                'int64_t, int64_t, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, '
                 'at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2b needs sm_90"); }\n'
                 'void sk2_set_pdl(int64_t) {}')
     lines = []
@@ -15260,10 +15264,10 @@ def bfp__sk2_src(sm90):
         blines.append(f"if (cfg == {ci} && tokr == 8) {{ launch_sk2<1, 8, {NT}, {NWR}, {WSK}, {UPW}, {nstage}, true, false, "
                       f"{NACC}, 1, __nv_bfloat16, false, true>(Ws, x, out, ptab, pmax, base4, M, N, K, 0, nullptr, "
                       f"nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, "
-                      f"nullptr, nullptr, nullptr, nullptr, sin_.data_ptr<float>(), "
+                      f"nullptr, nullptr, alpha.data_ptr<float>(), beta.data_ptr<float>(), sin_.data_ptr<float>(), "
                       f"has_gp ? reinterpret_cast<const __nv_bfloat16*>(gp.data_ptr()) : nullptr, "
                       f"reinterpret_cast<const __nv_bfloat16*>(gn.data_ptr()), sout.data_ptr<float>(), "
-                      f"reinterpret_cast<__nv_bfloat16*>(hout.data_ptr()), nullptr, cnt.data_ptr<int>(), reinterpret_cast<const __nv_bfloat16*>(gate.data_ptr())); return; }}")
+                      f"reinterpret_cast<__nv_bfloat16*>(hout.data_ptr()), nullptr, cnt.data_ptr<int>(), nullptr); return; }}")
     return (bfp_SK2_SRC.replace("@@SK2_DISPATCH@@", "\n  ".join(lines))
             .replace("@@SK2F_DISPATCH@@", "\n  ".join(flines))
             .replace("@@SK2B_DISPATCH@@", "\n  ".join(blines)))
@@ -15453,14 +15457,14 @@ def bfp__run_sk2(x, layer, m, n, k, state, dg=0, dbg=None):
 
 def bfp_run_sk2_tail(x, layer, m, n, k, state, tail):
     """sk2 GEMM (o projection or the unpooler's 1024-row slice, m <= 8) whose last CTA also computes the decode
-    layer's residual/norm boundary: tail = (alpha fp32 [8192], beta fp32 [8192], sin fp32 [m, 8192] (the stream the
+    layer's residual/norm boundary (M <= 8 rows): tail = (alpha fp32 [8192], beta fp32 [8192], sin fp32 [m, 8192] (the stream the
     gate mixes), gp bf16 [N] or None (post-FFN norm weight applied to the GEMM output before its norm), gn bf16 [8192]
     (the norm weight applied to the output), sout fp32 [m, 8192], hout bf16 [m, 8192]). Returns the GEMM output."""
-    assert m == 1 and layer in ("o", "unpooler")
+    assert 1 <= m <= 8 and layer in ("o", "unpooler")
     name = bfp__sk2_name(layer, m)
     ci, stream, tab, pmax, b4, n_rows = state["sk2"][name]
-    gate, sin_, gp, gn, sout, hout = tail   # gate: the residual gate's bf16 weight [8192] (alpha / beta formed in-kernel)
-    assert gate.dtype == torch.bfloat16 and sin_.dtype == torch.float32 and gn.dtype == torch.bfloat16
+    alpha, beta, sin_, gp, gn, sout, hout = tail   # alpha / beta: the residual gate's coefficients, fp32 [8192] (prepare-time)
+    assert alpha.dtype == torch.float32 and beta.dtype == torch.float32 and sin_.dtype == torch.float32 and gn.dtype == torch.bfloat16
     key = "btail_" + layer
     if key not in state:
         state[key] = torch.zeros(1, dtype=torch.int32, device=x.device)   # grid ticket (never reset)
@@ -15468,7 +15472,7 @@ def bfp_run_sk2_tail(x, layer, m, n, k, state, tail):
     out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
     ext = bfp__get_ext()
     ext.sk2_set_pdl(bfp_SK2_PDL)
-    ext.sk2b(stream, x, out, tab, pmax, b4, m, n, k, ci, bfp__sk2_tokr(m), gate, sin_, gn if gp is None else gp, gn,
+    ext.sk2b(stream, x, out, tab, pmax, b4, m, n, k, ci, bfp__sk2_tokr(m), alpha, beta, sin_, gn if gp is None else gp, gn,
              sout, hout, state["dummy"], cnt, 0 if gp is None else 1)
     return out
 
@@ -16053,7 +16057,8 @@ def T_of(t):
     return int(t.shape[0])
 
 
-FUSE_BOUNDARY = os.environ.get("OKC_FUSE_BOUNDARY", "0") == "1"   # (GPU A/B hook; the judge sees the default)
+FUSE_BOUNDARY = os.environ.get("OKC_FUSE_BOUNDARY", "1") == "1"   # the tails are built and self-tested; each (T, layer) runs
+                                                                   # only when BTAIL_LOCK (or an ab_vm override) turns it on
                         # OFF: the v2 tails (every load in flight, one reduction, alpha/beta from the gate in-kernel) are
                         # exact but compute-bound on one CTA: o launch 8.8 -> 46.0 us, unpooler slice 7.2 -> 21.5
                         # (a15e0698, a3816fbb; the ticket flavor made no difference). T = 1: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
@@ -16109,7 +16114,7 @@ def _boundary_selftest(st):
     g = torch.Generator(device=dev).manual_seed(778)
     f32 = dict(device=dev, dtype=torch.float32)
     report = []
-    for T in (1,):   # the v2 tails hold the whole row in registers: one row
+    for T in (1, 8):   # the v3 tails loop over the rows of one CTA
         stream = torch.randn(T, HIDDEN, generator=g, device=dev)
         o_in = (torch.randn(T, 1024, generator=g, device=dev) * 0.1).to(torch.bfloat16)
         m = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
@@ -16117,10 +16122,10 @@ def _boundary_selftest(st):
             _bfp_pdl(T)
             s1a, ha = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
             P = globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, st["bfp"],
-                                              (st["gate1"], stream, None, st["g_preffn"], s1a, ha))
+                                              (st["ab1"][0], st["ab1"][1], stream, None, st["g_preffn"], s1a, ha))
             s2a, outa = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
             Pu = globals()["bfp_run_sk2_tail"](m, "unpooler", T, 1024, D_EXPERT, st["bfp"],
-                                               (st["gate2"], s1a, st["g_postffn"], st["g_next"], s2a, outa))
+                                               (st["ab2"][0], st["ab2"][1], s1a, st["g_postffn"], st["g_next"], s2a, outa))
             torch.cuda.synchronize()
         except Exception as ex:  # noqa: BLE001
             print(f"boundary tails T{T}: FAILED {repr(ex)[:300]}", flush=True)
@@ -16146,10 +16151,10 @@ def _boundary_selftest(st):
             _FLUSH_SINK = torch.zeros((), dtype=torch.float32, device=dev)
         t_o = _graph_time(lambda: _bfp_gemm(st, "o", o_in, T, HIDDEN, 1024), flush_, reps=9)
         t_ot = _graph_time(lambda: globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, st["bfp"],
-                                                                 (st["gate1"], stream, None, st["g_preffn"], s1a, ha)), flush_, reps=9)
+                                                                 (st["ab1"][0], st["ab1"][1], stream, None, st["g_preffn"], s1a, ha)), flush_, reps=9)
         t_u = _graph_time(lambda: _bfp_gemm(st, "un", m, T, 1024, D_EXPERT), flush_, reps=9)
         t_ut = _graph_time(lambda: globals()["bfp_run_sk2_tail"](m, "unpooler", T, 1024, D_EXPERT, st["bfp"],
-                                                                 (st["gate2"], s1a, st["g_postffn"], st["g_next"], s2a, outa)), flush_, reps=9)
+                                                                 (st["ab2"][0], st["ab2"][1], s1a, st["g_postffn"], st["g_next"], s2a, outa)), flush_, reps=9)
         del flush_
         print(f"boundary tails T{T}: o launch {t_o:.1f} -> with the tail {t_ot:.1f} us; unpooler slice {t_u:.1f} -> {t_ut:.1f} us", flush=True)
     print("boundary tails ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
@@ -16324,7 +16329,9 @@ def _gate_coeffs(g):
     return alpha.contiguous(), beta.contiguous()
 
 
-BTAIL_MAX_T = 1   # the v2 tails load the whole row into registers in one round: one row only
+BTAIL_MAX_T = 8   # the v3 tails loop over the rows (one CTA): T <= 8
+BTAIL_LOCK = {}   # T -> layers ("o" = boundary 1 in the o-projection sk2, "unpooler" = boundary 2 in the unpooler slice
+                  # sk2) whose boundary runs in the producer's last CTA; decided on the H200 (vm_ab/ab20)
 
 
 def _bfp_tail_ok(state, T, layer):
@@ -18190,25 +18197,9 @@ def _tune(st, log=False):
             if log:
                 msg.append("prform[" + " ".join(f"{p_}{'+bnd1' if f_ else ''}:{t:.0f}" for (p_, f_), t in btimes.items())
                            + f"]->{best_pr[0]}{'+bnd1' if best_pr[1] else ''}")
-        if T <= BTAIL_MAX_T and st.get("fuse_bnd_ok"):
-            # the boundary tails (unpooler slice -> boundary 2, o projection -> boundary 1), each vs its Triton launch,
-            # on the chain: none / unpooler / o / both
-            ttimes = {}
-            for combo in ((), ("unpooler",), ("o",), ("unpooler", "o")):
-                for l_ in ("unpooler", "o"):
-                    st.setdefault("btail_on", {})[(T, l_)] = l_ in combo
-                try:
-                    ttimes[combo] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
-                except Exception as ex:  # noqa: BLE001
-                    ttimes[combo] = 1e30
-                    if log:
-                        msg.append(f"btailX:{'+'.join(combo) or 'none'}:{repr(ex)[:80]}")
-            best_c = min(ttimes, key=lambda k_: ttimes[k_])
+        if T <= BTAIL_MAX_T and st.get("fuse_bnd_ok"):   # the boundary tails per (T, layer): locked, not timed
             for l_ in ("unpooler", "o"):
-                st["btail_on"][(T, l_)] = l_ in best_c
-            if log:
-                msg.append("btail[" + " ".join(f"{'+'.join(c_) or 'none'}:{t:.0f}" for c_, t in ttimes.items())
-                           + f"]->{'+'.join(best_c) or 'none'}")
+                st.setdefault("btail_on", {})[(T, l_)] = l_ in BTAIL_LOCK.get(T, ())
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -18560,7 +18551,7 @@ def _after_attention(data, state, o_in, gate, T):
         # _boundary1 launch
         _bfp_pdl(T)
         globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, state["bfp"],
-                         (state["gate1"], data["stream"], None, state["g_preffn"], s1, h))
+                         (state["ab1"][0], state["ab1"][1], data["stream"], None, state["g_preffn"], s1, h))
     else:
         if gate is None:
             P, S = dense(o_in, state["o"], T, state, "o")
@@ -18677,7 +18668,7 @@ def _after_attention(data, state, o_in, gate, T):
         # _boundary2 launch
         _bfp_pdl(T)
         globals()["bfp_run_sk2_tail"](m, "unpooler", T, nu, D_EXPERT, state["bfp"],
-                         (state["gate2"], s1, state["g_postffn"], state["g_next"], s2, out))
+                         (state["ab2"][0], state["ab2"][1], s1, state["g_postffn"], state["g_next"], s2, out))
         return out, s2, ids
     P, S = dense(m, wu, T, state, "un")
     if v2:

@@ -211,7 +211,8 @@ def T_of(t):
     return int(t.shape[0])
 
 
-FUSE_BOUNDARY = os.environ.get("OKC_FUSE_BOUNDARY", "0") == "1"   # (GPU A/B hook; the judge sees the default)
+FUSE_BOUNDARY = os.environ.get("OKC_FUSE_BOUNDARY", "1") == "1"   # the tails are built and self-tested; each (T, layer) runs
+                                                                   # only when BTAIL_LOCK (or an ab_vm override) turns it on
                         # OFF: the v2 tails (every load in flight, one reduction, alpha/beta from the gate in-kernel) are
                         # exact but compute-bound on one CTA: o launch 8.8 -> 46.0 us, unpooler slice 7.2 -> 21.5
                         # (a15e0698, a3816fbb; the ticket flavor made no difference). T = 1: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
@@ -267,7 +268,7 @@ def _boundary_selftest(st):
     g = torch.Generator(device=dev).manual_seed(778)
     f32 = dict(device=dev, dtype=torch.float32)
     report = []
-    for T in (1,):   # the v2 tails hold the whole row in registers: one row
+    for T in (1, 8):   # the v3 tails loop over the rows of one CTA
         stream = torch.randn(T, HIDDEN, generator=g, device=dev)
         o_in = (torch.randn(T, 1024, generator=g, device=dev) * 0.1).to(torch.bfloat16)
         m = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
@@ -275,10 +276,10 @@ def _boundary_selftest(st):
             _bfp_pdl(T)
             s1a, ha = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
             P = globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, st["bfp"],
-                                              (st["gate1"], stream, None, st["g_preffn"], s1a, ha))
+                                              (st["ab1"][0], st["ab1"][1], stream, None, st["g_preffn"], s1a, ha))
             s2a, outa = torch.empty((T, HIDDEN), **f32), torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
             Pu = globals()["bfp_run_sk2_tail"](m, "unpooler", T, 1024, D_EXPERT, st["bfp"],
-                                               (st["gate2"], s1a, st["g_postffn"], st["g_next"], s2a, outa))
+                                               (st["ab2"][0], st["ab2"][1], s1a, st["g_postffn"], st["g_next"], s2a, outa))
             torch.cuda.synchronize()
         except Exception as ex:  # noqa: BLE001
             print(f"boundary tails T{T}: FAILED {repr(ex)[:300]}", flush=True)
@@ -304,10 +305,10 @@ def _boundary_selftest(st):
             _FLUSH_SINK = torch.zeros((), dtype=torch.float32, device=dev)
         t_o = _graph_time(lambda: _bfp_gemm(st, "o", o_in, T, HIDDEN, 1024), flush_, reps=9)
         t_ot = _graph_time(lambda: globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, st["bfp"],
-                                                                 (st["gate1"], stream, None, st["g_preffn"], s1a, ha)), flush_, reps=9)
+                                                                 (st["ab1"][0], st["ab1"][1], stream, None, st["g_preffn"], s1a, ha)), flush_, reps=9)
         t_u = _graph_time(lambda: _bfp_gemm(st, "un", m, T, 1024, D_EXPERT), flush_, reps=9)
         t_ut = _graph_time(lambda: globals()["bfp_run_sk2_tail"](m, "unpooler", T, 1024, D_EXPERT, st["bfp"],
-                                                                 (st["gate2"], s1a, st["g_postffn"], st["g_next"], s2a, outa)), flush_, reps=9)
+                                                                 (st["ab2"][0], st["ab2"][1], s1a, st["g_postffn"], st["g_next"], s2a, outa)), flush_, reps=9)
         del flush_
         print(f"boundary tails T{T}: o launch {t_o:.1f} -> with the tail {t_ot:.1f} us; unpooler slice {t_u:.1f} -> {t_ut:.1f} us", flush=True)
     print("boundary tails ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
@@ -482,7 +483,9 @@ def _gate_coeffs(g):
     return alpha.contiguous(), beta.contiguous()
 
 
-BTAIL_MAX_T = 1   # the v2 tails load the whole row into registers in one round: one row only
+BTAIL_MAX_T = 8   # the v3 tails loop over the rows (one CTA): T <= 8
+BTAIL_LOCK = {}   # T -> layers ("o" = boundary 1 in the o-projection sk2, "unpooler" = boundary 2 in the unpooler slice
+                  # sk2) whose boundary runs in the producer's last CTA; decided on the H200 (vm_ab/ab20)
 
 
 def _bfp_tail_ok(state, T, layer):
@@ -2348,25 +2351,9 @@ def _tune(st, log=False):
             if log:
                 msg.append("prform[" + " ".join(f"{p_}{'+bnd1' if f_ else ''}:{t:.0f}" for (p_, f_), t in btimes.items())
                            + f"]->{best_pr[0]}{'+bnd1' if best_pr[1] else ''}")
-        if T <= BTAIL_MAX_T and st.get("fuse_bnd_ok"):
-            # the boundary tails (unpooler slice -> boundary 2, o projection -> boundary 1), each vs its Triton launch,
-            # on the chain: none / unpooler / o / both
-            ttimes = {}
-            for combo in ((), ("unpooler",), ("o",), ("unpooler", "o")):
-                for l_ in ("unpooler", "o"):
-                    st.setdefault("btail_on", {})[(T, l_)] = l_ in combo
-                try:
-                    ttimes[combo] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
-                except Exception as ex:  # noqa: BLE001
-                    ttimes[combo] = 1e30
-                    if log:
-                        msg.append(f"btailX:{'+'.join(combo) or 'none'}:{repr(ex)[:80]}")
-            best_c = min(ttimes, key=lambda k_: ttimes[k_])
+        if T <= BTAIL_MAX_T and st.get("fuse_bnd_ok"):   # the boundary tails per (T, layer): locked, not timed
             for l_ in ("unpooler", "o"):
-                st["btail_on"][(T, l_)] = l_ in best_c
-            if log:
-                msg.append("btail[" + " ".join(f"{'+'.join(c_) or 'none'}:{t:.0f}" for c_, t in ttimes.items())
-                           + f"]->{'+'.join(best_c) or 'none'}")
+                st.setdefault("btail_on", {})[(T, l_)] = l_ in BTAIL_LOCK.get(T, ())
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -2718,7 +2705,7 @@ def _after_attention(data, state, o_in, gate, T):
         # _boundary1 launch
         _bfp_pdl(T)
         globals()["bfp_run_sk2_tail"](o_in, "o", T, HIDDEN, 1024, state["bfp"],
-                         (state["gate1"], data["stream"], None, state["g_preffn"], s1, h))
+                         (state["ab1"][0], state["ab1"][1], data["stream"], None, state["g_preffn"], s1, h))
     else:
         if gate is None:
             P, S = dense(o_in, state["o"], T, state, "o")
@@ -2835,7 +2822,7 @@ def _after_attention(data, state, o_in, gate, T):
         # _boundary2 launch
         _bfp_pdl(T)
         globals()["bfp_run_sk2_tail"](m, "unpooler", T, nu, D_EXPERT, state["bfp"],
-                         (state["gate2"], s1, state["g_postffn"], state["g_next"], s2, out))
+                         (state["ab2"][0], state["ab2"][1], s1, state["g_postffn"], state["g_next"], s2, out))
         return out, s2, ids
     P, S = dense(m, wu, T, state, "un")
     if v2:
