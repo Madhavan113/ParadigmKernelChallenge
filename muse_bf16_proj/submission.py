@@ -2034,6 +2034,8 @@ void cgemv(torch::Tensor L, torch::Tensor C, torch::Tensor x, torch::Tensor etab
 void gqx(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t M, int64_t N, int64_t K, int64_t bn, int64_t nwg,
          int64_t cl, int64_t nstage);
 void rk(torch::Tensor Wc, torch::Tensor x, torch::Tensor out, int64_t S, torch::Tensor zc);
+void skx(torch::Tensor W, torch::Tensor Wt, torch::Tensor x, torch::Tensor out, torch::Tensor slab, torch::Tensor cnt,
+         int64_t M, int64_t N, int64_t K, int64_t bn, int64_t nstage, int64_t fix, int64_t tiled, int64_t diag, int64_t grid);
 """
 
 # (layer, mt) -> (splits, RG, WS); grid = (N / (16 RG), splits) ~ 128 CTAs
@@ -2684,6 +2686,346 @@ def _run_gqx(x, layer, m, n, k, state, idx=0):
     return out
 
 
+SKX_SRC = r"""
+// ============================================================================ skx (m 33..256): persistent stream-K
+// One CTA per SM (grid = SM count), BM = 128 weight rows x BN tokens: two consumer warpgroups (rows [0, 64) / [64, 128)
+// of the W tile, both multiplying the one x tile in shared memory, SS-wgmma m64nBNk16) + one producer warp feeding a
+// ring of TMA'd W [128 x 64 k] and x [BN x 64 k] tiles (128B swizzle).  Work = (row block, 64-k chunk) units in
+// row-block-major order, cut into gridDim.x equal contiguous ranges (static stream-K); a range spans at most two row
+// blocks (host: units per CTA <= chunks per row block).  Row block rb is covered by P = last - first + 1 CTAs whose
+// fp32 partials meet in global memory, in wgmma fragment order ([BN/8 token blocks][256 threads] float4):
+//   FIX 0: every CTA red.add.v4.f32's its fragments into the row block's slab and takes a ticket; the last arriver
+//          converts the slab to BF16, stores the output tile, re-zeroes the slab and resets the ticket (self-cleaning:
+//          slabs and tickets are zero between launches).
+//   FIX 1: every CTA stores its fragments into its own slab [(segment ? G : 0) + cta], counts itself in (monotonic
+//          counter, target = (old / P + 1) * P), waits for the row block's P CTAs (all co-resident: one CTA per SM) and
+//          reduces the slice of the tile proportional to its units (reads the P slabs), storing BF16.
+// A straddler exports its first segment right away (stores / reds, no fence) and fences once after its last segment,
+// so the second main loop never waits for the first segment's fixup.  TILED: W tiles pre-swizzled and contiguous
+// ([rb][chunk][128 x 128 B], one bulk copy per unit) instead of 2-D TMA boxes from the row-major matrix.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+__device__ __forceinline__ void bulk_g2s_ef(uint32_t dst, const void* src, uint32_t bytes, uint32_t bar) {
+  asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes.L2::cache_hint [%0], [%1], %2, [%3], %4;"
+               :: "r"(dst), "l"(src), "r"(bytes), "r"(bar), "l"(l2_pol_ef()) : "memory");
+}
+// fragment float4 (token block j, consumer thread tp) of row block rb -> the four BF16 outputs it holds
+__device__ __forceinline__ void skx_store4(__nv_bfloat16* __restrict__ out, int M, int N, int rb, int j, int tp, float4 v) {
+  const int wg = tp >> 7, w4 = (tp >> 5) & 3, lane = tp & 31, g = lane >> 2, t4 = lane & 3;
+  const int row = rb * 128 + wg * 64 + w4 * 16 + g, t0 = 8 * j + 2 * t4;
+  if (t0 < M) {
+    out[(size_t)t0 * N + row] = __float2bfloat16_rn(v.x);
+    out[(size_t)t0 * N + row + 8] = __float2bfloat16_rn(v.z);
+  }
+  if (t0 + 1 < M) {
+    out[(size_t)(t0 + 1) * N + row] = __float2bfloat16_rn(v.y);
+    out[(size_t)(t0 + 1) * N + row + 8] = __float2bfloat16_rn(v.w);
+  }
+}
+#endif
+
+// DIAG (measurement builds only, never self-tested, picked or routed): 1 = main loops only (no export, no tickets),
+// 2 = + the fragment export, 3 = + the release fence and tickets (no wait / reduce / epilogue); 4 = main loops without
+// wgmma (pure TMA streaming of W + x), 5 = W only (no x copies) without wgmma, 6 = W only with wgmma (stale x tile);
+// 7 = everything but the reduce (fix 1: wait only), 8 = the reduce without the output stores.
+template <int BN, int NSTAGE, int FIX, bool TILED, int DIAG>
+__global__ void __launch_bounds__(288, 1)
+skx_kernel(const __grid_constant__ CUtensorMap mapW, const __grid_constant__ CUtensorMap mapX,
+           const uint8_t* __restrict__ Wt, __nv_bfloat16* __restrict__ out, float4* __restrict__ slab,
+           int* __restrict__ cnt, int M, int N, int K) {
+#if __CUDA_ARCH__ >= 900
+  constexpr int BM = 128, NTH = 256;
+  constexpr int A_BYTES = BM * 128, B_BYTES = BN * 128, ST = A_BYTES + B_BYTES;
+  constexpr int NACC = BN / 2, NB = BN / 8, NF4 = NB * NTH;
+  constexpr bool NO_MMA = DIAG == 4 || DIAG == 5, NO_X = DIAG == 5 || DIAG == 6;
+  constexpr bool LOOP_ONLY = DIAG == 1 || DIAG == 4 || DIAG == 5 || DIAG == 6;
+  extern __shared__ __align__(1024) unsigned char smem_raw[];
+  const uint32_t sraw = (uint32_t)__cvta_generic_to_shared(smem_raw);
+  const uint32_t sbase = (sraw + 1023u) & ~1023u;
+  const uint32_t bars = sbase + NSTAGE * ST;
+  const uint32_t full0 = bars, empty0 = bars + 8 * NSTAGE;
+  int* s_tk = reinterpret_cast<int*>(smem_raw + (sbase - sraw) + NSTAGE * ST + 16 * NSTAGE);   // [2] tickets
+  const int tid = threadIdx.x, warp = tid >> 5, lane = tid & 31;
+  const int G = (int)gridDim.x, ci = (int)blockIdx.x;
+  const int C = K >> 6, RB = N / BM, U = RB * C;
+  const int u0 = (int)(((long long)ci * U) / G), u1 = (int)(((long long)(ci + 1) * U) / G);
+  const int nk = u1 - u0;
+  const int rb0 = u0 / C, nseg = (u1 - 1) / C - rb0 + 1;
+  const int xrows = min(M, BN);
+
+  auto issue = [&](int u, int slot) {   // one unit (W tile + x tile) into ring slot `slot`
+    mbar_expect_tx(full0 + 8 * slot, A_BYTES + (NO_X ? 0 : xrows * 128));
+    const int rb = u / C, c = u - rb * C;
+    if constexpr (TILED)
+      bulk_g2s_ef(sbase + slot * ST, Wt + (size_t)u * A_BYTES, A_BYTES, full0 + 8 * slot);
+    else
+      tma_load_2d_ef(sbase + slot * ST, &mapW, full0 + 8 * slot, c * 64, rb * BM);
+    if constexpr (!NO_X) tma_load_2d_el(sbase + slot * ST + A_BYTES, &mapX, full0 + 8 * slot, c * 64, 0);
+  };
+  if (tid == 0) {
+    for (int i = 0; i < NSTAGE; ++i) { mbar_init(full0 + 8 * i, 1); mbar_init(empty0 + 8 * i, 2); }
+    asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    if constexpr (!TILED) asm volatile("prefetch.tensormap [%0];" :: "l"(&mapW) : "memory");
+    asm volatile("prefetch.tensormap [%0];" :: "l"(&mapX) : "memory");
+    for (int i = 0; i < NSTAGE && i < nk; ++i) issue(u0 + i, i);
+  }
+  __syncthreads();
+
+  if (warp == 8) {   // producer: refills (busy wait: a sleeping producer refills late)
+    if (lane == 0) {
+      for (int i = NSTAGE; i < nk; ++i) {
+        const int slot = i % NSTAGE;
+        mbar_wait(empty0 + 8 * slot, ((i / NSTAGE) - 1) & 1);
+        issue(u0 + i, slot);
+      }
+    }
+    return;
+  }
+
+  const int wg = warp >> 2, t = tid & 127;
+  float acc[NACC];
+  int it = 0, pending = -1;
+  for (int s = 0; s < nseg; ++s) {
+    const int rb = rb0 + s;
+    const int ua = s == 0 ? u0 : rb * C, ub = s == nseg - 1 ? u1 : (rb + 1) * C;
+#pragma unroll
+    for (int q = 0; q < NACC; ++q) acc[q] = 0.f;
+    for (int u = ua; u < ub; ++u, ++it) {
+      const int slot = it % NSTAGE;
+      mbar_wait(full0 + 8 * slot, (it / NSTAGE) & 1);
+      const uint32_t a_st = sbase + slot * ST + wg * (64 * 128);
+      const uint32_t b_st = sbase + slot * ST + A_BYTES;
+      if constexpr (!NO_MMA) {
+#pragma unroll
+        for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
+        wg_fence();
+#pragma unroll
+        for (int j = 0; j < 4; ++j) wgmma_ss<BN>(acc, make_desc_sw128(a_st + j * 32), make_desc_sw128(b_st + j * 32));
+        wg_commit();
+        wg_wait<1>();   // the previous unit's group is done: hand its slot back
+#pragma unroll
+        for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
+      }
+      if (pending >= 0 && t == 0) mbar_arrive(empty0 + 8 * pending);
+      pending = slot;
+    }
+    if constexpr (!NO_MMA) {
+      wg_wait<0>();
+#pragma unroll
+      for (int q = 0; q < NACC; ++q) asm volatile("" : "+f"(acc[q]) :: "memory");
+    }
+    if (t == 0) mbar_arrive(empty0 + 8 * pending);
+    pending = -1;
+    if constexpr (LOOP_ONLY) {   // keep the wgmma chain alive (ptxas drops accumulators nobody reads: 24 registers)
+      if (!NO_MMA && acc[0] == 12345.678f && acc[NACC - 1] == -12345.678f) out[tid] = __float2bfloat16_rn(acc[1]);
+      continue;
+    }
+    // export this segment's fragments (no fence yet: a straddler goes straight on to its second segment)
+    float4* sl = slab + (size_t)(FIX == 0 ? rb : (s ? G : 0) + ci) * NF4 + tid;
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+      if constexpr (FIX == 0)
+        asm volatile("red.relaxed.gpu.global.add.v4.f32 [%0], {%1, %2, %3, %4};"
+                     :: "l"(sl + j * NTH), "f"(acc[4 * j]), "f"(acc[4 * j + 1]), "f"(acc[4 * j + 2]), "f"(acc[4 * j + 3])
+                     : "memory");
+      else
+        __stcg(sl + j * NTH, make_float4(acc[4 * j], acc[4 * j + 1], acc[4 * j + 2], acc[4 * j + 3]));
+    }
+  }
+  if constexpr (LOOP_ONLY || DIAG == 2) return;
+  // every consumer thread's exports precede the tickets: CTA barrier, then one thread releases at gpu scope
+  // (fence.acq_rel.gpu is cumulative over what the barrier made visible; a per-thread __threadfence = fence.sc.gpu
+  // costs microseconds), takes the tickets and acquires
+  named_bar(1, NTH);
+  if (tid == 0) {
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+    for (int s = 0; s < nseg; ++s) s_tk[s] = atomicAdd(cnt + rb0 + s, 1);
+    asm volatile("fence.acq_rel.gpu;" ::: "memory");
+  }
+  named_bar(1, NTH);
+  if constexpr (DIAG == 3) return;
+  for (int s = 0; s < nseg; ++s) {
+    const int rb = rb0 + s;
+    const int fc = (int)(((long long)(rb * C + 1) * G - 1) / U);            // first CTA touching rb
+    const int lc = (int)(((long long)(rb * C + C) * G - 1) / U);            // last CTA touching rb
+    const int P = lc - fc + 1;
+    if constexpr (FIX == 0) {
+      if (s_tk[s] != P - 1) continue;   // not the last arriver of this row block
+      const float4* src = slab + (size_t)rb * NF4 + tid;
+#pragma unroll 4
+      for (int j = 0; j < NB; ++j) skx_store4(out, M, N, rb, j, tid, __ldcg(src + j * NTH));
+#pragma unroll 4
+      for (int j = 0; j < NB; ++j) __stcg(slab + (size_t)rb * NF4 + tid + j * NTH, make_float4(0.f, 0.f, 0.f, 0.f));
+      if (tid == 0) asm volatile("st.relaxed.gpu.global.s32 [%0], %1;" :: "l"(cnt + rb), "r"(0) : "memory");
+    } else {
+      const int target = (s_tk[s] / P + 1) * P;
+      if (tid == 0) {
+        unsigned long long t0, t1;
+        asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t0));
+        for (;;) {
+          int v;
+          asm volatile("ld.acquire.gpu.global.s32 %0, [%1];" : "=r"(v) : "l"(cnt + rb) : "memory");
+          if (v - target >= 0) break;
+          asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t1));
+          if (t1 - t0 > 2000000000ull) __trap();   // 2 s: a peer that never arrives is a bug (non-resident CTA)
+          __nanosleep(64);
+        }
+      }
+      named_bar(1, NTH);
+      if constexpr (DIAG == 7) continue;   // wait only
+      const int ua = s == 0 ? u0 : rb * C, ub = s == nseg - 1 ? u1 : (rb + 1) * C;
+      const int lo = (int)(((long long)(ua - rb * C) * NF4) / C), hi = (int)(((long long)(ub - rb * C) * NF4) / C);
+      float4 keep = make_float4(0.f, 0.f, 0.f, 0.f);
+      for (int idx = lo + tid; idx < hi; idx += NTH) {
+        float4 v = make_float4(0.f, 0.f, 0.f, 0.f);
+        int ip = fc;
+        for (; ip + 2 <= lc + 1; ip += 2) {
+          const int sa = ((int)(((long long)ip * U) / G) / C == rb) ? 0 : G;
+          const int sb = ((int)(((long long)(ip + 1) * U) / G) / C == rb) ? 0 : G;
+          const float4 a = __ldcg(slab + (size_t)(sa + ip) * NF4 + idx);
+          const float4 b = __ldcg(slab + (size_t)(sb + ip + 1) * NF4 + idx);
+          v.x += a.x + b.x; v.y += a.y + b.y; v.z += a.z + b.z; v.w += a.w + b.w;
+        }
+        if (ip <= lc) {
+          const int sa = ((int)(((long long)ip * U) / G) / C == rb) ? 0 : G;
+          const float4 a = __ldcg(slab + (size_t)(sa + ip) * NF4 + idx);
+          v.x += a.x; v.y += a.y; v.z += a.z; v.w += a.w;
+        }
+        if constexpr (DIAG == 8) { keep.x += v.x; keep.y += v.y; keep.z += v.z; keep.w += v.w; }
+        else skx_store4(out, M, N, rb, idx / NTH, idx % NTH, v);
+      }
+      if constexpr (DIAG == 8) {   // reduce without output stores: keep the loads alive
+        if (keep.x == 12345.678f && keep.y == -12345.678f && keep.z == 1.f && keep.w == -1.f) out[tid] = __float2bfloat16_rn(keep.x);
+      }
+    }
+  }
+#endif
+}
+
+template <int BN, int NSTAGE, int FIX, bool TILED, int DIAG>
+static void launch_skx(const at::Tensor& W, const at::Tensor& Wt, const at::Tensor& x, at::Tensor& out, at::Tensor& slab,
+                       at::Tensor& cnt, int M, int N, int K, int grid) {
+  constexpr int ST = 128 * 128 + BN * 128;
+  constexpr int NF4 = (BN / 8) * 256;
+  const size_t smem = 1024 + (size_t)NSTAGE * ST + 16 * NSTAGE + 16;
+  auto kern = skx_kernel<BN, NSTAGE, FIX, TILED, DIAG>;
+  TORCH_CHECK(N % 128 == 0 && K % 64 == 0 && M >= 1 && M <= BN, "skx: shape");
+  const int C = K / 64, RB = N / 128, U = RB * C;
+  TORCH_CHECK(U >= grid && (U + grid - 1) / grid <= C, "skx: schedule (units per CTA must not exceed a row block)");
+  TORCH_CHECK(cnt.numel() >= RB, "skx: counters");
+  TORCH_CHECK((FIX == 0 ? (int64_t)RB : (int64_t)2 * grid) * NF4 * 4 <= slab.numel(), "skx: slab workspace");
+  if (TILED) TORCH_CHECK(Wt.numel() * (int64_t)Wt.element_size() >= (int64_t)N * K * 2, "skx: tiled weights");
+  static bool attr_done = false;
+  if (!attr_done) {
+    C10_CUDA_CHECK(cudaFuncSetAttribute(kern, cudaFuncAttributeMaxDynamicSharedMemorySize, (int)smem));
+    int nb = 0;
+    cudaOccupancyMaxActiveBlocksPerMultiprocessor(&nb, kern, 288, smem);
+    cudaGetLastError();
+    fprintf(stderr, "[okc] skx<bn %d, ns %d, fix %d, tiled %d, diag %d>: smem %d, CTAs/SM %d, grid %d\n", BN, NSTAGE, FIX,
+            (int)TILED, DIAG, (int)smem, nb, grid);
+    TORCH_CHECK(nb >= 1, "skx: the CTA does not fit an SM");
+    attr_done = true;
+  }
+  CUtensorMap mW = make_map_2d(W.data_ptr(), (uint64_t)N, (uint64_t)K, 128);
+  CUtensorMap mX = make_map_2d(x.data_ptr(), (uint64_t)M, (uint64_t)K, (uint32_t)(M < BN ? M : BN));
+  kern<<<grid, 288, smem, at::cuda::getCurrentCUDAStream()>>>(
+      mW, mX, reinterpret_cast<const uint8_t*>(Wt.data_ptr()), reinterpret_cast<__nv_bfloat16*>(out.data_ptr()),
+      reinterpret_cast<float4*>(slab.data_ptr<float>()), cnt.data_ptr<int>(), M, N, K);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void skx(at::Tensor W, at::Tensor Wt, at::Tensor x, at::Tensor out, at::Tensor slab, at::Tensor cnt, int64_t M, int64_t N,
+         int64_t K, int64_t bn, int64_t nstage, int64_t fix, int64_t tiled, int64_t diag, int64_t grid) {
+  @@SKX_DISPATCH@@
+  TORCH_CHECK(false, "skx: no config");
+}
+"""
+
+# (layer, bn) -> [(nstage, fix, tiled, diag), ...]: persistent stream-K candidates (grid = SM count, 1 CTA per SM, BM = 128);
+# fix 0 = red.add slabs + last-arriver epilogue (self-cleaning), fix 1 = per-CTA slabs + co-resident distributed reduce;
+# tiled 1 = W from the pre-swizzled contiguous copy (one bulk copy per unit); diag > 0 = deliberately incomplete
+# measurement build (timed by the autotuner, never self-tested, picked or routed).  Every entry is a candidate.
+# Check 1 (e79f1d99, m=128 bench us): qkv fix1/fix0/tiled 28.3/31.1/28.1/30.7 vs gqx 18.0; o 25.0/25.8/24.6/25.4 vs
+# torchT 10.5; pooler 36.2/37.6/35.8/37.7 vs gq 25.0; unpooler 37.8/37.8/37.1/37.4 vs torchT 22.5; m=256 (4,1,0) 38-54
+# vs 23-31: ~0.5 us per unit (ingest-bound as modeled) but ~18 us of fixup overhead (per-thread fence.sc.gpu + ticket).
+# Check 2 (bcdae43f, m=128 bench us; D1 loop / D2 +export / D3 +fence+tickets / full fix1 / full fix0 vs pick): qkv
+# 16.7 / 18.08 / 19.33 / 27.84 / 30.62 vs gqx 18.08; o 10.4 / 13.06 / 14.3 / 24.64 / 25.28 vs torchT 10.43; pooler
+# 23.62 / 25.25 / 26.53 / 35.78 / 37.22 vs gq 25.22; unpooler 22.82 / 24.93 / 26.37 / 37.34 / 37.41 vs torchT 22.72.
+# The main loop alone only ties / -1.5 us the picks (0.58 us per unit: W at ~3.4 TB/s, ~48% tensor utilization) and
+# the tail (wait + reduce or last-arriver epilogue) costs ~10 us on every layer. Round 3 = attribution only.
+# Check 3 (0aad5144, m=128 bench us; loop / loop tiled / W+x stream only / W stream only / W + wgmma / full minus
+# reduce / reduce without stores vs pick): qkv 16.9 / 16.5 / 15.8 / 14.7 / 15.6 / 21.1 / 27.9 vs gqx 18.1; o 10.5 /
+# 10.4 / 9.9 / 9.7 / 10.5 / 16.0 / 24.0 vs torchT 10.7; pooler 23.9 / 23.4 / 22.8 / 21.3 / 22.3 / 28.1 / 35.7 vs gq
+# 25.4; unpooler 23.3 / 22.8 / 22.1 / 21.6 / 22.6 / 27.9 / 36.7 vs torchT 23.0. Streaming W alone costs 11.2 us at
+# qkv (~4.1 TB/s steady state + ~2 us ramp/drain), x ~1 us, wgmma ~1 us exposed; the wait ~1.6 us; the reduce's loads
+# 7-9 us (latency chain, fixable) - but export + tickets + wait alone exceed the main loop's 1.2-1.6 us margin over
+# the picks, so no stream-K fixup wins at m=128 on this GPU; at m=256 the doubled compute per unit ties cuBLAS before
+# any fixup. Route dormant (empty table keeps the kernel, model and gates; the build carries only the stub).
+SKX_CONFIGS = {
+    # ("qkv_gate", 128): [(6, 1, 0, 0)],   # (nstage, fix, tiled, diag); see notes/skx_streamk.md for every judged row
+}
+USE_SKX = True
+
+
+def _skx_diag(layer, m, ch):
+    """True for a diagnostic (incomplete) skx candidate: timed, never self-tested, picked or routed."""
+    return ch[0] == "skx" and SKX_CONFIGS[(layer, _skx_bn(m))][ch[1] if len(ch) > 1 else 0][3] > 0
+
+
+def _skx_src(sm90):
+    if not sm90 or not SKX_CONFIGS:
+        return ('void skx(at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, at::Tensor, int64_t, int64_t, '
+                'int64_t, int64_t, int64_t, int64_t, int64_t, int64_t, int64_t) { TORCH_CHECK(false, "skx needs sm_90"); }')
+    lines = []
+    for (layer, bn), cfgs in sorted(SKX_CONFIGS.items()):
+        for ns, fix, tiled, diag in cfgs:
+            lines.append(f"if (bn == {bn} && nstage == {ns} && fix == {fix} && tiled == {tiled} && diag == {diag}) "
+                         f"{{ launch_skx<{bn}, {ns}, {fix}, {str(bool(tiled)).lower()}, {diag}>(W, Wt, x, out, slab, cnt, M, N, K, (int)grid); return; }}")
+    return SKX_SRC.replace("@@SKX_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
+
+
+def _skx_bn(m):
+    return 128 if m <= 128 else 256
+
+
+def skx_prepare(weights, state):
+    """Workspaces of the skx route: the fix-0 slabs (zero between launches), the fix-1 slabs (2 per CTA), the tickets
+    (per layer and fix mode) and the pre-swizzled W copies of the tiled configs."""
+    if not (USE_SKX and state["sm90"] and SKX_CONFIGS):
+        return
+    dev = weights["o"].device
+    nsm = state["nsm"]
+    cfgs = [(layer, bn, ns, fix, tiled) for (layer, bn), lst in SKX_CONFIGS.items() for (ns, fix, tiled, diag) in lst
+            if layer in state["raw"]]
+    if not cfgs:
+        return
+    sk = {"cnt": {}, "tiled": {}}
+    f0 = max([32 * bn for (_, bn, _, fix, _) in cfgs if fix == 0], default=0)   # float4s per row-block tile
+    f1 = max([32 * bn for (_, bn, _, fix, _) in cfgs if fix == 1], default=0)
+    rbmax = max(w_rows[layer] // 128 for (layer, _, _, _, _) in cfgs)
+    if f0:
+        sk["slab0"] = torch.zeros(rbmax * f0 * 4, dtype=torch.float32, device=dev)
+    if f1:
+        sk["slab1"] = torch.empty(2 * nsm * f1 * 4, dtype=torch.float32, device=dev)
+    for (layer, bn, ns, fix, tiled) in cfgs:
+        if (layer, fix) not in sk["cnt"]:
+            sk["cnt"][(layer, fix)] = torch.zeros(64, dtype=torch.int32, device=dev)
+        if tiled and layer not in sk["tiled"]:
+            sk["tiled"][layer] = swizzle_tiles(state["raw"][layer], 128).view(torch.uint8).reshape(-1)
+    state["skx"] = sk
+    print(f"[okc] skx configs (nstage, fix, tiled, diag): {SKX_CONFIGS}", file=sys.stderr)
+
+
+def _run_skx(x, layer, m, n, k, state, idx=0):
+    ns, fix, tiled, diag = SKX_CONFIGS[(layer, _skx_bn(m))][idx]
+    sk = state["skx"]
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    w = state["raw"][layer]
+    wt = sk["tiled"][layer] if tiled else w
+    _get_ext().skx(w, wt, x, out, sk["slab0" if fix == 0 else "slab1"], sk["cnt"][(layer, fix)], m, n, k, _skx_bn(m),
+                   ns, fix, tiled, diag, state["nsm"])
+    return out
+
+
 
 RGEMV_SRC = r"""
 // ============================================================================ router GEMV (m = 1): FP32 weights
@@ -3220,13 +3562,13 @@ def _get_ext():
         common = CUDA_SRC.replace("@@MBAR@@", MBAR_HELPERS).replace("@@BODY@@", WG_HELPERS if sm90 else "")
         defs = wgmma_defs([8, 16, 32, 64, 128]) if sm90 else ""
         cuda_src = (common + defs + _tma_srcs(sm90) + MAP_SRC + _gemm_src(sm90) + _wide_src(sm90) + _sk2_src(sm90)
-                    + _gq_src(sm90) + _gqx_src(sm90) + _rgemv_src() + _rk_src(sm90))
+                    + _gq_src(sm90) + _gqx_src(sm90) + _skx_src(sm90) + _rgemv_src() + _rk_src(sm90))
         _ext = load_inline(
-            name=f"okc_bf16proj_v142_{arch}" + (f"_dly{_SK2_DELAY}" if _SK2_DELAY else ""),
+            name=f"okc_bf16proj_v143_{arch}" + (f"_dly{_SK2_DELAY}" if _SK2_DELAY else ""),
             cpp_sources="#include <torch/extension.h>\n" + CPP_SRC,
             cuda_sources=cuda_src,
             functions=["skinny_tma_a", "gemm90", "wide", "sk2", "gq", "gqx", "rgemv", "sgemv", "cgemv", "rk", "sk2f",
-                       "sk2_set_pdl"],
+                       "sk2_set_pdl", "skx"],
             extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}"] + ([f"-DSK2_DELAY_ESC={_SK2_DELAY}"] if _SK2_DELAY else []),
             no_implicit_headers=True,
             verbose=False,
@@ -4126,6 +4468,7 @@ def prepare(weights):
     state["nsm"] = torch.cuda.get_device_properties(dev).multi_processor_count   # rk: one resident CTA per SM
     state["old_paths"] = old_paths
     sk2_prepare(weights, state)
+    skx_prepare(weights, state)
     if GEMM_DIAG and state["sm90"]:
         state["wtile"], state["diag_cnt"] = {}, {}
         for layer in DIAG_LAYERS:
@@ -4191,6 +4534,8 @@ def _cand_key(layer, m, ch):
         return ("skinny_alt", layer, m)
     if ch[0] == "gqx":
         return (layer, "gqx", _gqx_bn(m), ch[1])
+    if ch[0] == "skx":
+        return (layer, "skx", _skx_bn(m), ch[1])
     if ch[0] == "cgemv" and len(ch) > 1:
         return (layer, "cgemv", ch[1])
     if ch[0] == "sk2" and len(ch) > 1:
@@ -4214,7 +4559,7 @@ def _selftest(weights, state):
                 ref = ref.to(torch.bfloat16).double()
             tol = 2e-5 if layer == "router" else 5e-3
             for ch in _candidates(layer, m, state):
-                if ch[0] == "torch":
+                if ch[0] == "torch" or _skx_diag(layer, m, ch):
                     continue
                 key = _cand_key(layer, m, ch)
                 try:
@@ -4313,6 +4658,8 @@ def _run(choice, x, layer, m, n, k, state):
         return _run_gq(x, layer, m, n, k, state)
     if kind == "gqx":
         return _run_gqx(x, layer, m, n, k, state, choice[1] if len(choice) > 1 else 0)
+    if kind == "skx":   # m 33..256: persistent stream-K wgmma GEMM (see SKX_SRC)
+        return _run_skx(x, layer, m, n, k, state, choice[1] if len(choice) > 1 else 0)
     if kind == "cgemv":   # m = 1: 12-bit compressed GEMV (qkv, o, unpooler slice, pooler)
         rows, nth = choice[1] if len(choice) > 1 else CG_CONFIGS[layer]
         cg = state["cg"][(layer, rows)]
@@ -4390,6 +4737,10 @@ def _candidates(layer, m, state):
         for i in range(len(GQX_CONFIGS.get((layer, _gqx_bn(m)), ()))):
             if _cand_key(layer, m, ("gqx", i)) not in state["disabled"]:
                 c.insert(0, ("gqx", i))
+    if USE_SKX and state["sm90"] and 32 < m <= 256 and layer != "router" and "skx" in state:
+        for i in range(len(SKX_CONFIGS.get((layer, _skx_bn(m)), ()))):
+            if _cand_key(layer, m, ("skx", i)) not in state["disabled"]:
+                c.insert(0, ("skx", i))
     if layer == "router" and m == 1 and "router_f32" in state:
         c.insert(0, ("rgemv",))
     if (USE_RK and layer == "router" and 32 < m <= 256 and state["sm90"] and "rk_zc" in state and state.get("nsm", 0) >= 16
@@ -4460,11 +4811,12 @@ def _autotune(weights, state):
             for i, e0, e1 in evs:
                 per[i].append(e0.elapsed_time(e1))
             med = [sorted(v)[len(v) // 2] for v in per]
-            best = min(range(len(cands)), key=lambda i: med[i])
+            real = [i for i in range(len(cands)) if not _skx_diag(layer, m, cands[i])]   # diagnostic builds: timed only
+            best = min(real, key=lambda i: med[i])
             state["choice"][(layer, m)] = cands[best]
             # CUTLASS is tuned for the scored m only (its partial token tiles are slow: m=129 +14 us, m=200 +4 us vs
             # cuBLAS): other m of the bucket take the best other candidate
-            alt = [i for i in range(len(cands)) if cands[i][0] != "cutlass"]
+            alt = [i for i in real if cands[i][0] != "cutlass"]
             if alt:
                 state.setdefault("choice_alt", {})[(layer, m)] = cands[min(alt, key=lambda i: med[i])]
             state.setdefault("tune_log", []).append((layer, m, [(c[0], round(1000 * v, 2)) for c, v in zip(cands, med)]))
@@ -4485,6 +4837,8 @@ def _cand_name(c):
         return c[0] + "/" + "x".join(map(str, c[1]))
     if c[0] == "gqx" and len(c) > 1:
         return f"gqx[{c[1]}]"
+    if c[0] == "skx" and len(c) > 1:
+        return f"skx[{c[1]}]"
     if c[0] == "sk2" and len(c) > 1:
         return f"sk2/{c[1]}"
     if c[0] == "cgemv" and len(c) > 1:
@@ -4513,6 +4867,8 @@ def _nearby_choice(layer, m, state):
     if ch[0] == "gq" and (layer, _gq_bn(m)) not in GQ_CONFIGS:
         return None
     if ch[0] == "gqx" and (layer, _gqx_bn(m)) not in GQX_CONFIGS:
+        return None
+    if ch[0] == "skx" and (layer, _skx_bn(m)) not in SKX_CONFIGS:
         return None
     return ch
 
