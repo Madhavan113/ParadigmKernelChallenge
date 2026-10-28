@@ -338,3 +338,8 @@ o16t_r68 by 0.2-1.3, unpooler32_r144 beats unpooler16h_r100 by 0.4-1.3 (ab7 test
 at 16 (revert confirmed), +4.4 at 32; pooler8h_r72 outside tokr 8 +3-4; qkv8t_r144 at 32 +2.7; qkv configs otherwise
 ties within 0.7. Separate pooler at T=8 with the 'pooler' config trails the fused launch by only 0.5-0.7 (pooler8h_r72:
 +2.8), moot while the fused form is locked there.
+
+ab3 (attention build flags, one prepare per flag set and seed, unpaired: floor ~1.5 us): PDLKV=1 loses 1-2.3 us on
+the decode shapes (d1s +1.6/+1.0, d16s +1.3/+2.3, d32s +2.3/+1.5); QDIRECT=0 / PK2=0 / W0ENABLE=1 mixed within the
+floor (all three show v1f -1.2..-1.4 = the default run's draw; v16f/v32f +1.3..+4.3 under PK2=0 and W0ENABLE=1).
+Defaults stay.
