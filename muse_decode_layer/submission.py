@@ -12805,11 +12805,14 @@ sk2_kernel(const __grid_constant__ CUtensorMap xmap, const uint8_t* __restrict__
       __shared__ int s_blast;
       __shared__ float s_bred4[16][4];
       named_bar(1, NC);
-      if (tid == 0) {   // release this CTA's output rows; the last arriver acquires every CTA's
-        int old;
-        asm volatile("atom.add.release.gpu.global.s32 %0, [%1], 1;" : "=r"(old) : "l"(b_cnt) : "memory");
+      if (tid == 0) {
+        // the classic threadfence-reduction ticket: fence, then a RELAXED atomic (a15e0698: the .release-flavored
+        // atomic cost ~0.1 us per CTA serialized -- o launch 9.0 -> 49.2 us with 256 CTAs, unpooler slice 7.5 -> 21.6
+        // with 128 -- while the tail body itself is a single CTA's work); the last arriver fences again before reading
+        __threadfence();
+        const int old = atomicAdd(b_cnt, 1);
         s_blast = (old % (int)gridDim.x) == (int)gridDim.x - 1;   // the counter only ever grows by gridDim.x per launch
-        if (s_blast) asm volatile("fence.acq_rel.gpu;" ::: "memory");
+        if (s_blast) __threadfence();
       }
       named_bar(1, NC);
       if (!s_blast) return;
