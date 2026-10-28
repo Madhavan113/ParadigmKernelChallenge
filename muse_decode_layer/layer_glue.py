@@ -211,8 +211,12 @@ def T_of(t):
     return int(t.shape[0])
 
 
-FUSE_BOUNDARY = os.environ.get("OKC_FUSE_BOUNDARY", "1") == "1"   # the tails are built and self-tested; each (T, layer) runs
-                                                                   # only when BTAIL_LOCK (or an ab_vm override) turns it on
+FUSE_BOUNDARY = os.environ.get("OKC_FUSE_BOUNDARY", "0") == "1"   # OFF (vm_ab/ab20, tail v3 with the v4 math: still a
+                                                                   # one-CTA memory pipeline of ~130 KB per token that cannot
+                                                                   # start before the producer's last row - isolated o launch
+                                                                   # 8.0 -> 18.8 us, unpooler slice 6.9 -> 12.9 at T=1; chain
+                                                                   # +2.6..+11.8 us at T=1, +26..+76 at T=8; the separate v4
+                                                                   # glue kernel hides 100 KB of those loads under PDL)
                         # OFF: the v2 tails (every load in flight, one reduction, alpha/beta from the gate in-kernel) are
                         # exact but compute-bound on one CTA: o launch 8.8 -> 46.0 us, unpooler slice 7.2 -> 21.5
                         # (a15e0698, a3816fbb; the ticket flavor made no difference). T = 1: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2

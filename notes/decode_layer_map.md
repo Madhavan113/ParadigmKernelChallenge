@@ -471,3 +471,15 @@ flat 252 x4 +1.1, clusters +6.1 / +7.5. The module's plans are the chain's best 
 trip is the page-table walk + first tile; more splits add partials to merge and the finalize grows with them;
 clusters pay DSMEM on top). Closed; a faster B=16/32 sliding attention needs kernel work (prefetch before the wait,
 two requests per CTA), not a plan.
+
+Boundary folds with the v4 math (tail v3 in the sk2 kernel's last-arriving CTA: alpha / beta precomputed, one fused
+four-sum reduction, two passes with as / bx in registers, M <= 8 rows; ab20, check ALL OK, rel errors ~6e-8): isolated
+at T=1 the o launch 8.0 -> 18.8 us with the tail, the unpooler slice 6.9 -> 12.9; at T=8 8.2 -> 58.0 and 6.9 -> 41.0.
+On the chain (paired, seeds 0-2): T=1 unpooler fold +2.6/+3.2 (d1s/d1f), o fold +8.7/+8.7, both +11.5/+11.8; T=8
++26/+26, +48/+50, +74/+76. Mechanism: the tail is a one-CTA memory pipeline - ~130 KB of fresh loads per token
+(stream or s1 32 KB, alpha 32, beta 32, gn 16, gp, the row) that cannot start before the producer's last row exists,
+on 128 (o) / 256 (unpooler) threads with ~16-32 KB in flight, i.e. 20-50 GB/s effective -> 3-6 us per row; the
+arithmetic (~12 instr/element) is not the cost any more. The separate v4 glue kernel loads the same 100 KB of weights
+and stream in its PDL prologue under the producer and exposes only the 16 KB row read; prefetching the tail's inputs
+into L2 from every CTA would still leave one CTA's in-flight capacity against ~130 KB (~2.6 us at L2 latency), not
+below the v4 kernel's ~1.5 us post-wait work. Closed after one variant; FUSE_BOUNDARY back to off (code kept).
