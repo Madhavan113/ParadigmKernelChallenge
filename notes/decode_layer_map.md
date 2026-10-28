@@ -381,3 +381,21 @@ pooler+router wrote them: garbage on the first replay (fresh pool memory), the p
 afterwards ("correct"), never in eager mode (launch gaps) or with PDL off. glue_diag.py (per kernel kind and PDL
 placement mode) showed: wait-before-any-load fixes it, moving the trigger does not. Rule: a PDL dependent must read
 anything the preceding grid writes after the wait through __ldcg / plain loads, never via const __restrict__ / __ldg.
+
+v3 measured (ab8/ab9, paired, seeds 0-2): SLOWER than Triton by 0.3-2.5 us at T <= 32 and 10-19 us at T = 128/256.
+ncu (glue2): bnd 5.6 us (8 CTAs, 436 instr/warp, No-Eligible 87%: the ticket barrier ~2 us + ~80 instr/element of
+gate math), route 7.5 us (850 instr/warp: 8 serial argmax rounds); at T >= 128 the 8-CTA token groups ran in waves
+with a barrier each. v4 (84f5158 + c057d0c): boundaries = one 512-thread CTA per token, 16 coalesced columns per
+thread, alpha/beta precomputed (st["ab1"/"ab2"], ~12 instr/element), the four sums in one block reduction, no
+inter-CTA traffic (64-94 registers); routing = one 1024-thread CTA, top-8 by rank with 64-bit (ordered score,
+255 - e) keys (4 threads per expert), norm fused (32 registers). The self-test caught a missing (1 + g) in the
+routing's norm (xm rel-L2 1.0) and kept the glue off until fixed.
+
+v4 vs Triton (ab10, Triton minus CUDA, us, s0/s1/s2): d1s +4.1/+2.4/+2.5, d1f +3.5/+2.6/+3.3, d16s +1.6/+1.8/+1.8,
+d16f +1.7/+1.6/+2.0, d32s +2.1/+1.9/+1.6, d32f +3.0/+2.3/+2.4, v1s +3.0/+2.2/+3.4, v1f +2.9/+3.0/+2.9, v16s
++2.4/+2.0/+1.2, v16f +2.8/+0.5/+1.6, v32s +3.1/+1.0/+1.1, v32f +1.1/+0.6/+2.2. Locked on at every T (two T >= 128
+seed-rows under 1 us, no loss anywhere). PDL at T > 32 with the CUDA glue (ab10b): PDL_MAX_T 128 gains v16s
+-1.6/-1.2/-3.7, v16f -1.5/-0.5/-1.2; T = 256 a wash (+-0.6) -> PDL_MAX_T = 128 (1e5ea1e). Why only ~3 us at T = 1
+against ~14 us of Triton glue: most of the Triton programs' time was already under PDL overlap (their exposed parts
+were ~1.5-3 us each per the nsys timeline), and the new kernels keep ~1.2 us of exposed critical path each (the
+producer row's L2 load after the wait, one block reduction, the stores) plus the routing's 256 x 256 rank (~0.7 us).
