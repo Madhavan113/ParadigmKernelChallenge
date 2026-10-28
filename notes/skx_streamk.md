@@ -95,3 +95,36 @@ Reading:
 - D2 (main loop + plain export, no reduce at all) already only ties the picks, so no fixup can make this form win at
   m=128 unless the main loop itself gets ~30% faster. Round 3 attributes the main loop (no wgmma / W only / W only +
   wgmma / tiled W) and the fix-1 tail (wait only / reduce without stores).
+
+### Check 3: 0aad51440ee940f2 (commit 292bcf1), 1.4781x (CI 1.456-1.500), 9/9 (attribution only; picks unchanged:
+qkv 14.89, o 7.41, pooler 21.92, unpooler 19.12 judged)
+
+Bench us at m=128, every skx entry a diagnostic (timed, never picked):
+
+| layer | loop (D1) | loop, tiled W | W+x stream, no wgmma | W stream only | W only + wgmma | full minus reduce | reduce, no stores | pick |
+|---|---|---|---|---|---|---|---|---|
+| qkv | 16.90 | 16.51 | 15.81 | 14.69 | 15.62 | 21.12 | 27.87 | gqx 18.14 |
+| o | 10.50 | 10.43 | 9.86 | 9.66 | 10.50 | 15.97 | 24.03 | torchT 10.72 |
+| pooler | 23.90 | 23.36 | 22.78 | 21.31 | 22.27 | 28.10 | 35.65 | gq 25.38 |
+| unpooler | 23.30 | 22.82 | 22.08 | 21.57 | 22.56 | 27.87 | 36.74 | torchT 23.01 |
+
+Attribution (kernel = bench - ~3.5 us replay):
+- W streaming alone (TMA 2-D boxes, 6 x 16 KB in flight per SM, 132 persistent CTAs): qkv 11.2 us for 37.7 MB,
+  pooler 17.8 us for 67 MB, unpooler 18.1 us: ~4.1-4.2 TB/s steady state plus ~2 us of ramp / drain per launch. The
+  contiguous pre-swizzled copy (tiled) gains only ~0.4 us: the box pattern is not the limiter.
+- x ingest through L2 adds ~0.2-1.5 us (multicast could save at most ~0.7 us); wgmma adds ~1 us (mostly overlapped;
+  the main loop is DRAM/ramp-bound, not tensor-bound).
+- Tail (fix 1): wait ~1.6 us; the reduce's LOADS 7-9 us with the stores free (full fix1 == reduce-without-stores):
+  a latency chain (P peers two at a time, 2-3 slices per thread = ~12 dependent L2 round trips), fixable by issuing
+  all P loads per slice at once (~1-2 us). Export 1.4-2.7 us, fence + tickets ~1.3 us (check 2).
+
+Conclusion: even with a perfect reduce, export + tickets + wait cost ~4-5 us on top of a main loop that beats the
+current picks by only 1.2-1.6 us (and the loop cannot get much faster: W streaming is at the practical DRAM rate and
+the ramp is inherent to a short launch). No stream-K / global-fixup form wins at m=128 on this GPU; the gqx / gq
+cluster-DSMEM forms win precisely because they have no global fixup, and BM=128 cluster split-K cannot fill one wave
+(GPC packing). At m=256 the compute per unit doubles (~1.0 us per unit at the observed ~48% tensor utilization), so
+the main loop alone ties cuBLAS. Route left dormant (SKX_CONFIGS = {}): kernel, schedule model and gates kept.
+
+What would have to change for a win at m=128: a reduction that costs < 1 us end to end (DSMEM within one wave, i.e.
+a cluster geometry the H200 can hold for 18-64 row blocks of 128 rows) or a main loop that beats the picks by >= 5 us
+(impossible at ~4.2 TB/s: qkv's W alone needs 9 us + ramp).

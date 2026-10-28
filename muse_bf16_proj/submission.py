@@ -2952,11 +2952,16 @@ void skx(at::Tensor W, at::Tensor Wt, at::Tensor x, at::Tensor out, at::Tensor s
 # 23.62 / 25.25 / 26.53 / 35.78 / 37.22 vs gq 25.22; unpooler 22.82 / 24.93 / 26.37 / 37.34 / 37.41 vs torchT 22.72.
 # The main loop alone only ties / -1.5 us the picks (0.58 us per unit: W at ~3.4 TB/s, ~48% tensor utilization) and
 # the tail (wait + reduce or last-arriver epilogue) costs ~10 us on every layer. Round 3 = attribution only.
+# Check 3 (0aad5144, m=128 bench us; loop / loop tiled / W+x stream only / W stream only / W + wgmma / full minus
+# reduce / reduce without stores vs pick): qkv 16.9 / 16.5 / 15.8 / 14.7 / 15.6 / 21.1 / 27.9 vs gqx 18.1; o 10.5 /
+# 10.4 / 9.9 / 9.7 / 10.5 / 16.0 / 24.0 vs torchT 10.7; pooler 23.9 / 23.4 / 22.8 / 21.3 / 22.3 / 28.1 / 35.7 vs gq
+# 25.4; unpooler 23.3 / 22.8 / 22.1 / 21.6 / 22.6 / 27.9 / 36.7 vs torchT 23.0. Streaming W alone costs 11.2 us at
+# qkv (~4.1 TB/s steady state + ~2 us ramp/drain), x ~1 us, wgmma ~1 us exposed; the wait ~1.6 us; the reduce's loads
+# 7-9 us (latency chain, fixable) - but export + tickets + wait alone exceed the main loop's 1.2-1.6 us margin over
+# the picks, so no stream-K fixup wins at m=128 on this GPU; at m=256 the doubled compute per unit ties cuBLAS before
+# any fixup. Route dormant (empty table keeps the kernel, model and gates; the build carries only the stub).
 SKX_CONFIGS = {
-    ("qkv_gate", 128): [(6, 1, 0, 1), (6, 1, 1, 1), (6, 1, 0, 4), (6, 1, 0, 5), (6, 1, 0, 6), (6, 1, 0, 7), (6, 1, 0, 8)],
-    ("pooler", 128): [(6, 1, 0, 1), (6, 1, 1, 1), (6, 1, 0, 4), (6, 1, 0, 5), (6, 1, 0, 6), (6, 1, 0, 7), (6, 1, 0, 8)],
-    ("unpooler", 128): [(6, 1, 0, 1), (6, 1, 1, 1), (6, 1, 0, 4), (6, 1, 0, 5), (6, 1, 0, 6), (6, 1, 0, 7), (6, 1, 0, 8)],
-    ("o", 128): [(6, 1, 0, 1), (6, 1, 1, 1), (6, 1, 0, 4), (6, 1, 0, 5), (6, 1, 0, 6), (6, 1, 0, 7), (6, 1, 0, 8)],
+    # ("qkv_gate", 128): [(6, 1, 0, 0)],   # (nstage, fix, tiled, diag); see notes/skx_streamk.md for every judged row
 }
 USE_SKX = True
 
