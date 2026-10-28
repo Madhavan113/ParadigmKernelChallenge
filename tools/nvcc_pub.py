@@ -10,6 +10,9 @@ if "--build" in sys.argv:   # run the emitted command (no torch in this process)
     out = r.stdout + r.stderr
     lines = out.splitlines()
     print("\n".join([l for l in lines if "error" in l.lower()][:40]))
+    # ptxas advisories (C7510-C7515: wgmma serialized; any 'Potential Performance Loss'): reject such builds
+    adv = [l for l in lines if "Potential Performance Loss" in l or re.search(r"\bC75\d\d\b", l)]
+    print("\n".join(adv[:40]) if adv else "no ptxas advisories")
     cur = None
     for l in lines:
         m = re.search(r"Compiling entry function '(\S+)'", l)
@@ -20,7 +23,7 @@ if "--build" in sys.argv:   # run the emitted command (no torch in this process)
                 if "spill" in l and "0 bytes spill stores, 0 bytes spill loads" in l:
                     continue
                 print(cur[:150], "|", l.strip())
-    print("rc", r.returncode, "entries", out.count("Compiling entry"))
+    print("rc", r.returncode, "entries", out.count("Compiling entry"), "advisories", len(adv))
     sys.exit(1 if r.returncode else 0)
 spec = importlib.util.spec_from_file_location("sub", "/work/muse_bf16_proj/submission.py")
 S = importlib.util.module_from_spec(spec)
@@ -37,9 +40,9 @@ if "--sk2-alt-only" in sys.argv:   # instantiate only the SK2_ALT configs (the p
     sys.argv.remove("--sk2-alt-only"); S.SK2_PICK = {}
 if only is None:
     cuda_src = (common + defs + S._tma_srcs(sm90) + S.MAP_SRC + S._gemm_src(sm90) + S._wide_src(sm90) + S._sk2_src(sm90)
-                + S._gq_src(sm90) + S._gqx_src(sm90) + S._rgemv_src() + S._rk_src(sm90))
+                + S._gq_src(sm90) + S._gqx_src(sm90) + S._skx_src(sm90) + S._rgemv_src() + S._rk_src(sm90))
 else:
-    parts = {"sk2": S._sk2_src, "gq": S._gq_src, "gqx": S._gqx_src, "rk": S._rk_src, "wide": S._wide_src,
+    parts = {"sk2": S._sk2_src, "gq": S._gq_src, "gqx": S._gqx_src, "skx": S._skx_src, "rk": S._rk_src, "wide": S._wide_src,
              "gemm": S._gemm_src, "tma": S._tma_srcs, "rgemv": lambda sm: S._rgemv_src()}
     cuda_src = common + defs + S.wgmma_ss_defs([64, 128, 256]) + S.MAP_SRC + "".join(parts[k](sm90) for k in only)
 import torch.utils.cpp_extension as E
