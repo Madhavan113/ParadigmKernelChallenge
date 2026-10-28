@@ -4806,7 +4806,7 @@ def _scales_prmt_exact(*sfs):
 _EXTS = {}
 MAIN_DEFINES = ("-DOKC_NW=16", "-DOKC_FAST1=0", "-DOKC_EPI4=0", "-DOKC_WGS=1")          # compile-time variant used by kernel_fn
 # M <= TINY_MAX_M runs a skinny-only build with 16 warps per CTA (a job never has more than M tokens, so no fat units)
-TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_L2H=0", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2", "-DOKC_FINPF=1")  # bf16 WSB at NW=8 + WSBL tail (Oct 26: bs1 +2.5% / +3.5%)
+TINY_DEFINES = ("-DOKC_NW=8", "-DOKC_TINY=1", "-DOKC_EPI4=0", "-DOKC_FAST1=2", "-DOKC_NACC=4", "-DOKC_UWARP=0", "-DOKC_WS=1", "-DOKC_WSB=1", "-DOKC_WSBL=2", "-DOKC_WSBLK=2", "-DOKC_FINPF=1")  # bf16 WSB at NW=8 + WSBL tail (Oct 26: bs1 +2.5% / +3.5%); L2 hints on (Oct 27 judge: -DOKC_L2H=0 was 2.4 us slower at bs1: phase-A straggler spread 3.9 -> 2.3 us with evict_first weights)
 TINY_MAX_M = 4
 # TINY_MAX_M < M <= TINY2_MAX_M runs a second skinny-only build (empty: skipped); TINY2_MAX_M must stay <= 8
 TINY2_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=1', '-DOKC_FINPF=1')  # bf16 WSB (Oct 26: bs8 +2.0..2.5%)
@@ -4815,7 +4815,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "J"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "K"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 DIAG_VARIANT_SETS = {
@@ -4826,6 +4826,15 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "K": {  # bs1: L2H (evict_first stream + evict_last inter) with / without the phase-B prefetch, prefetch caps
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_l2h": {"defines": tuple(d for d in TINY_DEFINES if d != "-DOKC_L2H=0"), "shapes": [1]},
+        "tiny_pf_l2h": {"defines": tuple(d for d in TINY_DEFINES if d != "-DOKC_L2H=0") + ("-DOKC_PBPF=64000000",), "shapes": [1]},
+        "tiny_pf_l2h_c32": {"defines": tuple(d for d in TINY_DEFINES if d != "-DOKC_L2H=0") + ("-DOKC_PBPF=32000000",), "shapes": [1]},
+        "tiny_pf_l2h_c16": {"defines": tuple(d for d in TINY_DEFINES if d != "-DOKC_L2H=0") + ("-DOKC_PBPF=16000000",), "shapes": [1]},
+        "tiny_l2h_dbg": {"defines": tuple(d for d in TINY_DEFINES if d != "-DOKC_L2H=0") + ("-DOKC_DEBUG=1",), "shapes": [1]},
+        "tiny_pf_l2h_dbg": {"defines": tuple(d for d in TINY_DEFINES if d != "-DOKC_L2H=0") + ("-DOKC_PBPF=64000000", "-DOKC_DEBUG=1"), "shapes": [1]},
     },
     "J": {  # tiny builds: L2 prefetch of each CTA's phase-B units during phase A (OKC_PBPF byte cap), bs1 / bs8
         "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
@@ -4908,7 +4917,7 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8] if DIAG_SET == "J" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
