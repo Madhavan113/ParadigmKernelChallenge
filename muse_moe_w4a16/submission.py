@@ -2864,13 +2864,21 @@ __device__ __forceinline__ void wgs_wait(uint64_t* bar, uint32_t parity, int tag
                  : "=r"(ok) : "r"(smem_u32(bar)), "r"(parity) : "memory");
     if (ok) return;
   }
+#if OKC_WGSDBG == 1
   printf("WGS hang: block %d thread %d tag %d parity %u\n", (int)blockIdx.x, (int)threadIdx.x, tag, parity);
-  __trap();
+#endif
+  __trap();  // (OKC_WGSDBG 2: no printf, so no CALL inside the wgmma pipeline or a deallocated producer region)
 #else
   (void)tag;
   mbar_wait(bar, parity);
 #endif
 }
+// bounded global-memory spins in the DIAG builds (a hang traps within seconds instead of the judge's 900 s)
+#if OKC_WGSDBG
+#define SPIN_GUARD(cond) do { long long it_ = 0; while (cond) { __nanosleep(32); if (++it_ > (1ll << 24)) __trap(); } } while (0)
+#else
+#define SPIN_GUARD(cond) do { while (cond) __nanosleep(32); } while (0)
+#endif
 template <int NTT> struct WGSMMA;
 template <> struct WGSMMA<1> {
   static __device__ __forceinline__ void mma0(float (&d)[WGS_NT][4], uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3, uint64_t desc) {
@@ -3183,10 +3191,10 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
         curj = j;
         npad = ((S.jC[j] + 7) >> 3) << 3;
         jb = xsrc + (size_t)S.jrow[j] * HD;
-        if (!pb && !(OKC_WGSX & 8)) { while (ld_acquire(p.xready + j) < npad) __nanosleep(32); }  // every row gathered
+        if (!pb && !(OKC_WGSX & 8)) SPIN_GUARD(ld_acquire(p.xready + j) < npad);  // every row gathered
       }
       // phase B stage st reads inter columns 256 st .. +255: the 2 phase-A units (x 4 warpgroups) that wrote them
-      if (pb && !(OKC_WGSX & 8)) { while (ld_acquire(p.doneAs + j * 16 + st) < 8) __nanosleep(32); }
+      if (pb && !(OKC_WGSX & 8)) SPIN_GUARD(ld_acquire(p.doneAs + j * 16 + st) < 8);
       if (OKC_DEBUG) { const unsigned long long dt = gtimer() - tw0; if (pb) { xwaitB += dt; xstallB += dt > 500; } else xwaitA += dt; }
       uint64_t* bar = S.bars + BX_F + xs;
       const uint32_t bytes = (uint32_t)npad * 512u;
@@ -3427,7 +3435,7 @@ __device__ __forceinline__ void wgs_flush(const Params& p, Smem& S, WgsPend& pd)
     pd.kind = 0;
     return;
   }
-  if (wt == 0) { while (ld_acquire(fc) < 16 - pd.nst) __nanosleep(32); }
+  if (wt == 0) SPIN_GUARD(ld_acquire(fc) < 16 - pd.nst);
   asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
   pd.kind = 0;
   } else {
@@ -4974,10 +4982,10 @@ DIAG_VARIANT_SETS = {
     },
     "M": {  # WGS with setmaxnreg: producer warpgroup dec 24, consumers inc 120; wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
-        "reg120": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=1"), "shapes": _WGS_SHAPES},
-        "reg120_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=1"), "shapes": _WGS_SHAPES},
-        "reg120_gs4_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
-        "reg120_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "reg120": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
+        "reg120_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
+        "reg120_gs4_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "reg120_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=2", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
     },
     "L": {  # WGS with the producers folded into warp 0 (16-warp CTA, 128 registers): wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
@@ -5030,7 +5038,7 @@ DIAG_VARIANT_SETS = {
     },
     "F": {  # WGS early producer start (fixed consumer/range sync), bs32/128/256
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
-        "wgs_early_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSEARLY=1", "-DOKC_DEBUG=1", "-DOKC_WGSDBG=1"), "shapes": _WGS_SHAPES},
+        "wgs_early_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSEARLY=1", "-DOKC_DEBUG=1", "-DOKC_WGSDBG=2"), "shapes": _WGS_SHAPES},
         "wgs_early": {"defines": MAIN_DEFINES + ("-DOKC_WGSEARLY=1",), "shapes": _WGS_SHAPES},
     },
     "E": {  # WSDYN cause split (pool off / chunked claims / late slot release) + WGS early producer start
