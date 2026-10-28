@@ -452,3 +452,10 @@ Items (variant minus base, us; closed = under the bar):
 5. attention plans at B=1 sliding q1 (ab17, check ok for each): clusters cs 8 +5.5 (+5.0/+5.7/+5.7), cs 16 +5.8,
    cooperative finalize over 4 copies +0.5, 16 two-tile splits +1.5, 64 splits +0.6 - the module's plain 32-split
    plan is the chain's best; closed.
+
+Locked build 682afcb (submission md5 42931740) validated (ab19): the judge's check on the 12 scored shapes at seeds
+2/3 ALL OK, the 13 TASK.md tests ALL OK; before/after at T=1 (variant minus locked, s0/s1/s2): all-cgemv m=1 routes
++6.4/+9.4/+8.0 d1s, +9.9/+7.1/+7.1 d1f; unpooler cgemv alone +1.0/+1.5/+1.4, +0.9/+0.8/+1.2; order check -0.3/-0.5.
+Handed to main for a scored run. Round 2 closed: the T <= 32 chain is at its launch-structure floor (~9 kernels,
+~1 us of PDL wait-return each); further gains need fewer kernels (a boundary folded into its producer's epilogue,
+which the ticket tails showed is one-CTA compute-bound) or faster MoE / attention / sk2 bodies.
