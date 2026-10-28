@@ -5304,8 +5304,13 @@ TINY2_MAX_M = 8
 # TINY_MAX_M < M <= MID_MAX_M runs MID_DEFINES (empty: the main module)
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1', '-DOKC_WSH0=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split  # Oct 28: + OKC_WSH0 (helper = hardware warp 0): -2.0..-2.9 us at bs16 on judge seeds 0-2 (VM, paired); TINY/TINY2 neutral -> unchanged
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
+# MID_MAX_M < M <= WGS32_MAX_M runs the WGS build with FT_T = 32 (16 KB x slots, 4 n-tiles): no expert of a <= 32-token
+# batch exceeds 32 tokens, so nothing re-streams, and it measured 1.3-3.8 us faster than the FT_T = 64 build at bs32 on
+# judge seeds 0-2 (H200, paired, Oct 28); larger batches keep MAIN (FT_T = 64: splitting their experts re-streams weights)
+WGS32_DEFINES = MAIN_DEFINES + ("-DOKC_FT_T=32",)
+WGS32_MAX_M = 32
 DIAG = False               # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "W2"            # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "P32"           # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 def _fast1(defs, n):  # a tiny define tuple with another FAST1 pre-issue depth (units issued before routing, <= OKC_NS)
@@ -5324,6 +5329,12 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "P32": {  # the WGS32 policy build (FT_T 32) paired with MAIN at bs32 on judge seeds 0-2 (two timings each)
+        "main": {"defines": MAIN_DEFINES, "shapes": [32, 128]},
+        "wgs32": {"defines": WGS32_DEFINES, "shapes": [32]},
+        "main_b": {"defines": MAIN_DEFINES, "shapes": [32]},
+        "wgs32_b": {"defines": WGS32_DEFINES, "shapes": [32]},
     },
     "W2": {  # WGS with 2 consumer warpgroups (128-row half units), 2 CTAs per SM: FT_T 32 (16 KB x slots), 3 weight
              # slots of 18 KB + 2 x slots (<= 113 KB per CTA); paired with the shipped build on judge seeds 0-2
@@ -5584,11 +5595,11 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [32, 128] if DIAG_SET == "W2" else [1, 4, 8] if DIAG_SET in ("Q", "S", "V") else [1, 8, 16] if DIAG_SET in ("W", "X", "Y", "Z", "Z2") else [1, 4, 8, 16] if DIAG_SET in ("R", "T") else [32, 128] if DIAG_SET == "U" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [32, 128] if DIAG_SET in ("W2", "P32") else [1, 4, 8] if DIAG_SET in ("Q", "S", "V") else [1, 8, 16] if DIAG_SET in ("W", "X", "Y", "Z", "Z2") else [1, 4, 8, 16] if DIAG_SET in ("R", "T") else [32, 128] if DIAG_SET == "U" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 # (bs, touched local experts) cases: the input seed is searched (DIAG_SEED + bs + 1000 k) for the judge's typical draw
 # (tools/moe_routing_stats.py, 60 seeds: bs1 p10/p50/p90 2/3/3, bs4 4/6/8, bs8 5/8/11); None: the fixed seed
-DIAG_CASES = [(32, ("ref", sd)) for sd in (0, 1, 2)] + [(128, ("ref", 0))] if DIAG_SET == "W2" else [(16, ("ref", sd)) for sd in (0, 1, 2)] + [(1, ("ref", 0)), (8, ("ref", 0))] if DIAG_SET == "Z2" else [(bs, ("ref", sd)) for bs in (1, 8, 16) for sd in (0, 1, 2)] if DIAG_SET == "Z" else [(1, 2), (1, 3), (8, 8)] if DIAG_SET == "V" else [(1, 2), (1, 3), (8, 8), (16, None)] if DIAG_SET in ("W", "X", "Y") else [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET in ("Q", "S") else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET in ("R", "T") else [(bs, None) for bs in DIAG_SHAPES]
+DIAG_CASES = [(32, ("ref", sd)) for sd in (0, 1, 2)] + [(128, ("ref", 0))] if DIAG_SET in ("W2", "P32") else [(16, ("ref", sd)) for sd in (0, 1, 2)] + [(1, ("ref", 0)), (8, ("ref", 0))] if DIAG_SET == "Z2" else [(bs, ("ref", sd)) for bs in (1, 8, 16) for sd in (0, 1, 2)] if DIAG_SET == "Z" else [(1, 2), (1, 3), (8, 8)] if DIAG_SET == "V" else [(1, 2), (1, 3), (8, 8), (16, None)] if DIAG_SET in ("W", "X", "Y") else [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET in ("Q", "S") else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET in ("R", "T") else [(bs, None) for bs in DIAG_SHAPES]
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
 
@@ -5760,7 +5771,7 @@ def _main_defines(sfx):
 
 
 def _wgs_on():
-    return any("-DOKC_WGS=1" in tuple(d) for d in (MAIN_DEFINES, TINY_DEFINES, TINY2_DEFINES, MID_DEFINES))
+    return any("-DOKC_WGS=1" in tuple(d) for d in (MAIN_DEFINES, TINY_DEFINES, TINY2_DEFINES, MID_DEFINES, WGS32_DEFINES))
 
 
 def prepare(weights):
@@ -5799,8 +5810,8 @@ def prepare(weights):
     prmt = PRMT_SCALES and _scales_prmt_exact(weights["w13_sf"][lo:lo + cnt], weights["w2_sf"][lo:lo + cnt])
     state["sfx"] = ("-DOKC_PRMTSC=1",) if prmt else ()
     mods = [tuple(_main_defines(state["sfx"])) + state["sfx"]]
-    for d in (TINY_DEFINES, TINY2_DEFINES, MID_DEFINES):
-        if d and (state["sfx"] or "-DOKC_WGS=1" not in tuple(d)):  # the WGS build needs the PRMT scale decode
+    for d in (TINY_DEFINES, TINY2_DEFINES, MID_DEFINES, WGS32_DEFINES):
+        if d and (state["sfx"] or "-DOKC_WGS=1" not in tuple(d)):  # the WGS builds need the PRMT scale decode
             mods.append(tuple(d) + state["sfx"])
     state["wts"] = torch.zeros(EMAX, dtype=torch.float32, device=dev)  # in-kernel routing: the route weights (CTA 0)
     state["norsp"] = torch.empty(0, dtype=torch.float32, device=dev)  # (no pre-expert RMS partials)
@@ -5847,6 +5858,8 @@ def _select_ext(M, sfx, logits=False):
         d = tuple(TINY2_DEFINES) + sfx  # (the WGS build needs the PRMT scale decode: else MID/MAIN)
     elif MID_DEFINES and M <= MID_MAX_M:
         d = tuple(MID_DEFINES) + sfx
+    elif WGS32_DEFINES and M <= WGS32_MAX_M and sfx:  # (a WGS build: PRMT scale decode only)
+        d = tuple(WGS32_DEFINES) + sfx
     else:
         d = tuple(_main_defines(sfx)) + sfx
     return _ext(_logits_defines(d) if logits else d)
@@ -5973,7 +5986,7 @@ JMAX = 32 + EMAX // 64 + 8
 def _wgs_fixf():
     """moe WGS_FIXF: stream-K fixups + doneAs after ybuf (zero between calls); unit-indexed fixup slots (JMAX * 32) only
     when a selected build uses OKC_WGSDYN, else the 160 CTA-indexed slots."""
-    sets = [MAIN_DEFINES, TINY_DEFINES, TINY2_DEFINES, MID_DEFINES]
+    sets = [MAIN_DEFINES, TINY_DEFINES, TINY2_DEFINES, MID_DEFINES, WGS32_DEFINES]
     if DIAG:
         sets += [v["defines"] if isinstance(v, dict) else v for v in DIAG_VARIANTS.values()]
     slots = JMAX * 32 if any("-DOKC_WGSDYN=1" in tuple(d) for d in sets) else 160
@@ -6007,6 +6020,8 @@ def kernel_fn(data, state):
         ext = _ext(tuple(TINY2_DEFINES) + sfx)  # (the WGS build needs the PRMT scale decode: else MID/MAIN)
     elif MID_DEFINES and M <= MID_MAX_M:
         ext = _ext(tuple(MID_DEFINES) + sfx)
+    elif WGS32_DEFINES and M <= WGS32_MAX_M and sfx:  # (a WGS build: PRMT scale decode only)
+        ext = _ext(tuple(WGS32_DEFINES) + sfx)
     else:
         ext = _ext(tuple(_main_defines(sfx)) + sfx)
     for m0 in range(0, M, MMAX):
