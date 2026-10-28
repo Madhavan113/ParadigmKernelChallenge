@@ -212,8 +212,14 @@ CUDA_SRC = r'''
                        // 16 weights, 17 x, 18-19 idle) that releases its registers (dec 24) so the 4 consumer
                        // warpgroups can grow (inc OKC_WGSREG): per SM quadrant 4 x OKC_WGSREG + 24 <= 512 -> up to 120
 #endif
+#ifndef OKC_WGSREGP
+#define OKC_WGSREGP 24  // registers kept by the producer warpgroup (its TMA loops use R0..R15; the ranges run before)
+#endif
 #if OKC_WGSREG
-static_assert(4 * OKC_WGSREG + 24 <= 512 && OKC_WGSREG % 8 == 0, "OKC_WGSREG: at most 120, a multiple of 8");
+#undef OKC_WGSPR
+#define OKC_WGSPR 0    // (the x producer must not call wgs_ranges after its dealloc: thread 0 computes the ranges)
+static_assert(4 * OKC_WGSREG + OKC_WGSREGP <= 512 && OKC_WGSREG % 8 == 0 && OKC_WGSREGP % 8 == 0 && OKC_WGSREGP >= 24,
+              "OKC_WGSREG: 4 x consumers + producers <= 512 per quadrant, multiples of 8");
 #endif
 #ifndef OKC_WGSFOLD
 #define OKC_WGSFOLD 0  // WGS: no producer warps: lane 0 of warp 0 issues the weight and x TMAs between its own k16
@@ -3911,7 +3917,9 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #if OKC_WGS
   if (tid >= NT) {
 #if OKC_WGSREG
-    asm volatile("setmaxnreg.dec.sync.aligned.u32 24;\n" ::: "memory");  // the producer warpgroup gives its registers up
+    // the producer warpgroup gives its registers up at once; only the two TMA loops follow (R0..R15 in SASS): the
+    // stage ranges, a CALL into kernel-budget code, are computed by thread 0 after the gather (OKC_WGSPR = 0)
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 %0;\n" ::"n"(OKC_WGSREGP) : "memory");
     if (tid < NT + 32) wgs_wproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
     else if (tid < NT + 64) wgs_xproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
     else WS_JOIN();  // (the two idle warps of the producer warpgroup join the one CTA-wide barrier, then leave)
@@ -3922,7 +3930,7 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     return;
   }
 #if OKC_WGSREG
-  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(OKC_WGSREG) : "memory");  // consumer warpgroups grow
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(OKC_WGSREG) : "memory");  // consumer warpgroups grow (blocks until the producers' dealloc)
 #endif
 #endif
 #if OKC_ROUTE_LOGITS
@@ -4966,10 +4974,10 @@ DIAG_VARIANT_SETS = {
     },
     "M": {  # WGS with setmaxnreg: producer warpgroup dec 24, consumers inc 120; wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
-        "reg120": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120",), "shapes": _WGS_SHAPES},
-        "reg120_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4"), "shapes": _WGS_SHAPES},
-        "reg120_gs4_wd2": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSWD=2"), "shapes": _WGS_SHAPES},
-        "reg120_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "reg120": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=1"), "shapes": _WGS_SHAPES},
+        "reg120_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=1"), "shapes": _WGS_SHAPES},
+        "reg120_gs4_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSDBG=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "reg120_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSDBG=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
     },
     "L": {  # WGS with the producers folded into warp 0 (16-warp CTA, 128 registers): wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
