@@ -17,9 +17,11 @@ from ab_vm import SHAPES, parse_shape  # noqa: E402
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, nargs="+", default=[2])
-    ap.add_argument("--shapes", nargs="+", default=list(SHAPES))
+    ap.add_argument("--shapes", nargs="*", default=list(SHAPES))
+    ap.add_argument("--spec", action="append", default=[], help="raw shape spec k=v,... (added to --shapes)")
     ap.add_argument("--no-graph", action="store_true")
     args = ap.parse_args()
+    cases = [(n, SHAPES[n]) for n in args.shapes] + [(f"spec{i}", sp) for i, sp in enumerate(args.spec)]
     pdir = os.path.dirname(os.path.abspath(__file__))
     os.chdir(pdir)
     R = importlib.import_module("reference")
@@ -32,8 +34,10 @@ def main():
         st = S.prepare(weights)
         torch.cuda.synchronize()
         print(f"[prepare] seed {seed}: {time.perf_counter() - t0:.1f} s", flush=True)
-        for name in args.shapes:
-            data = R.generate_input(seed=seed, **parse_shape(SHAPES[name]))
+        for name, spec in cases:
+            data = R.generate_input(seed=seed, **parse_shape(spec))
+            T = data["config"]["tokens"] if "config" in data and "tokens" in data["config"] else -1
+            name = f"{name}[T={T} {spec}]"
             out = S.kernel_fn(data, st)
             torch.cuda.synchronize()
             ok, msg = R.check_implementation(data, R.collect(data, out), weights)
