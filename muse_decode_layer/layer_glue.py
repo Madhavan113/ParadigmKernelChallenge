@@ -1713,19 +1713,26 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
-        if st.get("fuse_bnd1_ok") and T <= BND1_MAX_T:   # the boundary-1 prologue vs the _boundary1 launch, on the chain
+        if T <= BND1_MAX_T and st.get("bfp") is not None:
+            # the pooler + router form at this T, on the chain: separate launches (pooler cgemv / sk2 + router rgemv /
+            # sk2) + _boundary1, the fused launch + _boundary1, or the fused launch computing the boundary in its
+            # prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each other
+            cands = [("bfp", False), ("bfpf", False)] + ([("bfpf", True)] if st.get("fuse_bnd1_ok") else [])
             btimes = {}
-            for flag in (False, True):
+            for pr_pick, flag in cands:
+                st["mm_pick"][(T, "pr")] = pr_pick
                 st.setdefault("bnd1_on", {})[T] = flag
                 try:
-                    btimes[flag] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                    btimes[(pr_pick, flag)] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
                 except Exception as ex:  # noqa: BLE001
-                    btimes[flag] = 1e30
+                    btimes[(pr_pick, flag)] = 1e30
                     if log:
-                        msg.append(f"bnd1X:{repr(ex)[:80]}")
-            st["bnd1_on"][T] = btimes[True] < btimes[False]
+                        msg.append(f"prX:{pr_pick}{int(flag)}:{repr(ex)[:80]}")
+            best_pr = min(btimes, key=lambda k_: btimes[k_])
+            st["mm_pick"][(T, "pr")], st["bnd1_on"][T] = best_pr
             if log:
-                msg.append(f"bnd1[{btimes[False]:.0f}/{btimes[True]:.0f}]->{int(st['bnd1_on'][T])}")
+                msg.append("prform[" + " ".join(f"{p_}{'+bnd1' if f_ else ''}:{t:.0f}" for (p_, f_), t in btimes.items())
+                           + f"]->{best_pr[0]}{'+bnd1' if best_pr[1] else ''}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -1818,15 +1825,12 @@ def prepare(weights):
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
+        if k[1] == "pr" and k[0] <= BND1_MAX_T:
+            continue   # the pooler + router form at T <= BND1_MAX_T is chosen on the chain in _tune ("prform")
         if isinstance(v, tuple):
             times = st.get("mm_times", {}).get(k, {})
             v = min(v, key=lambda p: times.get(p, 1e30))
         st.setdefault("mm_pick", {})[k] = v
-    if st.get("fuse_bnd1_ok"):   # the boundary-1 prologue lives in the fused pooler + router launch: pin it at those T
-        for T_ in TUNED_T:
-            if T_ <= BND1_MAX_T:
-                st["mm_pick"][(T_, "pr")] = "bfpf"
-                st["mm_pick"][(T_, "o")] = "bfp"
     torch.cuda.synchronize()
     if st.get("att_ok"):
         _attn_selftest(st)     # every attention plan family once, on synthetic inputs

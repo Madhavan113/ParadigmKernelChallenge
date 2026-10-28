@@ -13444,6 +13444,9 @@ void sk2b(torch::Tensor Ws, torch::Tensor x, torch::Tensor out, torch::Tensor pt
           torch::Tensor gp, torch::Tensor gn, torch::Tensor sout, torch::Tensor hout, torch::Tensor part, torch::Tensor cnt,
           int64_t has_gp);
 void sk2_set_pdl(int64_t n);
+void rgemv(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t M);
+void sgemv(torch::Tensor W, torch::Tensor x, torch::Tensor out, int64_t N);
+void cgemv(torch::Tensor L, torch::Tensor C, torch::Tensor x, torch::Tensor etab, int64_t pmax, torch::Tensor out, int64_t base4, int64_t rows, int64_t nth);
 """
 
 # (layer, mt) -> (splits, RG, WS); grid = (N / (16 RG), splits) ~ 128 CTAs
@@ -13909,6 +13912,330 @@ def bfp__mid_src(sm90):
             .replace("@@MID_DISPATCH@@", "\n  ".join(dict.fromkeys(lines))))
 
 
+bfp_RGEMV_SRC = r"""
+// ============================================================================ router GEMV (m = 1): FP32 weights
+// read directly (8.4 MB, no hi/lo split), ROWS rows per CTA, 256 threads; thread i owns k = 8i + 2048j (j < 4): every
+// weight and x load is issued before the first FMA; warp butterfly then a fixed-order cross-warp sum (deterministic).
+template <int ROWS, int MMAX>
+__global__ void __launch_bounds__(256) rgemv_kernel(const float* __restrict__ W, const __nv_bfloat16* __restrict__ x,
+                                                    float* __restrict__ out, int M, int N) {
+  constexpr int K = 8192;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int r0 = blockIdx.x * ROWS;
+  float4 w[ROWS][8];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const float4* p = reinterpret_cast<const float4*>(W + (size_t)(r0 + r) * K + j * 2048 + tid * 8);
+      w[r][2 * j] = __ldg(p); w[r][2 * j + 1] = __ldg(p + 1);
+    }
+  float acc[ROWS][MMAX];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < MMAX; ++t) acc[r][t] = 0.f;
+#pragma unroll
+  for (int t = 0; t < MMAX; ++t) {
+    if (t >= M) break;
+    uint4 xv[4];
+#pragma unroll
+    for (int j = 0; j < 4; ++j) xv[j] = __ldg(reinterpret_cast<const uint4*>(x + (size_t)t * K + j * 2048 + tid * 8));
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+      const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&xv[j]);
+      float xf[8];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) { const float2 f = __bfloat1622float2(h[e]); xf[2 * e] = f.x; xf[2 * e + 1] = f.y; }
+#pragma unroll
+      for (int r = 0; r < ROWS; ++r) {
+        const float4 a = w[r][2 * j], b = w[r][2 * j + 1];
+        float v = acc[r][t];
+        v = fmaf(a.x, xf[0], v); v = fmaf(a.y, xf[1], v); v = fmaf(a.z, xf[2], v); v = fmaf(a.w, xf[3], v);
+        v = fmaf(b.x, xf[4], v); v = fmaf(b.y, xf[5], v); v = fmaf(b.z, xf[6], v); v = fmaf(b.w, xf[7], v);
+        acc[r][t] = v;
+      }
+    }
+  }
+  __shared__ float red[ROWS][MMAX][8];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+    for (int t = 0; t < MMAX; ++t) {
+      float v = acc[r][t];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+      if (lane == 0) red[r][t][warp] = v;
+    }
+  __syncthreads();
+  if (tid < ROWS * MMAX) {
+    const int r = tid / MMAX, t = tid % MMAX;
+    if (t < M) {
+      float v = 0.f;
+#pragma unroll
+      for (int q = 0; q < 8; ++q) v += red[r][t][q];
+      out[(size_t)t * N + r0 + r] = v;
+    }
+  }
+}
+
+
+// ============================================================================ cgemv (m = 1): 12-bit compressed GEMV
+// Lossless planes, row-major: L [N][K] low bytes, C [N][K/2] 4-bit codes (sign | exponent offset from base), byte j of
+// each 4-byte group g holding codes 8g + j and 8g + j + 4. Exponents outside the 8-value window decode wrong and are
+// corrected exactly by a dedicated escape warp from a per-CTA table (entry 0 = count; ((row << 16) | k, delta bits)).
+// Every weight and x load is issued before the first FMA; fixed-order reductions (deterministic).
+__device__ __forceinline__ uint32_t cg_hib(uint32_t c, uint32_t base4) {
+  return ((c & 0x07070707u) + base4) | ((c << 4) & 0x80808080u);
+}
+template <int ROWS, int NTH, int K>
+__global__ void __launch_bounds__(NTH + 32) cgemv_kernel(const uint8_t* __restrict__ L, const uint8_t* __restrict__ C,
+    const __nv_bfloat16* __restrict__ x, const int2* __restrict__ etab, int pmax,
+    __nv_bfloat16* __restrict__ out, uint32_t base4) {
+  constexpr int PER = K / (16 * NTH);
+  constexpr int NWARP = NTH / 32;
+  static_assert(PER >= 1, "cgemv: K >= 16 NTH");
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int r0 = blockIdx.x * ROWS;
+  __shared__ float red[ROWS][NWARP + 1];
+  if (warp == NWARP) {   // escape warp: lane i takes entries 1 + i, 33 + i, ... (entry 0 = count); x[k] * delta per row
+    const int2* tb = etab + (size_t)blockIdx.x * pmax;
+    int2 mine = make_int2(0, 0);
+    if (lane < pmax) mine = __ldg(&tb[lane]);
+    const int cnt = __shfl_sync(0xffffffffu, mine.x, 0);
+    float ec[ROWS];
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) ec[r] = 0.f;
+    for (int i0 = 0; i0 <= cnt; i0 += 32) {
+      const int i = i0 + lane;
+      int2 en = mine;
+      if (i0 > 0) en = (i <= cnt) ? __ldg(&tb[i]) : make_int2(0, 0);
+      if (i >= 1 && i <= cnt) {
+        const float c = __bfloat162float(x[en.x & 0xFFFF]) * esc_delta((uint32_t)en.y, base4 & 0xFFu);
+        const int rl = en.x >> 16;
+#pragma unroll
+        for (int r = 0; r < ROWS; ++r) ec[r] += (rl == r) ? c : 0.f;
+      }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+      float v = ec[r];
+#pragma unroll
+      for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+      if (lane == 0) red[r][NWARP] = v;
+    }
+    __syncthreads();
+    return;
+  }
+  uint4 lw[ROWS][PER]; uint2 cw[ROWS][PER]; uint4 xv[PER][2];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+    for (int j = 0; j < PER; ++j) {
+      const size_t e0 = (size_t)(r0 + r) * K + (size_t)j * 16 * NTH + 16 * tid;
+      lw[r][j] = __ldg(reinterpret_cast<const uint4*>(L + e0));
+      cw[r][j] = __ldg(reinterpret_cast<const uint2*>(C + e0 / 2));
+    }
+#pragma unroll
+  for (int j = 0; j < PER; ++j) {
+    const __nv_bfloat16* xp = x + j * 16 * NTH + 16 * tid;
+    xv[j][0] = __ldg(reinterpret_cast<const uint4*>(xp));
+    xv[j][1] = __ldg(reinterpret_cast<const uint4*>(xp + 8));
+  }
+  float acc[ROWS];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r) acc[r] = 0.f;
+#pragma unroll
+  for (int j = 0; j < PER; ++j) {
+    float xf[16];
+#pragma unroll
+    for (int h = 0; h < 2; ++h) {
+      const uint32_t* xw = reinterpret_cast<const uint32_t*>(&xv[j][h]);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) { xf[8 * h + 2 * e] = __uint_as_float(xw[e] << 16); xf[8 * h + 2 * e + 1] = __uint_as_float(xw[e] & 0xFFFF0000u); }
+    }
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+      const uint32_t lws[4] = {lw[r][j].x, lw[r][j].y, lw[r][j].z, lw[r][j].w};
+      const uint32_t cws[2] = {cw[r][j].x, cw[r][j].y};
+      float v = acc[r];
+#pragma unroll
+      for (int g = 0; g < 2; ++g) {           // 8-element groups: low bytes lws[2g], lws[2g+1]; codes cws[g]
+        const uint32_t ha = cg_hib(cws[g] & 0x0F0F0F0Fu, base4);         // hi bytes of elements 0..3
+        const uint32_t hb = cg_hib((cws[g] >> 4) & 0x0F0F0F0Fu, base4);  // hi bytes of elements 4..7
+        const uint32_t la = lws[2 * g], lb = lws[2 * g + 1];
+        const uint32_t p01 = __byte_perm(la, ha, 0x5140), p23 = __byte_perm(la, ha, 0x7362);
+        const uint32_t p45 = __byte_perm(lb, hb, 0x5140), p67 = __byte_perm(lb, hb, 0x7362);
+        const float* xg = xf + 8 * g;
+        v = fmaf(__uint_as_float(p01 << 16), xg[0], v); v = fmaf(__uint_as_float(p01 & 0xFFFF0000u), xg[1], v);
+        v = fmaf(__uint_as_float(p23 << 16), xg[2], v); v = fmaf(__uint_as_float(p23 & 0xFFFF0000u), xg[3], v);
+        v = fmaf(__uint_as_float(p45 << 16), xg[4], v); v = fmaf(__uint_as_float(p45 & 0xFFFF0000u), xg[5], v);
+        v = fmaf(__uint_as_float(p67 << 16), xg[6], v); v = fmaf(__uint_as_float(p67 & 0xFFFF0000u), xg[7], v);
+      }
+      acc[r] = v;
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r) {
+    float v = acc[r];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (lane == 0) red[r][warp] = v;
+  }
+  __syncthreads();
+  if (tid < ROWS) {
+    float v = 0.f;
+#pragma unroll
+    for (int q = 0; q <= NWARP; ++q) v += red[tid][q];
+    out[r0 + tid] = __float2bfloat16_rn(v);
+  }
+}
+
+void cgemv(at::Tensor L, at::Tensor C, at::Tensor x, at::Tensor etab, int64_t pmax, at::Tensor out, int64_t base4,
+           int64_t rows, int64_t nth) {
+  const int N = out.size(1), K = L.size(1);
+  TORCH_CHECK(x.size(0) == 1 && N % rows == 0 && N <= L.size(0), "cgemv: m = 1");
+  auto st = at::cuda::getCurrentCUDAStream();
+  auto a0 = L.data_ptr<uint8_t>(); auto a1 = C.data_ptr<uint8_t>();
+  auto xp = reinterpret_cast<const __nv_bfloat16*>(x.data_ptr());
+  auto tp = reinterpret_cast<const int2*>(etab.data_ptr<int>());
+  auto op = reinterpret_cast<__nv_bfloat16*>(out.data_ptr());
+  const uint32_t b4 = (uint32_t)base4;
+  const int pm = (int)pmax;
+  @@CG_DISPATCH@@
+  TORCH_CHECK(false, "cgemv: no instantiation for K=", K, " rows=", rows, " nth=", nth);
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+// BF16 GEMV (the unpooler slice at m = 1: W[:1024] bf16 [1024, 4096]): 4 rows per CTA, 512 threads, thread i owns
+// k = 8i (one 16 B load per row and one of x), fixed-order reductions.
+template <int ROWS, int NTH, int K>
+__global__ void __launch_bounds__(NTH) sgemv_kernel(const __nv_bfloat16* __restrict__ W, const __nv_bfloat16* __restrict__ x,
+                                                    __nv_bfloat16* __restrict__ out) {
+  constexpr int PER = K / NTH / 8;
+  constexpr int NWARP = NTH / 32;
+  const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  const int r0 = blockIdx.x * ROWS;
+  uint4 w[ROWS][PER], xv[PER];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r)
+#pragma unroll
+    for (int j = 0; j < PER; ++j) w[r][j] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)(r0 + r) * K + j * (NTH * 8) + tid * 8));
+#pragma unroll
+  for (int j = 0; j < PER; ++j) xv[j] = __ldg(reinterpret_cast<const uint4*>(x + j * (NTH * 8) + tid * 8));
+  float acc[ROWS];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r) acc[r] = 0.f;
+#pragma unroll
+  for (int j = 0; j < PER; ++j) {
+    const __nv_bfloat162* hx = reinterpret_cast<const __nv_bfloat162*>(&xv[j]);
+    float xf[8];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) { const float2 f = __bfloat1622float2(hx[e]); xf[2 * e] = f.x; xf[2 * e + 1] = f.y; }
+#pragma unroll
+    for (int r = 0; r < ROWS; ++r) {
+      const __nv_bfloat162* hw = reinterpret_cast<const __nv_bfloat162*>(&w[r][j]);
+      float v = acc[r];
+#pragma unroll
+      for (int e = 0; e < 4; ++e) { const float2 a = __bfloat1622float2(hw[e]); v = fmaf(a.x, xf[2 * e], v); v = fmaf(a.y, xf[2 * e + 1], v); }
+      acc[r] = v;
+    }
+  }
+  __shared__ float red[ROWS][NWARP];
+#pragma unroll
+  for (int r = 0; r < ROWS; ++r) {
+    float v = acc[r];
+#pragma unroll
+    for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffffu, v, o);
+    if (lane == 0) red[r][warp] = v;
+  }
+  __syncthreads();
+  if (tid < ROWS) {
+    float v = 0.f;
+#pragma unroll
+    for (int q = 0; q < NWARP; ++q) v += red[tid][q];
+    out[r0 + tid] = __float2bfloat16_rn(v);
+  }
+}
+
+void sgemv(at::Tensor W, at::Tensor x, at::Tensor out, int64_t N) {
+  TORCH_CHECK(W.size(1) == 4096 && x.size(0) == 1 && N % 4 == 0 && N <= W.size(0), "sgemv: m = 1, K = 4096");
+  sgemv_kernel<4, 512, 4096><<<(int)(N / 4), 512, 0, at::cuda::getCurrentCUDAStream()>>>(
+      reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void rgemv(at::Tensor W, at::Tensor x, at::Tensor out, int64_t M) {
+  TORCH_CHECK(W.size(1) == 8192 && M == 1, "rgemv: K = 8192, m = 1");
+  rgemv_kernel<1, 1><<<(int)W.size(0), 256, 0, at::cuda::getCurrentCUDAStream()>>>(
+      W.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()), out.data_ptr<float>(), (int)M,
+      (int)W.size(0));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+"""
+
+
+bfp_CG_CONFIGS = {"qkv_gate": (2, 256), "o": (2, 64), "unpooler": (2, 128), "pooler": (2, 512)}   # layer -> (rows per CTA, threads); m = 1
+# (v137: pooler m=1 cgemv 2x512 measured -0.34 us vs sk2; 2x256 ties sk2, 4/8 rows or 1 row lose)
+# alternatives the autotuner times against CG_CONFIGS (m = 1): more rows per CTA = fewer CTAs and fewer x re-reads (o at
+# 2 x 64: 4096 CTAs of 3 KB each re-reading 2 KB of x: as many x bytes as weight bytes); K >= 16 threads per CTA
+# judged (ba7affa0, raw us): o 2x64 8.6 beats 4x64 8.8, 8x64 9.1, 4x32 9.4, 2x32 9.7; unpooler 2x128 7.04 beats 2x256
+# 7.07, 4x128 / 4x256 7.2, 8x128 8.1; qkv 2x256 12.4 beats 4x128 12.9, 2x128 13.6, 4x256 13.8 -> no alternatives kept
+bfp_CG_ALT = {}
+bfp_CG_K = {"qkv_gate": 8192, "o": 1024, "unpooler": 4096, "pooler": 8192}
+
+
+def bfp__cg_configs(layer):
+    return [bfp_CG_CONFIGS[layer]] + list(bfp_CG_ALT.get(layer, ()))
+
+
+def bfp__rgemv_src():
+    lines = []
+    for layer in bfp_CG_CONFIGS:
+        k = bfp_CG_K[layer]
+        for rows, nth in bfp__cg_configs(layer):
+            lines.append(f"if (K == {k} && rows == {rows} && nth == {nth}) {{ cgemv_kernel<{rows}, {nth}, {k}><<<N / {rows}, {nth} + 32, 0, st>>>"
+                         f"(a0, a1, xp, tp, pm, op, b4); C10_CUDA_KERNEL_LAUNCH_CHECK(); return; }}")
+    return bfp_RGEMV_SRC.replace("@@CG_DISPATCH@@", "\n  ".join(dict.fromkeys(lines)))
+
+
+def bfp_cg_compress(w, rows_per_cta):
+    """Row-major 12-bit planes for cgemv (lossless; escapes corrected exactly from a per-CTA table)."""
+    n, k = w.shape
+    bits = w.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+    hi, low = bits >> 8, bits & 0xFF
+    e71, sign = hi & 0x7F, hi >> 7
+    hist = torch.bincount(e71.flatten(), minlength=128)
+    win = torch.stack([hist[b:b + 8].sum() for b in range(121)])
+    base = int(win.argmax())
+    o = (e71 - base).clamp(0, 7)
+    code = ((sign << 3) | o).to(torch.uint8)
+    esc = (e71 < base) | (e71 > base + 7)
+    if int(esc.sum()) > n * k // 200:
+        return None
+    g = code.view(n, k // 8, 8)
+    C = (g[:, :, 0:4] | (g[:, :, 4:8] << 4)).reshape(n, k // 2).contiguous()
+    L = low.to(torch.uint8).contiguous()
+    rows, cols = esc.nonzero(as_tuple=True)          # row-major order
+    dec = ((((sign[rows, cols] << 7) | (base + o[rows, cols])) << 8) | low[rows, cols]).to(torch.int16).view(torch.bfloat16).float()
+    wtrue = w[rows, cols].float()
+    delta = (wtrue - dec).contiguous()
+    if not bool(((dec + delta) == wtrue).all()):
+        return None
+    ncta = n // rows_per_cta
+    cta = rows // rows_per_cta
+    counts = torch.bincount(cta, minlength=ncta)
+    pmax = int(counts.max()) + 1 if rows.numel() else 1
+    start = torch.cumsum(counts, 0) - counts
+    pos = torch.arange(rows.numel(), device=w.device) - start[cta] + 1
+    tab = torch.zeros(ncta, pmax, 2, dtype=torch.int32, device=w.device)
+    tab[:, 0, 0] = counts.to(torch.int32)
+    tab[cta, pos, 0] = (((rows - cta * rows_per_cta) << 16) | cols).to(torch.int32)
+    tab[cta, pos, 1] = bits[rows, cols].to(torch.int32)   # the original BF16 weights; the kernel forms the correction
+    return {"L": L, "C": C, "tab": tab.contiguous(), "pmax": pmax, "base4": base * 0x01010101}
+
+
 def bfp__get_ext():
     """Compile everything as one CUDA translation unit with load_inline.  no_implicit_headers: the CUDA file includes
     only the ATen headers it needs (torch/types.h alone costs ~45 s of nvcc time)."""
@@ -13920,12 +14247,12 @@ def bfp__get_ext():
         common = bfp_CUDA_SRC.replace("@@MBAR@@", bfp_MBAR_HELPERS).replace("@@BODY@@", bfp_WG_HELPERS if sm90 else "")
         defs = bfp_wgmma_defs([8, 16, 32, 64, 128]) if sm90 else ""
         cuda_src = (common + defs + bfp__tma_srcs(sm90) + bfp_MAP_SRC + bfp__gemm_src(sm90) + bfp__wide_src(sm90) + bfp__sk2_src(sm90)
-                    + bfp__gq_src(sm90))
+                    + bfp__gq_src(sm90) + bfp__rgemv_src())
         bfp__ext = load_inline(
             name=f"dl_okc_bf16proj_v86y4_{arch}" + (f"_dly{bfp__SK2_DELAY}" if bfp__SK2_DELAY else ""),
             cpp_sources="#include <torch/extension.h>\n" + bfp_CPP_SRC,
             cuda_sources=cuda_src,
-            functions=["skinny_tma_a", "gemm90", "wide", "sk2", "gq", "sk2f", "sk2b", "sk2_set_pdl"],
+            functions=["skinny_tma_a", "gemm90", "wide", "sk2", "gq", "sk2f", "sk2b", "sk2_set_pdl", "rgemv", "sgemv", "cgemv"],
             extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}"] + ([f"-DSK2_DELAY_ESC={bfp__SK2_DELAY}"] if bfp__SK2_DELAY else []),
             no_implicit_headers=True,
             verbose=False,
@@ -14457,6 +14784,7 @@ def bfp_prepare(weights):
             lo = (w - hi.float()).to(torch.bfloat16)
             state["router_hi_t"] = hi.t().contiguous()
             state["router_lo_t"] = lo.t().contiguous()
+            state["router_f32"] = w.float().contiguous()   # the router GEMV (m = 1) reads the FP32 weights as given
             state["router_cat"] = torch.cat([hi, lo], dim=1).contiguous()   # gemm90 fallback (m 33..256)
             # hi and lo tiles of the same k-step back to back: [rg, s, 2, 32, 8]
             src = torch.stack([bfp_pack_fragments(hi), bfp_pack_fragments(lo)], dim=2).contiguous()
@@ -14475,6 +14803,12 @@ def bfp_prepare(weights):
         else:
             w = w.contiguous()
             state["raw"][name] = w
+            if name in bfp_CG_CONFIGS:   # m = 1: 12-bit compressed GEMV planes (the unpooler: its 1024-row slice)
+                wc = w[:1024] if name == "unpooler" else w
+                for rows in sorted({r for r, _ in bfp__cg_configs(name)}):
+                    cg = bfp_cg_compress(wc.contiguous(), rows)
+                    if cg is not None:
+                        state.setdefault("cg", {})[(name, rows)] = cg
             c = bfp_pack_compressed(w) if name in bfp_COMPRESS else None
             if c is not None:
                 src, comp = c["packed"].transpose(0, 1).contiguous(), True  # [rg, u, 3, 32, 16]
@@ -14663,6 +14997,20 @@ def bfp__run(choice, x, layer, m, n, k, state):
         return bfp__run_gemm(x, layer, m, n, k, state)
     if kind == "gq":
         return bfp__run_gq(x, layer, m, n, k, state)
+    if kind == "cgemv":   # m = 1: 12-bit compressed GEMV (qkv, o, unpooler slice, pooler)
+        rows, nth = choice[1] if len(choice) > 1 else bfp_CG_CONFIGS[layer]
+        cg = state["cg"][(layer, rows)]
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+        bfp__get_ext().cgemv(cg["L"], cg["C"], x, cg["tab"], cg["pmax"], out, cg["base4"], rows, nth)
+        return out
+    if kind == "sgemv":   # unpooler slice, m = 1: BF16 weights straight from memory (4 rows per CTA)
+        out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+        bfp__get_ext().sgemv(state["raw"][layer], x, out, n)
+        return out
+    if kind == "rgemv":   # router, m = 1: FP32 weights straight from memory (one row per CTA)
+        out = torch.empty((m, n), dtype=torch.float32, device=x.device)
+        bfp__get_ext().rgemv(state["router_f32"], x, out, m)
+        return out
     return bfp__run_torch(x, layer, m, n, k, state)
 
 
@@ -14698,6 +15046,14 @@ def bfp__candidates(layer, m, state):
     if (bfp_USE_GQ and state["sm90"] and 32 < m <= 256 and layer != "router" and (layer, bfp__gq_bn(m)) in bfp_GQ_CONFIGS
             and bfp__route_key(layer, m, "gq") not in state["disabled"]):
         c.insert(0, ("gq",))
+    if layer == "router" and m == 1 and "router_f32" in state and bfp__route_key(layer, m, "rgemv") not in state["disabled"]:
+        c.insert(0, ("rgemv",))
+    if layer == "unpooler" and m == 1 and bfp__route_key(layer, m, "sgemv") not in state["disabled"]:
+        c.insert(0, ("sgemv",))
+    if m == 1 and layer in bfp_CG_CONFIGS and bfp__route_key(layer, m, "cgemv") not in state["disabled"]:
+        for cfg in bfp__cg_configs(layer):
+            if (layer, cfg[0]) in state.get("cg", {}):
+                c.insert(0, ("cgemv", cfg))
     if c[-1][0] != "torch" and all(ch[0] != "torch" for ch in c):
         c.append(("torch",))
     return c
@@ -16421,19 +16777,26 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
-        if st.get("fuse_bnd1_ok") and T <= BND1_MAX_T:   # the boundary-1 prologue vs the _boundary1 launch, on the chain
+        if T <= BND1_MAX_T and st.get("bfp") is not None:
+            # the pooler + router form at this T, on the chain: separate launches (pooler cgemv / sk2 + router rgemv /
+            # sk2) + _boundary1, the fused launch + _boundary1, or the fused launch computing the boundary in its
+            # prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each other
+            cands = [("bfp", False), ("bfpf", False)] + ([("bfpf", True)] if st.get("fuse_bnd1_ok") else [])
             btimes = {}
-            for flag in (False, True):
+            for pr_pick, flag in cands:
+                st["mm_pick"][(T, "pr")] = pr_pick
                 st.setdefault("bnd1_on", {})[T] = flag
                 try:
-                    btimes[flag] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                    btimes[(pr_pick, flag)] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
                 except Exception as ex:  # noqa: BLE001
-                    btimes[flag] = 1e30
+                    btimes[(pr_pick, flag)] = 1e30
                     if log:
-                        msg.append(f"bnd1X:{repr(ex)[:80]}")
-            st["bnd1_on"][T] = btimes[True] < btimes[False]
+                        msg.append(f"prX:{pr_pick}{int(flag)}:{repr(ex)[:80]}")
+            best_pr = min(btimes, key=lambda k_: btimes[k_])
+            st["mm_pick"][(T, "pr")], st["bnd1_on"][T] = best_pr
             if log:
-                msg.append(f"bnd1[{btimes[False]:.0f}/{btimes[True]:.0f}]->{int(st['bnd1_on'][T])}")
+                msg.append("prform[" + " ".join(f"{p_}{'+bnd1' if f_ else ''}:{t:.0f}" for (p_, f_), t in btimes.items())
+                           + f"]->{best_pr[0]}{'+bnd1' if best_pr[1] else ''}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -16526,15 +16889,12 @@ def prepare(weights):
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
+        if k[1] == "pr" and k[0] <= BND1_MAX_T:
+            continue   # the pooler + router form at T <= BND1_MAX_T is chosen on the chain in _tune ("prform")
         if isinstance(v, tuple):
             times = st.get("mm_times", {}).get(k, {})
             v = min(v, key=lambda p: times.get(p, 1e30))
         st.setdefault("mm_pick", {})[k] = v
-    if st.get("fuse_bnd1_ok"):   # the boundary-1 prologue lives in the fused pooler + router launch: pin it at those T
-        for T_ in TUNED_T:
-            if T_ <= BND1_MAX_T:
-                st["mm_pick"][(T_, "pr")] = "bfpf"
-                st["mm_pick"][(T_, "o")] = "bfp"
     torch.cuda.synchronize()
     if st.get("att_ok"):
         _attn_selftest(st)     # every attention plan family once, on synthetic inputs
