@@ -128,3 +128,11 @@ the main loop alone ties cuBLAS. Route left dormant (SKX_CONFIGS = {}): kernel, 
 What would have to change for a win at m=128: a reduction that costs < 1 us end to end (DSMEM within one wave, i.e.
 a cluster geometry the H200 can hold for 18-64 row blocks of 128 rows) or a main loop that beats the picks by >= 5 us
 (impossible at ~4.2 TB/s: qkv's W alone needs 9 us + ramp).
+
+### Check 4: b1508a1e59694b0f (commit 0fd29a5, route dormant), 1.4882x (CI 1.466-1.511), 9/9
+
+Ship-ready confirmation of the dormant state: no skx candidates in the tune lines, the usual picks (gqx / torch /
+gq / torchT / rk at m=128; torchT / cutlass / torchT / rk at m=256), nothing disabled. Judged m=128: qkv 14.56, o
+7.61, pooler 21.00, unpooler 18.88, router 6.38; m=256: qkv 19.76, o 9.10, pooler 28.55, unpooler 24.63, router 6.99
+(reference run 8bd13763: 1.4933x; the four checks of this round 1.4756 / 1.4620 / 1.4781 / 1.4882 are all inside the
+run-to-run band of the unchanged picks).
