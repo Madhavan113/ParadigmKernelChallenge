@@ -329,6 +329,20 @@ constexpr int HD = 4096, ID = 4096;
 constexpr int NW = OKC_NW, NT = NW * 32;
 constexpr int NTL = NT + (OKC_WGS ? (OKC_WGSFOLD ? 0 : OKC_WGSREG ? 128 : 64) : OKC_WS ? 32 : 0);  // + helper warp (WS) | weights and x producer warps (WGS)  // launched: NT compute threads (+ helper warp | WGS producer warp + epilogue warpgroup)
 constexpr int NRB = OKC_WS ? OKC_WSNR : 2;   // cross-warp partial-sum buffers
+#ifndef OKC_WSH0
+#define OKC_WSH0 0  // WS tiny builds: the helper warp is HARDWARE warp 0 (the oldest warp of the CTA, which a greedy-then-
+                    // oldest scheduler prefers over the ALU-saturating compute warps; as the youngest warp its first
+                    // epilogue took ~5 us and its credits lagged the hand-offs by 1-5 us: set V/W stamps); the logical
+                    // thread index TIDX is rotated so that hardware warps 1.. are the compute warps 0..
+#endif
+#if OKC_WSH0 && !OKC_WS
+#error "OKC_WSH0 needs the WS helper warp"
+#endif
+#if OKC_WSH0
+#define TIDX ((int)((threadIdx.x + NT) % NTL))
+#else
+#define TIDX ((int)threadIdx.x)
+#endif
 #if OKC_WS || OKC_WGS
 // CTA barrier over the NT compute threads only (the helper warp syncs with them through mbarriers and barrier 2)
 #define CTA_SYNC() asm volatile("bar.sync 1, %0;\n" ::"n"(NT) : "memory")
@@ -416,6 +430,10 @@ struct Smem {
   int wsr[4];                          // WS: this CTA's phase A and phase B unit ranges
   int wsd[4];                          // WSDYN: pool bounds [nAs, nA) and [nBs, nB)
   int uid[8];                          // WSDYN: unit of sequence index q at q & 7: (q << 16) | (PB << 15) | v
+#if OKC_WSHP
+  float hgs[2][32];                    // WSHP: per-expert gsA / gsB (all local experts)
+  alignas(16) __nv_bfloat16 hnw[HD];   // WSHP: post-norm weights (cp.async 16 B copies)
+#endif
 #endif
 #if OKC_WGS
   uint64_t bars[24];  // WGS: 0..3 weights full, 4..7 weights empty, 8..15 x full, 16..23 x empty
@@ -517,8 +535,8 @@ __device__ __forceinline__ unsigned long long gtimer() {
 #else
 #define TOPKW(i) p.topk_w[i]
 #endif
-#define DBGP(k) do { if (OKC_DEBUG && threadIdx.x == 0 && p.dbg) p.dbg[(size_t)gridDim.x * 13 + (size_t)blockIdx.x * 4 + (k)] = gtimer(); } while (0)
-#define DBG(k) do { if (OKC_DEBUG && threadIdx.x == 0 && p.dbg) p.dbg[blockIdx.x * 8 + (k)] = gtimer(); } while (0)
+#define DBGP(k) do { if (OKC_DEBUG && TIDX == 0 && p.dbg) p.dbg[(size_t)gridDim.x * 13 + (size_t)blockIdx.x * 4 + (k)] = gtimer(); } while (0)
+#define DBG(k) do { if (OKC_DEBUG && TIDX == 0 && p.dbg) p.dbg[blockIdx.x * 8 + (k)] = gtimer(); } while (0)
 // tiny (WS) builds: the same slots as DBGP (prologue) and the WGS producer-stall counters, stamped by whichever single
 // thread runs the site (the caller guards): DBGPX(0) first weight unit issued, (1) first phase-B unit landed, (2) first
 // phase-B gate passed, (3) first phase-B unit issued; DBGT(0) helper epilogues done, (1) grid barrier arrival,
@@ -591,7 +609,7 @@ __device__ __forceinline__ float sigmoid_tl(float x) { return div_full(1.f, 1.f 
 // CTA after the grid barrier).
 __device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, int lo, const float4 (&lq)[2], const float (&bv)[8],
                                              bool store_eid, bool store_out) {
-  const int lane = threadIdx.x & 31;
+  const int lane = TIDX & 31;
   const float lv[8] = {lq[0].x, lq[0].y, lq[0].z, lq[0].w, lq[1].x, lq[1].y, lq[1].z, lq[1].w};
   float sc[8], sel[8];
 #pragma unroll
@@ -643,7 +661,7 @@ __device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, in
 // ---------------------------------------------------------------- routing prologue (every CTA, identical result)
 __device__ void early_issue(const Params& p, Smem& S);
 __device__ void route(const Params& p, Smem& S) {
-  const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+  const int tid = TIDX, lane = tid & 31, warp = WARP_IDX(tid);
   const int E = p.M * 8;
   const int CH = ((E + NW * 32 - 1) / (NW * 32)) * 32;
   const int i0 = warp * CH, i1 = min(E, i0 + CH);
@@ -785,7 +803,7 @@ __device__ __forceinline__ void sk_load_w(const Params& p, int e, int rb, int la
 // stage x rows of a skinny job into xs [nrows][XP_SK] (rows >= cnt zero-filled)
 template <bool PB>
 __device__ __forceinline__ void sk_stage_x(const Params& p, const Smem& S, int j, __nv_bfloat16* xs, int nrows) {
-  const int tid = threadIdx.x;
+  const int tid = TIDX;
   const int cnt = S.jC[j], st = S.jS[j];
   const int tot = nrows * (HD / 8);
 #pragma unroll 4
@@ -935,7 +953,7 @@ __device__ __forceinline__ void ring_issue(const Params& p, const Smem& S, int v
   asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" L2H_SUFFIX " [%0], [%1], %2, [%3]" L2H_OPERAND ";\n"
                ::"r"(smem_u32(slot)), "l"(src), "r"(UNIT_BYTES), "r"(smem_u32(bar)) L2H_ARG : "memory");
 #else
-  for (int i = threadIdx.x; i < UNIT_BYTES / 16; i += NT)
+  for (int i = TIDX; i < UNIT_BYTES / 16; i += NT)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_u32(slot + i * 16)), "l"(src + i * 16));
   asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_u32(bar)) : "memory");
 #endif
@@ -944,7 +962,7 @@ __device__ __forceinline__ void ring_issue(const Params& p, const Smem& S, int v
 template <bool PB>
 __device__ __forceinline__ void ring_issue_all(const Params& p, const Smem& S, int v, unsigned char* slot, uint64_t* bar) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && OKC_USE_TMA
-  if (threadIdx.x == 0) ring_issue<PB>(p, S, v, slot, bar);
+  if (TIDX == 0) ring_issue<PB>(p, S, v, slot, bar);
 #else
   ring_issue<PB>(p, S, v, slot, bar);
 #endif
@@ -997,7 +1015,7 @@ __device__ __forceinline__ void load_x1_smem(const Params& p, const Smem& S, int
 template <bool PB>
 __device__ void skinny_ring(const Params& p, Smem& S, int v0, int v1, unsigned char* ring, uint64_t* bars, int& seq,
                             __nv_bfloat16* x1base, bool cpf_ok, int cB0, int cBn, int nSall, int poolBase) {
-  const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+  const int tid = TIDX, lane = tid & 31, warp = WARP_IDX(tid);
   const uint32_t k16 = 16u + p.zero;  // opaque 16 (scale decode IMAD)
   (void)k16;
   const int rbs = PB ? RB_B : RB_A;
@@ -1343,7 +1361,7 @@ __device__ void skinny_ring(const Params& p, Smem& S, int v0, int v1, unsigned c
 template <bool PB>
 __device__ void skinny_ring(const Params& p, Smem& S, int v0, int v1, unsigned char* ring, uint64_t* bars, int& seq,
                             __nv_bfloat16* x1base, bool cpf_ok, int cB0, int cBn, int nSall, int poolBase) {
-  const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+  const int tid = TIDX, lane = tid & 31, warp = WARP_IDX(tid);
   const uint32_t k16 = 16u + p.zero;  // opaque 16 (scale decode IMAD)
   (void)k16;
   const int rbs = PB ? RB_B : RB_A;
@@ -1656,13 +1674,13 @@ __device__ __forceinline__ void fat_issue(const Params& p, int e, int ub, int ks
   const int nub = PB ? UB_B : UB_A;
   const unsigned char* src = (nat ? (PB ? p.wBn : p.wAn) : (PB ? p.wBf : p.wAf)) + (((size_t)e * nub + ub) * 16 + ks) * (size_t)UNIT_BYTES;
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900 && OKC_USE_TMA
-  if (threadIdx.x == 0) {
+  if (TIDX == 0) {
     asm volatile("mbarrier.arrive.expect_tx.shared::cta.b64 _, [%0], %1;\n" ::"r"(smem_u32(bar)), "r"(UNIT_BYTES) : "memory");
     asm volatile("cp.async.bulk.shared::cluster.global.mbarrier::complete_tx::bytes" L2H_SUFFIX " [%0], [%1], %2, [%3]" L2H_OPERAND ";\n"
                  ::"r"(smem_u32(slot)), "l"(src), "r"(UNIT_BYTES), "r"(smem_u32(bar)) L2H_ARG : "memory");
   }
 #else
-  for (int i = threadIdx.x; i < UNIT_BYTES / 16; i += NT)
+  for (int i = TIDX; i < UNIT_BYTES / 16; i += NT)
     asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(smem_u32(slot + i * 16)), "l"(src + i * 16));
   asm volatile("cp.async.mbarrier.arrive.noinc.shared::cta.b64 [%0];\n" ::"r"(smem_u32(bar)) : "memory");
 #endif
@@ -1935,7 +1953,7 @@ __device__ __forceinline__ void fat_compute(const Smem& S, const unsigned char* 
 
 template <bool PB, bool BIG>
 __device__ __forceinline__ void fat_stream(const Params& p, Smem& S, __nv_bfloat16* xbuf, int nF, int ubs) {
-  const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+  const int tid = TIDX, lane = tid & 31, warp = WARP_IDX(tid);
   const int g = lane >> 2, t = lane & 3;
   int* ctr = p.ctr + (PB ? 1 : 0);
   unsigned char* ring = reinterpret_cast<unsigned char*>(xbuf);
@@ -2157,7 +2175,7 @@ __device__ void early_issue(const Params& p, Smem& S) {
   return;  // the first units were issued at kernel start (FAST1), or the WGS producer warp owns the ring
 #endif
   if (OKC_FATSTATIC && S.njF > 0) {  // fat units run first and own the ring region
-    if (threadIdx.x == 0) S.preissued = 0;
+    if (TIDX == 0) S.preissued = 0;
     return;
   }
   const int nS = S.njS * RB_A - dyn_pool(S.njS * RB_A, gridDim.x);  // static part (the pool tail is claimed at run time)
@@ -2168,7 +2186,7 @@ __device__ void early_issue(const Params& p, Smem& S) {
   // only the first unit, issued by the last warp so warp 0 (routing) is not held up; the ring prologue in
   // skinny_ring issues the rest after routing, so every CTA's first unit is served ahead of the second ones
   const int n = min(OKC_EARLYN, v1 - v0);
-  if (threadIdx.x == NT - 32) {
+  if (TIDX == NT - 32) {
     asm volatile("fence.proxy.async.shared::cta;\n" ::: "memory");
     for (int i = 0; i < n; ++i) { ring_issue<false>(p, S, v0 + i, ring + i * UNIT_BYTES, S.bars + i); S.uslot[i] = v0 + i; }
     S.preissued = n > 0 ? n : 0;
@@ -2176,7 +2194,7 @@ __device__ void early_issue(const Params& p, Smem& S) {
 #else
   const int n = min(OKC_NS, v1 - v0);
   for (int i = 0; i < n; ++i) ring_issue_all<false>(p, S, v0 + i, ring + i * UNIT_BYTES, S.bars + i);
-  if (threadIdx.x == 0) S.preissued = n > 0 ? n : 0;
+  if (TIDX == 0) S.preissued = n > 0 ? n : 0;
 #endif
 }
 
@@ -2200,6 +2218,12 @@ static_assert(!OKC_WS || !OKC_WSBL || OKC_WSBLK <= OKC_WSNR, "OKC_WSBLK must not
 #endif
 #ifndef OKC_WSRF
 #define OKC_WSRF 0
+#endif
+#ifndef OKC_WSHP
+#define OKC_WSHP 0  // WS tiny builds: the helper warp copies its epilogue constants (per-job gsA / gsB, the 8 KB post-norm
+                    // weights) into smem while the first units are in flight; measured without it the helper's first
+                    // epilogue waits ~5 us on cold global loads under a saturated memory system and the backlog delays
+                    // the doneA credits (the phase-B gate) by 2-4 us (set V stamps)
 #endif
 #ifndef OKC_WSSTR
 #define OKC_WSSTR 0  // WS tiny builds: with up to this many skinny jobs, a CTA's units of each phase are the strided set
@@ -2232,7 +2256,7 @@ __device__ __forceinline__ int ws_str_jobcnt(int jr, int rbs) {  // this CTA's u
 }
 template <bool PB>
 __device__ void skinny_ring_ws(const Params& p, Smem& S, int v0, int v1, unsigned char* ring, uint64_t* bars, int& seq) {
-  const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+  const int tid = TIDX, lane = tid & 31, warp = WARP_IDX(tid);
   const uint32_t k16 = 16u + p.zero;  // opaque 16 (scale decode IMAD)
   (void)k16;
   const int rbs = PB ? RB_B : RB_A;
@@ -2442,7 +2466,22 @@ __device__ __forceinline__ void ws_issue(const Params& p, Smem& S, int q, int nA
 }
 
 __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
-  const int lane = threadIdx.x & 31;
+  const int lane = TIDX & 31;
+#if OKC_WSHP
+  {  // the epilogue constants into smem, issued now (kernel start) as asynchronous copies: a cold global load issued
+     // during the weight stream waits 5-7 us (set V/W stamps), and a synchronous load here delays the CTA barrier;
+     // all local experts (no routing needed); waited for just before the first epilogue
+    const uint32_t s_nw = smem_u32(S.hnw), s_gs = smem_u32(&S.hgs[0][0]);
+    const char* nw = reinterpret_cast<const char*>(p.normw);
+    for (int i = lane; i < HD * 2 / 16; i += 32)
+      asm volatile("cp.async.cg.shared.global [%0], [%1], 16;\n" ::"r"(s_nw + i * 16), "l"(nw + i * 16) : "memory");
+    if (lane < p.nloc && lane < 32) {
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(s_gs + lane * 4), "l"(reinterpret_cast<const char*>(p.gsA + lane)) : "memory");
+      asm volatile("cp.async.ca.shared.global [%0], [%1], 4;\n" ::"r"(s_gs + 128 + lane * 4), "l"(reinterpret_cast<const char*>(p.gsB + lane)) : "memory");
+    }
+    asm volatile("cp.async.commit_group;\n" ::: "memory");
+  }
+#endif
   WS_JOIN();  // routing tables and this CTA's ranges are ready
   const int a0 = S.wsr[0], a1 = S.wsr[1], b0 = S.wsr[2], b1 = S.wsr[3];
   const int nA = a1 - a0, N = nA + (b1 - b0);
@@ -2471,6 +2510,10 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
     pf_i += cnt * 32;
   };
   if (nA == 0) pf_issue((pf_n + 31) / 32);
+#endif
+#if OKC_WSHP
+  asm volatile("cp.async.wait_group 0;\n" ::: "memory");  // the epilogue constants have landed (every lane its own copies)
+  __syncwarp();
 #endif
   unsigned long long dv_fence = 0, dv_wA = 0, dv_wB = 0, dv_eA = 0, dv_eB = 0, dv_t = 0;  // (debug) helper accounting
   if (OKC_DEBUG && lane == 0 && p.dbg) *DBGV_PTR(5) = gtimer();
@@ -2503,7 +2546,11 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
     // sm: (row gg, token 2tt), (row gg, token 2tt+1), (row gg+8, token 2tt), (row gg+8, token 2tt+1)
     const int cnt = S.jC[j], st = S.jS[j], ce = S.jE[j];
     if (!PB) {
+#if OKC_WSHP
+      const float gsc = S.hgs[0][ce] * TWO62;
+#else
       const float gsc = p.gsA[ce] * TWO62;
+#endif
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const int tk = 2 * tt + h;
@@ -2543,9 +2590,14 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
       }
       if (OKC_DEBUG && q == 0 && lane == 0) DBGU(3);  // (debug) the helper's first phase-A epilogue done
     } else {
-      const float gsc = p.gsB[ce] * TWO62;
       const int n0 = rb * 16 + gg;
+#if OKC_WSHP
+      const float gsc = S.hgs[1][ce] * TWO62;
+      const float nw0 = 1.f + __bfloat162float(S.hnw[n0]), nw1 = 1.f + __bfloat162float(S.hnw[n0 + 8]);
+#else
+      const float gsc = p.gsB[ce] * TWO62;
       const float nw0 = 1.f + __bfloat162float(p.normw[n0]), nw1 = 1.f + __bfloat162float(p.normw[n0 + 8]);
+#endif
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
         const int tk = 2 * tt + h;
@@ -2636,7 +2688,7 @@ __device__ __forceinline__ void wsd_issue(const Params& p, Smem& S, int q, int p
 // compute warps: follow the published sequence; per unit: x for the job (registers), wait the slot, codes to registers,
 // release the slot, 32 MMAs, partials to the helper
 __device__ void skinny_ring_wsd(const Params& p, Smem& S, unsigned char* ring) {
-  const int tid = threadIdx.x, lane = tid & 31, warp = WARP_IDX(tid);
+  const int tid = TIDX, lane = tid & 31, warp = WARP_IDX(tid);
   const uint32_t k16 = 16u + p.zero;  // opaque 16 (scale decode IMAD)
   (void)k16;
   const int njF = S.njF;
@@ -2717,7 +2769,7 @@ __device__ void skinny_ring_wsd(const Params& p, Smem& S, unsigned char* ring) {
 }
 // helper warp: claims and issues the sequence (lane 0), runs every epilogue, credits doneA
 __device__ void ws_helper_d(const Params& p, Smem& S, unsigned char* ring) {
-  const int lane = threadIdx.x & 31;
+  const int lane = TIDX & 31;
   WS_JOIN();  // routing tables, ranges and pool bounds are ready
   const int njF = S.njF;
   WsdSrc src{0, S.wsr[0] + S.preissued, S.wsr[1], -1};
@@ -2961,7 +3013,7 @@ __device__ __forceinline__ void wgs_wait(uint64_t* bar, uint32_t parity, int tag
     if (ok) return;
   }
 #if OKC_WGSDBG == 1
-  printf("WGS hang: block %d thread %d tag %d parity %u\n", (int)blockIdx.x, (int)threadIdx.x, tag, parity);
+  printf("WGS hang: block %d thread %d tag %d parity %u\n", (int)blockIdx.x, (int)TIDX, tag, parity);
 #endif
   __trap();  // (OKC_WGSDBG 2: no printf, so no CALL inside the wgmma pipeline or a deallocated producer region)
 #else
@@ -3121,7 +3173,7 @@ __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
 #else
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
 #endif
-  if ((threadIdx.x & 31) != 0) return;
+  if ((TIDX & 31) != 0) return;
   int ws = 0, n = 0, k = 0;
   uint32_t wph = 0;
   unsigned long long wring_wait = 0;
@@ -3186,7 +3238,7 @@ __device__ void wgs_wproducer(const Params& p, Smem& S, unsigned char* ring) {
 #else
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
 #endif
-  if ((threadIdx.x & 31) != 0) return;
+  if ((TIDX & 31) != 0) return;
   int ws = 0, n = 0;
   uint32_t wph = 0;
   unsigned long long wring_wait = 0;
@@ -3230,7 +3282,7 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
   // the routing tables are ready (the consumers arrive on barrier 7 right after routing): this idle warp computes the
   // stage ranges while the consumers gather phase A's x
   asm volatile("bar.sync 7, %0;\n" ::"n"(NT + (OKC_WGSEARLY ? 64 : 32)) : "memory");
-  if ((threadIdx.x & 31) == 0) { wgs_ranges(p, S); if (OKC_DEBUG && p.dbg) p.dbg[(size_t)gridDim.x * 13 + (size_t)blockIdx.x * 4 + 3] = gtimer(); }
+  if ((TIDX & 31) == 0) { wgs_ranges(p, S); if (OKC_DEBUG && p.dbg) p.dbg[(size_t)gridDim.x * 13 + (size_t)blockIdx.x * 4 + 3] = gtimer(); }
   __syncwarp();
 #endif
 #if OKC_WGSEARLY
@@ -3239,7 +3291,7 @@ __device__ void wgs_xproducer(const Params& p, Smem& S, unsigned char* ring) {
 #else
   WS_JOIN();  // routing tables and this CTA's stage ranges are ready
 #endif
-  if ((threadIdx.x & 31) != 0) return;
+  if ((TIDX & 31) != 0) return;
   unsigned char* xring = ring + WGS_NS * UNIT_BYTES;
   int xs = 0, n = 0;
   uint32_t xph = 0;
@@ -3404,7 +3456,7 @@ struct WgsCur { int n; };
 // phase A's x gather (all consumer threads of every CTA, once, at the start): this CTA's share of the jobs' padded rows
 // copied into xA's per-stage wgmma layout, then counted into xready (padding rows are counted, not written)
 __device__ void wgs_gather(const Params& p, Smem& S) {
-  const int tid = threadIdx.x, nj = S.njF + S.njS;
+  const int tid = TIDX, nj = S.njF + S.njS;
   const int R = S.jrow[nj];  // R * G < 2^24: exact float muldiv, no divide routine
   const float rG = __fdividef(1.f, (float)gridDim.x);
   const int q0 = muldiv_g(R, blockIdx.x, gridDim.x, rG), q1 = muldiv_g(R, blockIdx.x + 1, gridDim.x, rG);
@@ -3465,7 +3517,7 @@ __device__ void wgs_gather(const Params& p, Smem& S) {
 }
 #if OKC_GATHT
 __device__ void wgs_gather_t(const Params& p, Smem& S, unsigned char* stg) {
-  const int tid = threadIdx.x, nj = S.njF + S.njS;
+  const int tid = TIDX, nj = S.njF + S.njS;
   const int ntiles = S.jrow[nj] >> 3;
   constexpr int RS = HD * 2 + 16;  // staged row stride (bytes): the 8 rows of a tile hit different bank groups
   static_assert(NT * 16 == HD * 2, "one 16 B chunk per thread per row");
@@ -3505,7 +3557,7 @@ __device__ void wgs_gather_t(const Params& p, Smem& S, unsigned char* stg) {
 struct WgsPend { int kind, u, slot, nst; };
 template <bool PB>
 __device__ __forceinline__ void wgs_epi_tile(const Params& p, const Smem& S, int j, int r16, int nt, const float* d4) {
-  const int lane = threadIdx.x & 31, g = lane >> 2, t = lane & 3;
+  const int lane = TIDX & 31, g = lane >> 2, t = lane & 3;
   const int cnt = S.jC[j], jst = S.jS[j], e = S.jE[j];
   if (!PB) {
     // SwiGLU straight into xB (phase B's per-stage wgmma B layout) instead of row-major inter
@@ -3547,7 +3599,7 @@ __device__ __forceinline__ void wgs_epi_tile(const Params& p, const Smem& S, int
 template <bool PB>
 __device__ __forceinline__ void wgs_flush(const Params& p, Smem& S, WgsPend& pd) {
   if (pd.kind == 0) return;
-  const int tid = threadIdx.x, warp = WARP_IDX(tid), wg = warp >> 2, wp = warp & 3, wt = tid & 127;
+  const int tid = TIDX, warp = WARP_IDX(tid), wg = warp >> 2, wp = warp & 3, wt = tid & 127;
   constexpr int UBL = PB ? 4 : 5;
   const int j = pd.u >> UBL, ub = pd.u & ((1 << UBL) - 1);
   asm volatile("bar.sync %0, 128;\n" ::"r"(3 + wg) : "memory");
@@ -3623,7 +3675,7 @@ __device__ __forceinline__ bool wgs_is_fin(const Smem& S, int u, int s0, int s1)
 template <bool PB, int NTT>
 __device__ __forceinline__ void wgs_seg(const Params& p, Smem& S, unsigned char* ring, int u, int s0, int s1, int slot,
                                         int& seq, WgsPend& pd, WgsCur& wc, WgsCur& xc) {
-  const int tid = threadIdx.x, lane = tid & 31;
+  const int tid = TIDX, lane = tid & 31;
   const int warp = WARP_IDX(tid);
   (void)wc; (void)xc;
   const int wg = warp >> 2, wp = warp & 3, g = lane >> 2, wt = tid & 127;
@@ -3769,7 +3821,7 @@ __device__ __forceinline__ void wgs_seg_mma(const Params& p, Smem& S, unsigned c
                                             int& seq, WgsPend& pd, WgsCur& wc, WgsCur& xc) {
   static_assert(!OKC_WGSFOLD || OKC_WGSMMAN == 0, "OKC_WGSFOLD: wgmma segments only");
   (void)wc; (void)xc;
-  const int tid = threadIdx.x, lane = tid & 31;
+  const int tid = TIDX, lane = tid & 31;
   const int warp = WARP_IDX(tid);
   const int wg = warp >> 2, wp = warp & 3, g = lane >> 2, t = lane & 3, wt = tid & 127;
   constexpr int UBL = PB ? 4 : 5;
@@ -3971,7 +4023,7 @@ __device__ __noinline__ void wgs_ranges(const Params& p, Smem& S) {
 }
 // padded-row base of every job in xA / xB (one warp: lanes = jobs)
 __device__ __forceinline__ void wgs_jrow(Smem& S) {
-  const int tid = threadIdx.x;
+  const int tid = TIDX;
   const int nj = S.njF + S.njS;
   int carry = 0;
   for (int j0 = 0; j0 < nj; j0 += 32) {
@@ -4068,7 +4120,7 @@ template <bool BIG>
 __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   Smem& S = *reinterpret_cast<Smem*>(smem_raw);
   __nv_bfloat16* xbuf = reinterpret_cast<__nv_bfloat16*>(smem_raw + ((sizeof(Smem) + 127) / 128) * 128);
-  const int tid = threadIdx.x;
+  const int tid = TIDX;
   DBG(0);
   // programmatic dependent launch: everything below reads the previous kernel's outputs (routing, x) or writes
   // scratch, so wait for it here; without the launch attribute this returns at once
@@ -5144,7 +5196,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "V"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "X"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 def _fast1(defs, n):  # a tiny define tuple with another FAST1 pre-issue depth (units issued before routing, <= OKC_NS)
@@ -5163,6 +5215,31 @@ DIAG_VARIANT_SETS = {
         "wgs_now": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=32",), "shapes": _WGS_SHAPES},
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
+    },
+    "X": {  # OKC_WSH0: the helper as hardware warp 0 (scheduler age priority), alone and with the strided order
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_h0": {"defines": TINY_DEFINES + ("-DOKC_WSH0=1",), "shapes": [1]},
+        "tiny_h0_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSH0=1", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny_h0_str": {"defines": TINY_DEFINES + ("-DOKC_WSH0=1", "-DOKC_WSSTR=4"), "shapes": [1]},
+        "tiny_h0_str_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSH0=1", "-DOKC_WSSTR=4", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_h0": {"defines": TINY2_DEFINES + ("-DOKC_WSH0=1",), "shapes": [8]},
+        "tiny2_h0_dbg": {"defines": TINY2_DEFINES + ("-DOKC_WSH0=1", "-DOKC_DEBUG=1"), "shapes": [8]},
+        "mid": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_h0": {"defines": MID_DEFINES + ("-DOKC_WSH0=1",), "shapes": [16]},
+    },
+    "W": {  # OKC_WSHP: the helper's epilogue constants prefetched into smem (set V: its first epilogue took ~5 us on cold
+            # loads and the backlog delayed the doneA credits 2-4 us), alone and with the strided order
+        "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
+        "tiny_hp": {"defines": TINY_DEFINES + ("-DOKC_WSHP=1",), "shapes": [1]},
+        "tiny_hp_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSHP=1", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny_hp_str": {"defines": TINY_DEFINES + ("-DOKC_WSHP=1", "-DOKC_WSSTR=4"), "shapes": [1]},
+        "tiny_hp_str_dbg": {"defines": TINY_DEFINES + ("-DOKC_WSHP=1", "-DOKC_WSSTR=4", "-DOKC_DEBUG=1"), "shapes": [1]},
+        "tiny2": {"defines": TINY2_DEFINES, "shapes": [8]},
+        "tiny2_hp": {"defines": TINY2_DEFINES + ("-DOKC_WSHP=1",), "shapes": [8]},
+        "tiny2_hp_dbg": {"defines": TINY2_DEFINES + ("-DOKC_WSHP=1", "-DOKC_DEBUG=1"), "shapes": [8]},
+        "mid": {"defines": MID_DEFINES, "shapes": [16]},
+        "mid_hp": {"defines": MID_DEFINES + ("-DOKC_WSHP=1",), "shapes": [16]},
     },
     "V": {  # helper-warp accounting at bs1: fence time before the doneA credits, backlog (unit-3 hand-off vs its epilogue),
             # partials waits vs epilogue time; shipped contiguous order vs the strided order (set T: the strided order's
@@ -5353,11 +5430,11 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET in ("Q", "S", "V") else [1, 4, 8, 16] if DIAG_SET in ("R", "T") else [32, 128] if DIAG_SET == "U" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 4, 8] if DIAG_SET in ("Q", "S", "V") else [1, 8, 16] if DIAG_SET in ("W", "X") else [1, 4, 8, 16] if DIAG_SET in ("R", "T") else [32, 128] if DIAG_SET == "U" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M", "N", "O", "P") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 # (bs, touched local experts) cases: the input seed is searched (DIAG_SEED + bs + 1000 k) for the judge's typical draw
 # (tools/moe_routing_stats.py, 60 seeds: bs1 p10/p50/p90 2/3/3, bs4 4/6/8, bs8 5/8/11); None: the fixed seed
-DIAG_CASES = [(1, 2), (1, 3), (8, 8)] if DIAG_SET == "V" else [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET in ("Q", "S") else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET in ("R", "T") else [(bs, None) for bs in DIAG_SHAPES]
+DIAG_CASES = [(1, 2), (1, 3), (8, 8)] if DIAG_SET == "V" else [(1, 2), (1, 3), (8, 8), (16, None)] if DIAG_SET in ("W", "X") else [(1, 2), (1, 3), (4, 6), (8, 8)] if DIAG_SET in ("Q", "S") else [(1, 2), (1, 3), (4, 6), (8, 8), (16, None)] if DIAG_SET in ("R", "T") else [(bs, None) for bs in DIAG_SHAPES]
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
 
