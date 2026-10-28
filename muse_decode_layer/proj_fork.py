@@ -3359,7 +3359,7 @@ SK2_PICK = {  # (layer, tokr) -> config name
     ('router', 16): 'router',
     ('router', 32): 'router',
     ('unpooler', 8): 'slice8_r192',
-    ('unpooler', 16): 'unpooler16t_r72',
+    ('unpooler', 16): 'unpooler16h_r100',   # (the standalone's unpooler16t_r72 ran 18.2 vs 15.5 us in this kernel: b73aff83)
     ('unpooler', 32): 'unpooler32_r144',
 }
 SK2_ROT = False
