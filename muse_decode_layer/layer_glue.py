@@ -249,7 +249,7 @@ BND1_MAX_T = 8     # cooperative prologue: CTA c owns its 64 columns of every ro
 
 
 def _bnd1_fuse_ok(state, T):
-    return (FUSE_BND1 and T <= BND1_MAX_T and state.get("fuse_bnd1_ok") and state.get("bfp") is not None
+    return (FUSE_BND1 and T <= BND1_MAX_T and T in state.get("fuse_bnd1_ok_T", ()) and state.get("bfp") is not None
             and "bnd1" in bfp_fused_pooler_router.__code__.co_varnames and "ab1" in state
             and state["g_preffn"].dtype == torch.bfloat16 and state.get("bnd1_on", {}).get(T, True))
 
@@ -304,10 +304,12 @@ def _bnd1_selftest(st):
         del flush_
         print(f"boundary-1 prologue T{T}: fused launch {t_plain:.1f} us -> with the prologue {t_bnd1:.1f} us", flush=True)
         if not (t_bnd1 - t_plain < BND1_MAX_COST_US):   # (the chain timing in _tune makes the final on/off choice)
-            print(f"boundary-1 prologue T{T}: too costly (+{t_bnd1 - t_plain:.1f} us), off", flush=True)
-            return
-    print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
-    st["fuse_bnd1_ok"] = True
+            print(f"boundary-1 prologue T{T}: too costly (+{t_bnd1 - t_plain:.1f} us), off at T{T}", flush=True)
+            continue   # per T: a costly row count does not switch the other off
+        st.setdefault("fuse_bnd1_ok_T", set()).add(T)
+    print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report)
+          + f"; enabled at T {sorted(st.get('fuse_bnd1_ok_T', ()))}", flush=True)
+    st["fuse_bnd1_ok"] = bool(st.get("fuse_bnd1_ok_T"))
 
 
 BND1_MAX_COST_US = 6.0   # isolated gate (a guard against a broken prologue); the chain timing per T decides below it
@@ -1717,7 +1719,7 @@ def _tune(st, log=False):
             # the pooler + router form at this T, on the chain: separate launches (pooler cgemv / sk2 + router rgemv /
             # sk2) + _boundary1, the fused launch + _boundary1, or the fused launch computing the boundary in its
             # prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each other
-            cands = [("bfp", False), ("bfpf", False)] + ([("bfpf", True)] if st.get("fuse_bnd1_ok") else [])
+            cands = [("bfp", False), ("bfpf", False)] + ([("bfpf", True)] if T in st.get("fuse_bnd1_ok_T", ()) else [])
             btimes = {}
             for pr_pick, flag in cands:
                 st["mm_pick"][(T, "pr")] = pr_pick
