@@ -372,3 +372,12 @@ alpha / beta in registers; the four row sums (sum x^2, A = sum (alpha st)^2, B =
 `route_kernel<SPLIT>`: one 256-thread CTA per token, thread e owns logit e (8 block-argmax rounds, ties to the lower
 index as tl.argmax) and 16 pooled columns; split and combined fp32 inputs. 32-40 registers. Self-tested vs the
 Triton kernels at T=1/8/32/128 (`_glue_selftest`, st["glue_ok"]); per-T switch st["glue_on"]; Triton = fallback.
+
+PDL pitfall found on the way (2f4cf4c): the first build failed the judge's check only under graph replay with PDL
+(T <= 32), only on the FIRST replay after a capture, only the routing kernel. The producer's outputs were taken as
+`const T* __restrict__`: nvcc emits ld.global.nc for those and ptxas hoists such loads above `griddepcontrol.wait`
+(the asm "memory" clobber does not pin them), so the early-launched dependent read the buffers before the fused
+pooler+router wrote them: garbage on the first replay (fresh pool memory), the previous replay's identical values
+afterwards ("correct"), never in eager mode (launch gaps) or with PDL off. glue_diag.py (per kernel kind and PDL
+placement mode) showed: wait-before-any-load fixes it, moving the trigger does not. Rule: a PDL dependent must read
+anything the preceding grid writes after the wait through __ldcg / plain loads, never via const __restrict__ / __ldg.
