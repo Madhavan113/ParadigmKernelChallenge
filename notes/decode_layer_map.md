@@ -353,3 +353,22 @@ are 1-5 us better per shape than the old tuner's losing draws and never worse; p
 variant 2.6-3.7 us at T=1); (2) a single judged run resolves ~2-4% per shape (MoE draw + the reference column's own
 drift), so sub-1% effects need the VM, not checks; (3) the 300 s prepare was dominated by Triton JIT of candidates
 the picks never use (unscored T rows, pinned layers, Marlin) - 80 s on the VM after the trim.
+
+## 12. The three glue kernels as CUDA (Oct 28, after b7520fb)
+
+Why they cost 13-14 us of the 69 us T=1 chain (ncu, glue.ncu-rep): `_boundary1` 6.6 us, `_route_split` 5.8,
+`_boundary2` 6.1 at T=1 and the same per program at T=8. Each is ONE 16-warp (routing: 8-warp) CTA per token running
+~790 instructions per warp (12.7K warp-instructions per program) with 4 warps per scheduler: No-Eligible 61-75%,
+8-10.6 cycles per issued instruction, 6-70 GB/s, DRAM 0.1-1.5%, compute 0.2-1.7% = a latency / issue chain on one SM.
+Not the S loop: every producer already emits one reduced row (cgemv reduces K inside the CTA, sk2 through its own
+last-arriver, cuBLAS at T>32), so `for s in range(S)` runs once; no producer-side reduction to add.
+
+Fix (b28bacc): `okc_glue` extension (load_inline in prepare's thread pool). `bnd_kernel<KIND, AT>`: grid (8, T) x 256
+threads x 4 columns; stream / s1, gate and norm weights loaded before griddepcontrol.wait, the producer slice after;
+alpha / beta in registers; the four row sums (sum x^2, A = sum (alpha st)^2, B = sum (alpha st)(beta x), D = sum
+(beta x)^2; sum s^2 = A + 2rB + r^2 D) reduced per CTA, exchanged via a per-token ticket barrier of 8 arrivals
+(monotonic tickets aligned to blocks of 8: no reset, graph-replay safe), scales formed by the same tree in every CTA
+(deterministic), slice finished from registers. bf16 / fp32 producers, the 1024-wide unpooler slice, T up to 256.
+`route_kernel<SPLIT>`: one 256-thread CTA per token, thread e owns logit e (8 block-argmax rounds, ties to the lower
+index as tl.argmax) and 16 pooled columns; split and combined fp32 inputs. 32-40 registers. Self-tested vs the
+Triton kernels at T=1/8/32/128 (`_glue_selftest`, st["glue_ok"]); per-T switch st["glue_on"]; Triton = fallback.
