@@ -251,3 +251,4 @@ State: HEAD carries every lever self-tested and tuner-picked (cgemv/sgemv/rgemv 
 picks them; prologue, routing modes and pr form chosen on the chain per T). Judged band of the last 9 runs on
 near-identical code: 2.076-2.098. The remaining layer time at T=1 is kernel-side: MoE 22-29 us (routing-dependent),
 fused pooler+router 19, qkv cgemv 9.2 (floor 7.9), attention 4.7, three glue kernels ~13 us of rows (~8 exposed).
+| 1d2eac51 | + MoE aa9a8a4 (TINY/TINY2 builds with their L2 hints on; the phase-B prefetch OKC_PBPF measured a loss in the MoE agent's DIAG, dormant) | **2.1055 (2.074-2.137)** | highest judged layer: MoE rows d1 full 28.4 -> 22.0, d16 75.8/60.0 -> 61.8/52.4, v1 sliding 65.4 -> 56.7; at T=1 the separate cgemv pooler 13.7 + rgemv router 3.7 beat the fused launch 19.1 on the chain (prform bfp 70 / bfpf 73); per shape 77.8/83.0, 131.5/209.7, 154.8/295.8, 109.1/119.1, 259.1/335.7, 326.9/493.2. HEAD a9da5cd = the file to score |
