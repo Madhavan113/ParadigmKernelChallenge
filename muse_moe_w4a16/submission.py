@@ -256,6 +256,17 @@ CUDA_SRC = r'''
 #ifndef OKC_NOLOAD
 #define OKC_NOLOAD 0
 #endif
+#ifndef OKC_RLDIST
+#define OKC_RLDIST 32  // OKC_ROUTE_LOGITS: above this many tokens the selection is distributed over the CTAs (token t by
+                       // CTA t mod G), published in global memory and followed by a grid barrier; up to it every CTA
+                       // selects every token itself (the tiny FAST1 builds always do)
+#endif
+#ifndef OKC_ROUTE_LOGITS
+#define OKC_ROUTE_LOGITS 0  // routing in the kernel from the router logits (fp32 [M, 256]) and bias (fp32 [256]):
+                            // scores = sigmoid(logit * ROUTER_MULTIPLIER), top-8 of scores + bias (ties: lower id),
+                            // weights = chosen scores / (sum + 1e-15), local id = (id - local_start) mod 256 if < 32;
+                            // the decode layer's _route_split formula, bit-for-bit (ex2.approx + div.full as Triton)
+#endif
 #ifndef OKC_NOCOMPUTE
 #define OKC_NOCOMPUTE 0
 #endif
@@ -344,6 +355,12 @@ struct Params {
   int* doneAs;                           // WGS: per (job, phase-B stage), phase-A warpgroup epilogues done (8 = ready)
   uint32_t zero;  // always 0 (opaque to the compiler)
   const __nv_bfloat16* x; const int* topk_ids; const float* topk_w;
+  const float* logits;   // OKC_ROUTE_LOGITS: router logits [M, 256] fp32
+  const float* rbias;    // OKC_ROUTE_LOGITS: router bias [256] fp32
+  const int* lsp;        // OKC_ROUTE_LOGITS: local_start (device int32), or null -> lo
+  int* gid_out;          // OKC_ROUTE_LOGITS: chosen global expert ids [M, 8] (written by CTA 0)
+  const float* rsp;      // OKC_ROUTE_LOGITS: pre-expert RMS partials [M, 128] fp32 (sum of squares of the pooled row
+                         // over 128 slices) or null; rs_t = rsqrt(sum / 4096 + 1e-5) scales GEMM1's output per token
   int M, lo, nloc;
   int* ctr;        // [8]: 0 ctrA, 1 ctrB, 2 barrier, 3 exit
   int* doneA;      // [JMAX]
@@ -357,6 +374,9 @@ struct Params {
 
 struct Smem {
   uint32_t lut[256];
+#if OKC_ROUTE_LOGITS && !OKC_PRMTSC
+  float rs_[256];   // per-token GEMM1 scale (PRMT builds alias the unused LUT)
+#endif
 #if !OKC_WGS
   float red[NRB][NW][32][RED_W];  // per-unit cross-warp partial sums
 #else
@@ -401,6 +421,18 @@ struct Smem {
   short pos[EMAX];   // entry -> pair position, -1 if not local
 };
 
+#if OKC_ROUTE_LOGITS
+__device__ __forceinline__ float* rs_ptr(Smem& S) {
+#if OKC_PRMTSC
+  return reinterpret_cast<float*>(S.lut);
+#else
+  return S.rs_;
+#endif
+}
+#define RS_T(tok) (rs_ptr(const_cast<Smem&>(S))[(tok)])
+#else
+#define RS_T(tok) 1.f
+#endif
 // floor(a * c / G) without an integer divide (per-launch code runs from a cold instruction cache, where the divide
 // subroutines cost ~1 us): a * c < 2^24, rG ~ 1 / G, then an exact +-1 fix-up
 __device__ __forceinline__ int muldiv_g(int a, int c, int G, float rG) {
@@ -451,6 +483,11 @@ __device__ __forceinline__ unsigned long long gtimer() {
   asm volatile("mov.u64 %0, %globaltimer;" : "=l"(t));
   return t;
 }
+#if OKC_ROUTE_LOGITS
+#define TOPKW(i) __ldcg(p.topk_w + (i))  // written by CTA 0 in this launch (visible after the grid barrier)
+#else
+#define TOPKW(i) p.topk_w[i]
+#endif
 #define DBG(k) do { if (OKC_DEBUG && threadIdx.x == 0 && p.dbg) p.dbg[blockIdx.x * 8 + (k)] = gtimer(); } while (0)
 extern __shared__ __align__(16) unsigned char smem_raw[];
 __device__ __forceinline__ float* ss_cur();  // this launch's ss copy (defined after Smem users)
@@ -496,6 +533,68 @@ __device__ __forceinline__ void chunk_mma(uint4 w, uint32_t sg, uint32_t sg8, co
   }
 }
 
+#if OKC_ROUTE_LOGITS
+// ---------------------------------------------------------------- in-kernel top-8 routing from the router logits
+// Triton's tl.sigmoid(x) = 1 / (1 + exp(-x)) with exp lowered to ex2.approx.f32(x * log2e) and / to div.full.f32:
+// the same instructions here, so the scores (and the selection) match the layer's _route_split kernel bit for bit.
+__device__ __forceinline__ float ex2_approx(float x) { float y; asm("ex2.approx.f32 %0, %1;" : "=f"(y) : "f"(x)); return y; }
+__device__ __forceinline__ float div_full(float a, float b) { float y; asm("div.full.f32 %0, %1, %2;" : "=f"(y) : "f"(a), "f"(b)); return y; }
+__device__ __forceinline__ float sigmoid_tl(float x) { return div_full(1.f, 1.f + ex2_approx((-x) * 1.4426950408889634f)); }
+// one warp selects token t's experts: lane l holds experts 8 l .. 8 l + 7; 8 rounds of (lane-local strict max, lowest k
+// on ties; butterfly max over the lanes keeping value desc, index asc; the winner masked to -inf). Writes S.eid (local
+// ids) for this CTA; CTA 0 also writes the global ids and the renormalized weights (read by the final pass of every
+// CTA after the grid barrier).
+__device__ __forceinline__ void route_select(const Params& p, Smem& S, int t, int lo, const float4 (&lq)[2], const float (&bv)[8],
+                                             bool store_eid, bool store_out) {
+  const int lane = threadIdx.x & 31;
+  const float lv[8] = {lq[0].x, lq[0].y, lq[0].z, lq[0].w, lq[1].x, lq[1].y, lq[1].z, lq[1].w};
+  float sc[8], sel[8];
+#pragma unroll
+  for (int k = 0; k < 8; ++k) { sc[k] = sigmoid_tl(lv[k] * 0.1767766952966369f); sel[k] = sc[k] + bv[k]; }
+  int chosen[8];
+  float w[8];
+#pragma unroll
+  for (int r = 0; r < 8; ++r) {
+    float m = sel[0];
+    int mi = 0;
+#pragma unroll
+    for (int k = 1; k < 8; ++k) if (sel[k] > m) { m = sel[k]; mi = k; }
+    int gi = lane * 8 + mi;
+#pragma unroll
+    for (int off = 16; off > 0; off >>= 1) {
+      const float om = __shfl_xor_sync(0xffffffffu, m, off);
+      const int oi = __shfl_xor_sync(0xffffffffu, gi, off);
+      if (om > m || (om == m && oi < gi)) { m = om; gi = oi; }
+    }
+    // gi is warp-uniform: the winner's score from its lane, then masked
+    const int kw = gi & 7;
+    float v = sc[0];
+#pragma unroll
+    for (int k = 1; k < 8; ++k) v = (k == kw) ? sc[k] : v;
+    w[r] = __shfl_sync(0xffffffffu, v, gi >> 3);
+    chosen[r] = gi;
+    if (lane == (gi >> 3)) {
+#pragma unroll
+      for (int k = 0; k < 8; ++k) sel[k] = (k == kw) ? -INFINITY : sel[k];
+    }
+  }
+  const float sum = ((w[0] + w[1]) + (w[2] + w[3])) + ((w[4] + w[5]) + (w[6] + w[7]));
+  const float den = sum + 1e-15f;
+  if (lane < 8) {
+    int g = chosen[0];
+    float ww = w[0];
+#pragma unroll
+    for (int k = 1; k < 8; ++k) { g = (lane == k) ? chosen[k] : g; ww = (lane == k) ? w[k] : ww; }
+    const int el = (g - lo + 256) & 255;  // the layer's local id: (id - local_start) mod 256, local if < 32
+    if (store_eid) S.eid[t * 8 + lane] = (signed char)(el < p.nloc ? el : -1);
+    if (store_out) {
+      p.gid_out[t * 8 + lane] = g;
+      const_cast<float*>(p.topk_w)[t * 8 + lane] = div_full(ww, den);
+    }
+  }
+}
+#endif
+
 // ---------------------------------------------------------------- routing prologue (every CTA, identical result)
 __device__ void early_issue(const Params& p, Smem& S);
 __device__ void route(const Params& p, Smem& S) {
@@ -504,7 +603,16 @@ __device__ void route(const Params& p, Smem& S) {
   const int CH = ((E + NW * 32 - 1) / (NW * 32)) * 32;
   const int i0 = warp * CH, i1 = min(E, i0 + CH);
   if (tid < NW * 32) S.wc[tid >> 5][tid & 31] = 0;
-#if OKC_RLOAD && OKC_WGS  // (the small builds lose 1-2% with it: their E is at most 256)
+#if OKC_ROUTE_LOGITS
+  if (!OKC_TINY && p.M > OKC_RLDIST) {  // distributed selection: the global ids from every CTA (else S.eid is filled)
+    const int lo = p.lsp ? __ldg(p.lsp) : p.lo;
+#pragma unroll 4
+    for (int i = tid; i < E; i += NT) {
+      const int el = (__ldcg(p.gid_out + i) - lo + 256) & 255;
+      S.eid[i] = (signed char)(el < p.nloc ? el : -1);
+    }
+  }
+#elif OKC_RLOAD && OKC_WGS  // (the small builds lose 1-2% with it: their E is at most 256)
   {  // 16 B loads (E = 8 M; the launcher checks the alignment): one or two per thread, all issued before the stores
     constexpr int LPT = (EMAX / 4 + NT - 1) / NT;
     int4 ev[LPT];
@@ -2283,7 +2391,8 @@ __device__ void ws_helper(const Params& p, Smem& S, unsigned char* ring) {
       for (int h = 0; h < 2; ++h) {
         const int tk = 2 * tt + h;
         if (tk < cnt) {
-          const float gt = (h ? sm.y : sm.x) * gsc, up = (h ? sm.w : sm.z) * gsc;
+          const float gsct = gsc * RS_T(S.ent[st + tk] >> 3);  // (OKC_ROUTE_LOGITS: per-token pre-expert RMS scale)
+          const float gt = (h ? sm.y : sm.x) * gsct, up = (h ? sm.w : sm.z) * gsct;
           st_keep_bf16(p.inter + ((size_t)(st + tk) * ID + rb * 8 + gg), __float2bfloat16(probe_q(SILU_DIV(gt, 1.f + __expf(-gt)) * up)));
         }
       }
@@ -2520,7 +2629,8 @@ __device__ void ws_helper_d(const Params& p, Smem& S, unsigned char* ring) {
       for (int h = 0; h < 2; ++h) {
         const int tk = 2 * tt + h;
         if (tk < cnt) {
-          const float gt = (h ? sm.y : sm.x) * gsc, up = (h ? sm.w : sm.z) * gsc;
+          const float gsct = gsc * RS_T(S.ent[st + tk] >> 3);
+          const float gt = (h ? sm.y : sm.x) * gsct, up = (h ? sm.w : sm.z) * gsct;
           st_keep_bf16(p.inter + ((size_t)(st + tk) * ID + rb * 8 + gg), __float2bfloat16(probe_q(SILU_DIV(gt, 1.f + __expf(-gt)) * up)));
         }
       }
@@ -3122,7 +3232,8 @@ __device__ __forceinline__ void wgs_epi_tile(const Params& p, const Smem& S, int
     for (int h = 0; h < 2; ++h) {
       const int tk = nt * 8 + 2 * t + h;
       if (tk < cnt) {
-        const float gt = d4[h] * gsc, up = d4[2 + h] * gsc;
+        const float gsct = gsc * RS_T(S.ent[jst + tk] >> 3);  // (OKC_ROUTE_LOGITS: per-token pre-expert RMS scale)
+        const float gt = d4[h] * gsct, up = d4[2 + h] * gsct;
         const float v = SILU_DIV(gt, 1.f + __expf(-gt)) * up;
         st_keep_bf16(xb + (size_t)((((col >> 8) * ntt + (tk >> 3)) * 32 + ((col & 255) >> 3)) * 64 + (tk & 7) * 8),
                      __float2bfloat16(probe_q(v)));
@@ -3655,6 +3766,59 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     return;
   }
 #endif
+#if OKC_ROUTE_LOGITS
+  {  // the top-8 selection, one warp per token (every CTA, identical result): S.eid for the routing below; the
+     // logits of the warp's next two tokens are kept in flight (L2 latency overlaps the selection)
+    const int lo = p.lsp ? __ldg(p.lsp) : p.lo;
+    const int lane = tid & 31, warp = tid >> 5;
+    const float4* bb = reinterpret_cast<const float4*>(p.rbias + lane * 8);
+    const float4 b0 = __ldg(bb), b1 = __ldg(bb + 1);
+    const float bv[8] = {b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w};
+    float4 q0[2], q1[2], q2[2];
+    auto ld = [&](int t, float4 (&q)[2]) {
+      if (t < p.M) {
+        const float4* lg = reinterpret_cast<const float4*>(p.logits + (size_t)t * 256 + lane * 8);
+        q[0] = __ldg(lg); q[1] = __ldg(lg + 1);
+      }
+    };
+    const bool dist = !OKC_TINY && p.M > OKC_RLDIST;  // (the tiny builds' FAST1 needs S.eid before routing)
+    const int G = (int)gridDim.x;
+    const int t0 = dist ? (int)blockIdx.x + warp * G : warp, ts = dist ? NW * G : NW;
+    ld(t0, q0);
+    ld(t0 + ts, q1);
+    for (int t = t0; t < p.M; t += ts) {
+      ld(t + 2 * ts, q2);
+      route_select(p, S, t, lo, q0, bv, !dist, dist || blockIdx.x == 0);
+      q0[0] = q1[0]; q0[1] = q1[1]; q1[0] = q2[0]; q1[1] = q2[1];
+    }
+    {  // per-token GEMM1 scale from the pre-expert RMS partials (all tokens, every CTA); 1 without partials
+      float* rs = rs_ptr(S);
+      if (p.rsp) {
+        for (int t = warp; t < p.M; t += NW) {
+          const float4 v = __ldcg(reinterpret_cast<const float4*>(p.rsp + (size_t)t * 128) + lane);
+          float sum = (v.x + v.y) + (v.z + v.w);
+#pragma unroll
+          for (int off = 16; off > 0; off >>= 1) sum += __shfl_xor_sync(0xffffffffu, sum, off);
+          if (lane == 0) rs[t] = rsqrtf(sum * (1.f / 4096.f) + 1e-5f);
+        }
+      } else {
+        for (int t = tid; t < p.M; t += NT) rs[t] = 1.f;
+      }
+    }
+    CTA_SYNC();
+    if (dist) {  // every CTA's selections are visible after this barrier: a monotonic epoch barrier (ctr[6] = distributed
+                 // launches completed, bumped by CTA 0 after the final barrier; ctr[7] = arrivals), so interleaved
+                 // launches of other builds, which never touch these counters, cannot leave a stale count
+      if (tid == 0) {
+        const int e = *reinterpret_cast<volatile const int*>(p.ctr + 6);
+        __threadfence();
+        atomicAdd(p.ctr + 7, 1);
+        while (ld_acquire(p.ctr + 7) < (e + 1) * G) __nanosleep(64);
+      }
+      CTA_SYNC();
+    }
+  }
+#endif
 #if FAST1_ON
   // tiny build (M <= 8): every touched expert is one skinny job, in expert order, so this CTA's first units follow
   // from the touched-expert mask alone; the last warp issues them before routing, off the cold-start critical path
@@ -3667,7 +3831,11 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     for (int i0 = 0; i0 < p.M * 8; i0 += 32) {
       const int i = i0 + ln;
       int e = -1;
+#if OKC_ROUTE_LOGITS
+      if (i < p.M * 8) e = S.eid[i];
+#else
       if (i < p.M * 8) { e = __ldg(p.topk_ids + i) - p.lo; if (e < 0 || e >= p.nloc) e = -1; }
+#endif
       const unsigned peers = __match_any_sync(0xffffffffu, e);
       if (e >= 0 && ln == __ffs(peers) - 1) atomicAdd(&S.fcnt[e], __popc(peers));
     }
@@ -3691,7 +3859,12 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     // barriers while they are in flight (the inits used to wait behind the cold loads)
     uint32_t m = 0;
     const int E8 = p.M * 8;
+#if OKC_ROUTE_LOGITS
+    const int ev0 = 0, ev1 = 0;
+    (void)ev0; (void)ev1;
+#else
     const int ev0 = ln < E8 ? __ldg(p.topk_ids + ln) : 0, ev1 = ln + 32 < E8 ? __ldg(p.topk_ids + ln + 32) : 0;
+#endif
     if (ln == 0) {
       for (int k = 0; k < 12; ++k) mbar_init(S.bars + k, 1);
 #if OKC_WS
@@ -3700,17 +3873,25 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #endif
       asm volatile("fence.mbarrier_init.release.cluster;\n" ::: "memory");
     }
+#if OKC_ROUTE_LOGITS
+    for (int i = ln; i < E8; i += 32) { const int e = S.eid[i]; if (e >= 0) m |= 1u << e; }
+#else
     if (ln < E8) { const int e = ev0 - p.lo; if (e >= 0 && e < p.nloc) m |= 1u << e; }
     if (ln + 32 < E8) { const int e = ev1 - p.lo; if (e >= 0 && e < p.nloc) m |= 1u << e; }
     for (int i = ln + 64; i < E8; i += 32) {  // (never in the tiny builds: M <= 8)
       const int e = __ldg(p.topk_ids + i) - p.lo;
       if (e >= 0 && e < p.nloc) m |= 1u << e;
     }
+#endif
     m = __reduce_or_sync(0xffffffffu, m);
 #else
     uint32_t m = 0;
     for (int i = ln; i < p.M * 8; i += 32) {
+#if OKC_ROUTE_LOGITS
+      const int e = S.eid[i];
+#else
       const int e = __ldg(p.topk_ids + i) - p.lo;
+#endif
       if (e >= 0 && e < p.nloc) m |= 1u << e;
     }
     m = __reduce_or_sync(0xffffffffu, m);
@@ -3899,7 +4080,11 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #pragma unroll
   for (int s = 0; s < 8; ++s) {
     qvp[s] = hasp ? (int)S.pos[tkp * 8 + s] : -1;
+#if OKC_ROUTE_LOGITS
+    wvp[s] = 0.f;  // (CTA 0's weights: loaded after the grid barrier)
+#else
     wvp[s] = (qvp[s] >= 0) ? __ldg(p.topk_w + tkp * 8 + s) : 0.f;
+#endif
   }
 #endif
   CTA_SYNC();
@@ -3912,6 +4097,13 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
   }
   CTA_SYNC();
   DBG(4);
+#if OKC_ROUTE_LOGITS
+  if (!OKC_TINY && p.M > OKC_RLDIST && blockIdx.x == 0 && tid == 0) p.ctr[6] += 1;  // distributed-routing epoch
+#endif
+#if OKC_ROUTE_LOGITS && OKC_FINPF && OKC_FINCOL && !OKC_WGS
+#pragma unroll
+  for (int s = 0; s < 8; ++s) wvp[s] = (qvp[s] >= 0) ? __ldcg(p.topk_w + tkp * 8 + s) : 0.f;
+#endif
   // phases A and B are over everywhere: zero the per-launch flags for the next launch (this CTA's share)
   {
     const int G = gridDim.x, i0 = blockIdx.x * NT + tid;
@@ -3967,7 +4159,7 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #pragma unroll
       for (int sl = 0; sl < 8; ++sl)
         if (qv[sl] >= 0) {
-          const float r = p.topk_w[tk * 8 + sl] * rsqrtf(red[NW * 8 + sl] * (1.f / HD) + 1e-8f);
+          const float r = TOPKW(tk * 8 + sl) * rsqrtf(red[NW * 8 + sl] * (1.f / HD) + 1e-8f);
           const float4* src = reinterpret_cast<const float4*>(p.ybuf + (size_t)qv[sl] * HD) + tid * 2;
           const float4 a = __ldcg(src), b = __ldcg(src + 1);
           acc[0] += r * a.x; acc[1] += r * a.y; acc[2] += r * a.z; acc[3] += r * a.w;
@@ -4021,7 +4213,7 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     for (int s = 0; s < 8; ++s) {
       const int q = S.pos[tk * 8 + s];
       if (q >= 0) {
-        const float r = p.topk_w[tk * 8 + s] * rsqrtf(__ldcg(ss_cur() + q) * (1.f / HD) + 1e-8f);
+        const float r = TOPKW(tk * 8 + s) * rsqrtf(__ldcg(ss_cur() + q) * (1.f / HD) + 1e-8f);
         const float4 v = __ldcg(reinterpret_cast<const float4*>(p.ybuf + (size_t)q * HD + col));
         acc.x += r * v.x; acc.y += r * v.y; acc.z += r * v.z; acc.w += r * v.w;
       }
@@ -4041,7 +4233,7 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
     for (int s = 0; s < 8; ++s) {
       const int q = S.pos[tk * 8 + s];
       if (q >= 0) {
-        const float r = p.topk_w[tk * 8 + s] * rsqrtf(__ldcg(ss_cur() + q) * (1.f / HD) + 1e-8f);
+        const float r = TOPKW(tk * 8 + s) * rsqrtf(__ldcg(ss_cur() + q) * (1.f / HD) + 1e-8f);
         const float4* src = reinterpret_cast<const float4*>(p.ybuf + (size_t)q * HD) + tid * 4;
 #pragma unroll
         for (int i = 0; i < 4; ++i) {
@@ -4083,9 +4275,11 @@ static int g_okc_pdl = 0;  // launch with programmatic stream serialization (PDL
 
 void okc_set_pdl(int64_t on) { g_okc_pdl = on ? 1 : 0; }
 
-void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor ids,
-             torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid) {
+static void okc_run_impl(std::vector<torch::Tensor>& w, std::vector<torch::Tensor>& scratch, torch::Tensor x,
+                         const int* ids_ptr, const float* tw_ptr, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid,
+                         const float* logits, const float* rbias, const int* lsp, int* gid_out, const float* rsp) {
   okc::Params p;
+  p.logits = logits; p.rbias = rbias; p.lsp = lsp; p.gid_out = gid_out; p.rsp = rsp;
   p.wA = (const uint4*)w[0].data_ptr(); p.sA = (const uint4*)w[1].data_ptr(); p.gsA = (const float*)w[2].data_ptr();
   p.wB = (const uint4*)w[3].data_ptr(); p.sB = (const uint4*)w[4].data_ptr(); p.gsB = (const float*)w[5].data_ptr();
   p.lut = (const uint32_t*)w[6].data_ptr(); p.normw = (const __nv_bfloat16*)w[7].data_ptr();
@@ -4102,10 +4296,10 @@ void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, t
   p.wAs = nullptr; p.wBs = nullptr;
 #endif
   p.zero = 0;
-  p.x = (const __nv_bfloat16*)x.data_ptr(); p.topk_ids = (const int*)ids.data_ptr(); p.topk_w = (const float*)tw.data_ptr();
+  p.x = (const __nv_bfloat16*)x.data_ptr(); p.topk_ids = ids_ptr; p.topk_w = tw_ptr;
   p.M = (int)x.size(0); p.lo = (int)lo; p.nloc = (int)nloc;
-#if OKC_WGS && OKC_RLOAD
-  TORCH_CHECK(((uintptr_t)ids.data_ptr() & 15) == 0 && ids.is_contiguous(), "topk_ids must be 16 B aligned and contiguous");
+#if OKC_WGS && OKC_RLOAD && !OKC_ROUTE_LOGITS
+  TORCH_CHECK(((uintptr_t)ids_ptr & 15) == 0, "topk_ids must be 16 B aligned and contiguous");
 #endif
   int* ib = (int*)scratch[0].data_ptr();
   p.ctr = ib; p.doneA = ib + 8;
@@ -4167,6 +4361,44 @@ void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, t
     e = cudaStreamSynchronize(st);
     TORCH_CHECK(e == cudaSuccess, "kernel (smem ", (int)sm, ", threads ", okc::NTL, "): ", cudaGetErrorString(e));
   }
+#endif
+}
+
+void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor ids,
+             torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid) {
+#if OKC_ROUTE_LOGITS
+  TORCH_CHECK(false, "an OKC_ROUTE_LOGITS build: use okc_run_logits");
+#else
+  TORCH_CHECK(ids.is_contiguous() && tw.is_contiguous(), "topk_ids / topk_weights must be contiguous");
+  okc_run_impl(w, scratch, x, (const int*)ids.data_ptr(), (const float*)tw.data_ptr(), out, lo, nloc, grid,
+               nullptr, nullptr, nullptr, nullptr, nullptr);
+#endif
+}
+
+// routing in the kernel: logits [M, 256] fp32, rbias [256] fp32, ls int32 [1] (local_start on the device), gid int32
+// [M, 8] (chosen global ids, output), wts fp32 [>= M * 8] scratch (the renormalized route weights, written by CTA 0)
+void okc_run_logits(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor logits,
+                    torch::Tensor rbias, torch::Tensor ls, torch::Tensor out, torch::Tensor gid, torch::Tensor wts,
+                    torch::Tensor rsp, int64_t nloc, int64_t grid) {
+#if OKC_ROUTE_LOGITS
+  const float* rsp_ptr = nullptr;
+  if (rsp.numel() > 0) {
+    TORCH_CHECK(rsp.is_contiguous() && rsp.dtype() == torch::kFloat32 && rsp.size(0) == x.size(0) && rsp.size(1) == 128,
+                "pre_norm_partials: contiguous fp32 [M, 128]");
+    TORCH_CHECK(x.size(0) <= 256, "pre_norm_partials: at most 256 tokens per launch");
+    TORCH_CHECK(OKC_WS || OKC_WGS, "pre_norm_partials: WS / WGS builds only");
+    rsp_ptr = (const float*)rsp.data_ptr();
+  }
+  TORCH_CHECK(logits.is_contiguous() && logits.dtype() == torch::kFloat32 && logits.size(1) == 256 && logits.size(0) == x.size(0),
+              "router logits must be contiguous fp32 [M, 256]");
+  TORCH_CHECK(rbias.is_contiguous() && rbias.dtype() == torch::kFloat32 && rbias.numel() == 256, "router bias: fp32 [256]");
+  TORCH_CHECK(ls.dtype() == torch::kInt32 && ls.numel() >= 1, "local_start: int32 device tensor");
+  TORCH_CHECK(gid.is_contiguous() && gid.dtype() == torch::kInt32 && gid.numel() >= x.size(0) * 8, "topk ids out: int32 [M, 8]");
+  TORCH_CHECK(wts.is_contiguous() && wts.dtype() == torch::kFloat32 && wts.numel() >= x.size(0) * 8, "weights scratch: fp32 [M * 8]");
+  okc_run_impl(w, scratch, x, nullptr, (const float*)wts.data_ptr(), out, 0, nloc, grid, (const float*)logits.data_ptr(),
+               (const float*)rbias.data_ptr(), (const int*)ls.data_ptr(), (int*)gid.data_ptr(), rsp_ptr);
+#else
+  TORCH_CHECK(false, "not an OKC_ROUTE_LOGITS build");
 #endif
 }
 
@@ -4516,11 +4748,21 @@ CPP_SRC = r'''
 #include <torch/extension.h>
 void okc_run(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor ids,
              torch::Tensor tw, torch::Tensor out, int64_t lo, int64_t nloc, int64_t grid);
+void okc_run_logits(std::vector<torch::Tensor> w, std::vector<torch::Tensor> scratch, torch::Tensor x, torch::Tensor logits,
+                    torch::Tensor rbias, torch::Tensor ls, torch::Tensor out, torch::Tensor gid, torch::Tensor wts,
+                    torch::Tensor rsp, int64_t nloc, int64_t grid);
 void okc_set_pdl(int64_t on);
 '''
 # Programmatic dependent launch for embedders whose graph runs this kernel right after other kernels (the kernel
 # waits on griddepcontrol.wait before touching their outputs). Off here: one launch per call gains nothing.
 PDL = False
+# Routing in the kernel from the router logits (the decode layer: no _route_split launch). ROUTE_LOGITS_BUILDS makes
+# prepare() also compile the OKC_ROUTE_LOGITS=1 variants of the selected builds (the layer sets it before prepare);
+# kernel_fn_logits(data, state) is the entry. ROUTE_LOGITS_SELFTEST runs the in-kernel selection against the host
+# selection on synthetic logits in prepare() (untimed) and prints the result.
+ROUTE_LOGITS_BUILDS = False
+ROUTE_LOGITS_SELFTEST = False
+ROUTER_MULTIPLIER = 0.1767766952966369
 # Scale decode with PRMT + IMAD instead of the smem LUT; exact only when every block-scale byte of the local experts
 # is a positive normal e4m3 value (0x08..0x7E). prepare() checks the actual weights and keeps the LUT build otherwise.
 PRMT_SCALES = True
@@ -4658,7 +4900,7 @@ def _ext(defines=None):
             name=f"okc_moe_w4a16_v216x_{tag}_sm{arch}",
             cpp_sources=CPP_SRC,
             cuda_sources=src,
-            functions=["okc_run", "okc_set_pdl"],
+            functions=["okc_run", "okc_set_pdl", "okc_run_logits"],
             extra_cuda_cflags=["-O3", f"-gencode=arch=compute_{arch},code=sm_{arch}", "-lineinfo",
                                *([] if any(d.startswith("-DOKC_NS=") for d in defs) else [f"-DOKC_NS={MAIN_NS if major >= 9 else 1}"]),
                                f"-DOKC_FNST={4 if major >= 9 else 3}",
@@ -4843,6 +5085,10 @@ def prepare(weights):
     for d in (TINY_DEFINES, TINY2_DEFINES, MID_DEFINES):
         if d and (state["sfx"] or "-DOKC_WGS=1" not in tuple(d)):  # the WGS build needs the PRMT scale decode
             mods.append(tuple(d) + state["sfx"])
+    state["wts"] = torch.zeros(EMAX, dtype=torch.float32, device=dev)  # in-kernel routing: the route weights (CTA 0)
+    state["norsp"] = torch.empty(0, dtype=torch.float32, device=dev)  # (no pre-expert RMS partials)
+    if ROUTE_LOGITS_BUILDS or ROUTE_LOGITS_SELFTEST:
+        mods += [_logits_defines(d) for d in list(mods)]
     extra = []
     if DIAG:  # the diagnostic variants compile alongside (one pool; nvcc runs in subprocesses); a variant that fails
         for v in DIAG_VARIANTS.values():  # to build only loses its column
@@ -4862,9 +5108,144 @@ def prepare(weights):
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
         list(ex.map(_build, mods + extra))
     torch.cuda.synchronize()
+    if ROUTE_LOGITS_SELFTEST:
+        try:
+            _route_logits_selftest(state)
+        except Exception as ex:  # a self-test must never break the run
+            print(f"[route-logits] self-test failed: {ex}", flush=True)
     if DIAG:
         _diag(state, weights)
     return state
+
+
+def _logits_defines(d):
+    return tuple(d) + ("-DOKC_ROUTE_LOGITS=1",)
+
+
+def _select_ext(M, sfx, logits=False):
+    """The build for M tokens (the shipped policy), optionally its OKC_ROUTE_LOGITS variant."""
+    if TINY_DEFINES and M <= TINY_MAX_M:
+        d = tuple(TINY_DEFINES) + sfx
+    elif TINY2_DEFINES and M <= TINY2_MAX_M and (sfx or "-DOKC_WGS=1" not in tuple(TINY2_DEFINES)):
+        d = tuple(TINY2_DEFINES) + sfx  # (the WGS build needs the PRMT scale decode: else MID/MAIN)
+    elif MID_DEFINES and M <= MID_MAX_M:
+        d = tuple(MID_DEFINES) + sfx
+    else:
+        d = tuple(_main_defines(sfx)) + sfx
+    return _ext(_logits_defines(d) if logits else d)
+
+
+def kernel_fn_logits(data, state):
+    """The MoE with the routing in the kernel. data: hidden_states bf16 [T, 4096]; router_logits fp32 [T, 256]
+    (contiguous); router_bias fp32 [256]; local_start: an int32 device tensor [1] (graph-safe) or an int (untimed use);
+    optional topk_out int32 [T, 8]; optional pre_norm_partials fp32 [T, 128] (partial sums of squares of the pooled row
+    over 128 slices: the per-token pre-expert RMS scale rs_t = rsqrt(sum / 4096 + 1e-5) is then applied in GEMM1's
+    epilogue, so hidden_states carries the column gain only, T <= 256). Returns (out bf16 [T, 4096], topk_ids int32 [T, 8]: the chosen GLOBAL expert ids,
+    slots in descending biased-score order). The selection and the route weights follow the decode layer's
+    _route_split kernel (sigmoid(logit * ROUTER_MULTIPLIER) + bias, top-8 with ties to the lower id, weights
+    renormalized with eps 1e-15; local = (id - local_start) mod 256 < local_count). Needs the OKC_ROUTE_LOGITS builds
+    (ROUTE_LOGITS_BUILDS = True before prepare())."""
+    x = data["hidden_states"].contiguous()
+    M = x.shape[0]
+    logits = data["router_logits"]
+    if logits.dtype != torch.float32 or not logits.is_contiguous():
+        logits = logits.float().contiguous()
+    bias = data["router_bias"]
+    if bias.dtype != torch.float32 or not bias.is_contiguous():
+        bias = bias.float().contiguous()
+    ls = data.get("local_start", 0)
+    if not torch.is_tensor(ls):
+        ls = torch.tensor([int(ls)], dtype=torch.int32, device=x.device)
+    elif ls.dtype != torch.int32:
+        ls = ls.to(torch.int32)
+    cnt = data.get("config", {}).get("local_count", state["cnt"])
+    out = torch.empty((M, 4096), dtype=torch.bfloat16, device=x.device)
+    gid = data.get("topk_out")
+    if gid is None:
+        gid = torch.empty((M, 8), dtype=torch.int32, device=x.device)
+    rsp = data.get("pre_norm_partials")
+    if rsp is None:
+        rsp = state["norsp"]
+    elif rsp.dtype != torch.float32 or not rsp.is_contiguous():
+        rsp = rsp.float().contiguous()
+    ext = _select_ext(M, state.get("sfx", ()), logits=True)
+    for m0 in range(0, M, MMAX):
+        m1 = min(M, m0 + MMAX)
+        ext.okc_run_logits(state["w"], state["scratch"], x[m0:m1], logits[m0:m1], bias, ls, out[m0:m1], gid[m0:m1],
+                           state["wts"], rsp[m0:m1] if rsp.numel() else rsp, cnt, state["grid"])
+    return out, gid
+
+
+def _route_logits_selftest(state):
+    """In-kernel routing vs the host selection: synthetic logits whose top-8 reproduce _gen_input's ids (so the MoE
+    output can be compared with kernel_fn on the same routes), random logits (ids / weights vs torch), timing."""
+    dev = torch.device("cuda")
+    gen = torch.Generator(device=dev).manual_seed(4321)
+    bias = (0.05 * torch.randn((256,), generator=gen, device=dev)).float().contiguous()
+    ls = torch.tensor([0], dtype=torch.int32, device=dev)
+    for bs in (1, 4, 8, 16, 32, 33, 128, 256):
+        d = _gen_input(bs, 777 + bs, dev)
+        ids = d["topk_ids"].long()
+        # logits: the given ids get large, slot-ordered logits (their biased scores dominate every other expert)
+        logits = 0.5 * torch.randn((bs, 256), generator=gen, device=dev)
+        logits.scatter_(1, ids, (20.0 - 0.5 * torch.arange(8, device=dev, dtype=torch.float32)).expand(bs, 8))
+        logits = logits.float().contiguous()
+        sc = torch.sigmoid(logits * ROUTER_MULTIPLIER)
+        sel = sc + bias
+        ref_ids = sel.topk(8, dim=-1).indices
+        picked = sc.gather(1, ref_ids)
+        ref_w = picked / (picked.sum(-1, keepdim=True) + 1e-15)
+        out2, gid = kernel_fn_logits({"hidden_states": d["hidden_states"], "router_logits": logits, "router_bias": bias,
+                                      "local_start": ls, "config": {"local_count": 32}}, state)
+        torch.cuda.synchronize()
+        kw = state["wts"][:bs * 8].view(bs, 8)
+        same_ids = bool((gid.long() == ref_ids).all())
+        same_set = bool((gid.long().sort(-1).values == ids.sort(-1).values).all())
+        werr = float((kw - ref_w).abs().max())
+        # the MoE output with the same routes through the plain entry (host ids / weights)
+        lids = ((gid.long() - 0) % 256)
+        lids = torch.where(lids < 32, lids, torch.full_like(lids, -1)).to(torch.int32)
+        out1 = kernel_fn({"hidden_states": d["hidden_states"], "topk_ids": gid, "topk_weights": kw.contiguous(),
+                          "config": {"local_start": 0, "local_count": 32}}, state)
+        torch.cuda.synchronize()
+        oerr = float((out2.float() - out1.float()).norm() / out1.float().norm().clamp(min=1e-20))
+        # per-token pre-expert RMS scale in the kernel (partials) vs the scale applied to x on the host
+        rerr = float("nan")
+        if bs <= 256:
+            pooled = 3.0 * torch.randn((bs, 4096), generator=gen, device=dev)
+            part = (pooled * pooled).view(bs, 128, 32).sum(-1).contiguous()
+            rs = torch.rsqrt(part.sum(-1, keepdim=True) / 4096.0 + 1e-5)
+            o_k, _ = kernel_fn_logits({"hidden_states": pooled.to(torch.bfloat16), "router_logits": logits, "router_bias": bias,
+                                       "local_start": ls, "pre_norm_partials": part, "config": {"local_count": 32}}, state)
+            o_h, _ = kernel_fn_logits({"hidden_states": (pooled * rs).to(torch.bfloat16), "router_logits": logits,
+                                       "router_bias": bias, "local_start": ls, "config": {"local_count": 32}}, state)
+            torch.cuda.synchronize()
+            rerr = float((o_k.float() - o_h.float()).norm() / o_h.float().norm().clamp(min=1e-20))
+        # random logits (no structure): ids vs torch's top-8 (ties improbable), weights
+        logits2 = (3.0 * torch.randn((bs, 256), generator=gen, device=dev)).float().contiguous()
+        sc2 = torch.sigmoid(logits2 * ROUTER_MULTIPLIER)
+        ref2 = (sc2 + bias).topk(8, dim=-1).indices
+        _, gid2 = kernel_fn_logits({"hidden_states": d["hidden_states"], "router_logits": logits2, "router_bias": bias,
+                                    "local_start": ls, "config": {"local_count": 32}}, state)
+        torch.cuda.synchronize()
+        nd = int((gid2.long() != ref2).any(-1).sum())
+        # timing: in-kernel routing vs the plain entry (graph replays, cold L2)
+        tw = ref_w.float().contiguous()
+
+        def f_plain():
+            kernel_fn({"hidden_states": d["hidden_states"], "topk_ids": gid, "topk_weights": tw,
+                       "config": {"local_start": 0, "local_count": 32}}, state)
+
+        def f_logits():
+            kernel_fn_logits({"hidden_states": d["hidden_states"], "router_logits": logits, "router_bias": bias,
+                              "local_start": ls, "config": {"local_count": 32}}, state)
+
+        t_plain, _ = _time_graph(f_plain)
+        t_logits, _ = _time_graph(f_logits)
+        print(f"[route-logits] bs={bs:3d}: ids == host top-8 {same_ids} (same set as the input routing {same_set}), "
+              f"max |w - w_ref| {werr:.1e}, out rel L2 vs plain entry {oerr:.1e}, rs-in-epilogue vs host-scaled x {rerr:.1e}, "
+              f"random-logit tokens differing {nd}/{bs}, "
+              f"time plain {t_plain:6.1f} us vs in-kernel routing {t_logits:6.1f} us", flush=True)
 
 
 MMAX = 384
