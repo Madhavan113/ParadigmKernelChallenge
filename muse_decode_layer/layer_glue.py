@@ -154,8 +154,9 @@ def T_of(t):
     return int(t.shape[0])
 
 
-FUSE_BOUNDARY = True    # v2 tails (every load in flight before any use, one block reduction, alpha/beta from the gate
-                        # in-kernel; the v1 per-iteration-load tails were latency-bound: d467a5c5). T = 1: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
+FUSE_BOUNDARY = False   # OFF: the v2 tails (every load in flight, one reduction, alpha/beta from the gate in-kernel) are
+                        # exact but compute-bound on one CTA: o launch 8.8 -> 46.0 us, unpooler slice 7.2 -> 21.5
+                        # (a15e0698, a3816fbb; the ticket flavor made no difference). T = 1: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
                         # (proj_fork's sk2b); enabled only when the prepare-time self-test matches the Triton kernels
 
 
