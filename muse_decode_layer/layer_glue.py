@@ -61,7 +61,9 @@ FORCE_PBMAX = None
 # Programmatic Dependent Launch for this file's Triton glue: each kernel launches while its producer drains and
 # waits (griddepcontrol.wait) right before its first read of producer data; weights and older inputs load before.
 PDL = True
-PDL_MAX_T = 32   # measured: a launch-latency win at decode sizes (d1 +2%), a ~1% loss at T = 256 (big grids)
+PDL_MAX_T = 128  # measured: a launch-latency win at decode sizes (d1 +2%); with the CUDA glue the T = 128 shapes gain
+                 # 1.2-2.3 us (H200 paired, seeds 0-2, vm_ab/ab10b) while T = 256 is a wash (+0.6/-0.6: the cuBLAS
+                 # nodes stay plain launches there anyway) - off at 256 as before
 
 
 def _pdl(T):
