@@ -459,3 +459,15 @@ Locked build 682afcb (submission md5 42931740) validated (ab19): the judge's che
 Handed to main for a scored run. Round 2 closed: the T <= 32 chain is at its launch-structure floor (~9 kernels,
 ~1 us of PDL wait-return each); further gains need fewer kernels (a boundary folded into its producer's epilogue,
 which the ticket tails showed is one-CTA compute-bound) or faster MoE / attention / sk2 bodies.
+
+## 14. Round 3: attention plans at the unswept shapes, boundary folds with the v4 math (Oct 28 night)
+
+Attention plan sweep on the chain (ab21; paired, seeds 0-2; variant minus the module's plan, us): d16s (4 splits):
+8 +0.4, 16 -0.1, 32 +3.0, 8x4 copies +0.8, 16+coop +1.3, clusters 8x2 +7.4, 4x4 +4.5. d32s (2 splits): 4 +1.2, 8 -0.1,
+16 +4.1, 4x4 copies +1.6, 8+coop +0.9, clusters +5.8 / +1.2. v16s (4+coop): 8+coop 0.0, 16+coop +0.9, 32+coop +9.6,
+8 last-CTA x4 +4.2, 8+coop x4 +0.2, clusters 8x2 +13.8. v32s (tuned 4+coop): 8+coop +2.1, 16 +12.8, 2 +8.8, 8 last-CTA
+x4 +10.6, clusters +15.7 / +11.6. d1f (tuned 252+coop x8): 504 +3.6, 1008 +3.6, 252 last-CTA +0.3, 252+coop x4 +0.1,
+flat 252 x4 +1.1, clusters +6.1 / +7.5. The module's plans are the chain's best everywhere (the per-CTA DRAM round
+trip is the page-table walk + first tile; more splits add partials to merge and the finalize grows with them;
+clusters pay DSMEM on top). Closed; a faster B=16/32 sliding attention needs kernel work (prefetch before the wait,
+two requests per CTA), not a plan.
