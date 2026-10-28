@@ -298,6 +298,27 @@ ab4 (T=128/256 dense routes, 5 per layer): qkv cuBLAS fp32-out wins by 1.2-3.5 u
 (bfq/mm16 +0-2.4, Triton / cuBLAS fp32 +3-4 at T=256); o: mm16 / torchT / bfq tie (+-1); pr: Triton == cuBLAS, torchT
 +2-4, the proj module's bfq route +12-14 us.
 
-Locks (layer_glue): PDL_LOCK = 2 at every T; ROUTE_MODE_LOCK = split; PR_FORM_LOCK T8 fused / T32 separate (T1, T16
-after ab5); PIN_PICK at 128/256: qkv True, o mm16/torchT, pr True, un torchT. FUSE_ROUTE / ROUTE_IN_MOE / FUSE_BND1 off
-(code kept; their self-tests and the 11 chain timings per T no longer run in prepare).
+ab5 (round-robin paired replays; base x3 interleaved agreed within +-1 us, so the first-variant artifact was the
+sequential harness): T=1 fused+split beats separate by 2.0/1.2 (s0) and 1.0/2.0 (s1) us; T=16 fused by 1.1-1.5 (s1),
+tie (s0); o sk2 beats cuBLAS bf16-out by 2.0-2.6 at T=16 (the tuner flipped to mm16 one prepare in three) and 2-3.4 at
+T=32, cuBLAS fp32-out by 1.1-2.1 at T=1 and 1.9-3.3 at T=8; the unpooler slice's cuBLAS +2.7-4.1 at T=1/8, its Triton
+split-K ties at T=1 and loses 1.3-1.9 at T=8; qkv cuBLAS +3-5 and bf16-out +8-13 at every T <= 32; PDL 3 +1.4-2.4 at
+T=16/32 again.
+
+Locks (layer_glue, commit 1962ad3): PR_FORM_LOCK fused+split at T <= 16, separate at T32, bnd1 off; ROUTE_MODE_LOCK
+split; PDL_LOCK 2; PIN_PICK o and qkv sk2 at T <= 32, T128/256 qkv True, o mm16/torchT, pr True, un torchT.
+FUSE_ROUTE / ROUTE_IN_MOE / FUSE_BND1 off (code kept; their self-tests and the 11 chain timings per T no longer run
+in prepare). The tuner's remaining chain timing is the MoE backend/config per T.
+
+ab6, before/after of the locked build (paired: the locked prepare's picks vs the same seed's 8e96589 picks as
+overrides; base repeated last agreed within +-1 us). Locked median s0 / s1 ; before - locked s0 / s1 (us):
+d1s 73.1/63.1 ; +2.3/+1.3 | d1f 85.3/80.0 ; +1.3/+1.4 | d16s 127.8/120.8 ; +0.5/+2.5 | d16f 186.5/194.0 ; +0.8/+2.3 |
+d32s 148.3/157.2 ; -0.2/+0.4 | d32f 304.1/323.9 ; -0.6/+0.6 | v1s 106.5/105.2 ; 0.0/+0.9 | v1f 114.1/105.4 ; -0.4/+1.4 |
+v16s 249.1/256.2 ; -0.4/+2.5 | v16f 325.2/350.8 ; +1.4/+2.0 | v32s 311.5/298.9 ; +2.4/+3.0 | v32f 474.4/492.1 ; +2.7/+5.1.
+The gain is the removal of the losing coin flips (0 where a prepare had drawn the locked picks already).
+
+Prepare budget (300 s hard): the locked build took 307 s on the VM (seed 0; 241 s at seed 2), 298-304 s for 8e96589.
+Trim (feb6313): TUNED_T = the scored T only (2/4/64 take the next row's picks), Marlin never a candidate when the
+agent's kernel is present (12 timings per T, lost 30-50% everywhere), pinned / locked dense picks skip their isolated
+timing; prepare prints its phase wall times. check_vm.py = the judge's check (reference.collect + check_implementation)
+on eager and graph-replayed steps (tools/gpu_run.py's check passes the raw tuple and raises).
