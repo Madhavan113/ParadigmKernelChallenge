@@ -1,0 +1,14 @@
+route tail: not available
+boundary tails: not available
+boundary-1 prologue ok: T1 4.7e-08/0.0e+00/0.0e+00/0.0e+00 T8 5.6e-08/3.3e-08/1.0e-08/4.3e-08
+calib delta 0.182 routes/token 1.60 experts@32 17.8
+T1/4r4e qkvB:14 oB:10 pr[T32 M31 B26 F26] prF:26 unT:8 mcfg8a:35 mar2:114 mar1:121 age2:88 age1:97 pdl[2:88 3:88 4:88 6:88]->2
+T2/5r5e qkvB:14 oB:10 pr[T32 M30 B27 F26] prF:26 unT:8 mcfg8a:67 mar2:123 mar1:115 age2:95 age1:85 pdl[2:87 3:87 4:88 6:88]->2
+T4/9r7e qkvB:14 oB:10 pr[T32 M30 B27 F27] prB:27 unT:8 mcfg8a:76 mar2:146 mar1:137 age2:108 age1:99 pdl[2:99 3:100 4:100 6:100]->2
+T8/14r8e qkvB:14 oB:10 pr[T32 M30 B28 F27] prF:27 unT:8 mcfg8:110 mar2:158 mar1:149 age2:114 age1:107 pdl[2:107 3:107 4:107 6:109]->2
+T16/24r12e qkvB:14 oB:10 pr[T32 M30 B27 F28] prB:27 unB:19 mcfg8a:171 mar2:211 mar1:199 age2:154 age1:143 pdl[2:143 3:144 4:145 6:146]->2
+T32/55r21e qkvB:15 oB:10 pr[T35 M31 B28 F31] prB:28 unB:19 mcfg8a:246 mar2:315 mar1:305 age2:224 age1:214 pdl[2:216 3:217 4:216 6:216]->4
+T64/112r22e qkvt:18 ot:11 pr[T34 M34 B1000000000000000019884624838656 F1000000000000000019884624838656] prt:33 unm:23 mcfg8:342 mar2:390 mar1:386 age2:252 age1:242
+T128/216r27e qkvq:20 qkv[T20.9 M21.7 m20.4 t21.2 q20.2] ot:11 o[T11.5 M11.2 m11.0 t10.9 q11.1] pr[T32 M32 B1000000000000000019884624838656 F1000000000000000019884624838656] prT:32 pr[T31.7 M31.8 t33.5 q39.8] unt:23 un[T23.1 M23.4 m22.8 t22.5 q23.1] mcfg16:371 mar2:477 mar1:450 age2:306 age1:274
+T256/404r29e qkvm:23 qkv[T23.6 M23.1 m22.9 t24.0 q24.1] ot:13 o[T13.7 M13.9 m12.7 t12.6 q12.8] pr[T39 M38 B1000000000000000019884624838656 F1000000000000000019884624838656] prM:38 pr[T39.2 M38.4 t42.8 q52.3] unm:28 un[T29.7 M28.8 m27.9 t28.3 q29.1] mcfg16:398 mar2:648 mar1:590 age2:385 age1:337
+tune: pbmax 0 moe {1: 'agent', 2: 'agent', 4: 'agent', 8: 'agent', 16: 'agent', 32: 'agent', 64: 'agent', 128: 'agent', 256: 'agent'} gluev2 {1: True, 2: False, 4: False, 8: False, 16: False, 32: False, 64: False, 128: False, 256: False}

@@ -218,3 +218,23 @@ Every candidate is within ~1 us of cuBLAS on every matrix; hypotheses (a) worksp
 T > 32 shapes are unchanged within noise (verify-16 255.3/345.1, verify-32 322.1/490.5). The remaining headroom there
 is cuBLAS vs the bandwidth floor (qkv 20 vs 7.9 us, pr 32 vs 15.7, un 22 vs 14, o 11 vs 3.5: ~45 us per verify-16
 shape, ~55 per verify-32), which needs a custom skinny-M (M = 128/256) GEMM, not a dispatch change.
+
+## 8. Round 4 (launch removal under PDL), judged (all 13/13 unless noted)
+
+| job | change | speedup | finding |
+|---|---|---|---|
+| 30d1ae0f | boundary-1 prologue v1 (every sk2f CTA writes the full h to global, then TMA) + PDL depth sweep | 2.053 (d1 85.6/92.8) | 128 CTAs writing the same 16 KB serialize in L2 (~20 us in the chain); tuner fell back to the v2 glue. PDL depth 2 = 3 = 4 = 6 at every T |
+| 960a1e77 | prologue v2: h in 16 KB shared memory (swizzled unit layout, no x boxes) + MoE-side routing (872689c) with a grid-barrier norm | 2.0855 | prologue correct (pooled/logits bit-identical) but my self-test compared the unused global h and disabled it; MoE-side routing a wash: rim[off/on] 72/76, 100/104, 157/157, 233/233 |
+| 0f57b859 | prologue v2 enabled | 2.0516 (d1 87.1/92.0) | the v1 chain measured +12 us at T=1 (age1 84 vs 72) -> v2 glue fallback again |
+| 1a4846de | prologue v3: staggered column sweep + isolated gate; routing modes split / sk2f-side (CTA t after the barrier) / MoE-side | 2.0967 | isolated: fused launch 23.4 -> 34.0 us (+10.6): not a hot-spot. rmode T1 73/78/77, T8 114/117/118, T16 126/126/125, T32 180/181/181: a grid barrier at the END of a PDL-chained kernel costs 3-5 us (SMs stay held until the last CTA; the early-launched MoE CTAs cannot start) |
+| 2ac47839 | attention -DOKC_PDLKV=1 | 2.0852 | attention rows +0.4..+1.1 us on 10/12 shapes vs the same-base run; not adopted |
+| 200a83ac, 8c7152a2 | + MoE a388dff (pre_norm_partials), prologue v4 (L2 prefetch of the input rows before the wait) | failed in prepare | the MoE module's OWN routing self-test deadlocked after bs=32 (its distributed-selection barrier; fixed in dc4ca7a, self-test off) |
+| 711bbae5 | HEAD 2e669e4: dc4ca7a + prologue v4 chain-timed + 4 routing modes | 2.0762 | prologue isolated 22.8 -> 36.1 (+13.3) even with the prefetch: the cost is the prologue's own load issue (128 live floats per thread under the 128-register cap -> register-bound batches, ~25 dependent rounds; ptxas spills were the symptom). rmode T1 70/70/71/70, T8 107/108/107/107, T16 158/159/158/157, T32 183/182/182/181: the no-barrier MoE mode (self-test: ids exact, output 5e-3) repays the 4.3 us launch exactly, no more |
+
+Net: no lever produced a judged kernel-row win; every new path is self-tested and auto-gated (off unless it wins
+on the chain), so HEAD is safe but not faster. Lessons: (1) under PDL a kernel must not end with a grid barrier
+(it blocks the dependent's early start: 3-5 us); (2) a CTA-local prologue that needs a whole 8192-wide row is
+load-issue-bound unless it keeps <= ~16 elements per thread in flight (the Triton kernels' layout), i.e. it needs
+>= 512 threads or a streamed two-pass structure; (3) the per-token top-8 costs ~2.3 us wherever it runs, so moving
+it only pays if nothing else is added; (4) the judge flushes L2 before each replay: anything an input row is read
+by must be prefetched before the kernel's gdc_wait.

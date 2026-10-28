@@ -1,0 +1,205 @@
+okc run 711bbae5d04143b3 on muse_decode_layer
+submission  /Users/madhavanp/kerneloptimizer/.claude/worktrees/agent-ab41706bb5b7e284f/muse_decode_layer/submission.py
+status      ok
+passed      true
+speedup     2.0761948071809195
+speedup_ci  [2.045051885073206 2.1073377292886333]
+score_us    10895.075896425198
+tests       13/13 passed
+
+scored shapes (µs; speed of light is the reference's bound)
+case                                                         sglang      yours  speedup        sol  
+batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1     173.58      78.07   2.224x      40.02  
+batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1     183.31      83.30   2.201x      44.18  
+batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic     260.62     133.11   1.958x      76.72  
+batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic     439.42     213.53   2.058x     137.46  
+batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic     265.02     161.18   1.644x      84.51  
+batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic     621.71     311.07   1.999x     208.10  
+batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8     258.82     111.88   2.313x      62.29  
+batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8     271.97     119.85   2.269x      66.44  
+batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic     507.20     252.36   2.010x     126.61  
+batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic     692.03     338.66   2.043x     188.68  
+batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic     700.02     320.89   2.181x     143.81  
+batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic    1067.89     489.92   2.180x     267.18  
+
+profile 0: batch=1 ctx=80000 dist=soft layer=sliding load=decode 1 page=1
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<false>(okc::Params)                           23.5 µs  28.6%      1
+void sk2_kernel<1, 8, 1, 2, 2, 4, 3, true, false, 1, 1, _...      15.0 µs  18.2%      1
+void sk2_kernel<1, 8, 3, 1, 4, 2, 6, true, false, 1, 1, _...      10.8 µs  13.1%      1
+void sk2_kernel<1, 8, 4, 1, 4, 1, 4, true, false, 2, 1, _...       6.0 µs   7.3%      1
+void (anonymous namespace)::attn_kernel<1, false, 13>((an...       4.8 µs   5.8%      1
+void sk2_kernel<1, 8, 1, 1, 8, 1, 6, false, true, 4, 3, f...       4.8 µs   5.8%      1
+void sk2_kernel<1, 8, 1, 1, 8, 2, 4, true, false, 2, 1, _...       4.4 µs   5.4%      1
+_boundary2                                                         4.4 µs   5.3%      1
+_boundary1                                                         4.3 µs   5.2%      1
+_route_split                                                       4.3 µs   5.2%      1
+total                                                             82.4 µs
+
+profile 1: batch=1 ctx=80000 dist=soft layer=full load=decode 1 page=1
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<false>(okc::Params)                           22.1 µs  25.4%      1
+void sk2_kernel<1, 8, 1, 2, 2, 4, 3, true, false, 1, 1, _...      14.9 µs  17.2%      1
+void (anonymous namespace)::attn_kernel<1, false, 11>((an...      10.8 µs  12.4%      1
+void sk2_kernel<1, 8, 3, 1, 4, 2, 6, true, false, 1, 1, _...      10.8 µs  12.4%      1
+void sk2_kernel<1, 8, 4, 1, 4, 1, 4, true, false, 2, 1, _...       6.0 µs   6.9%      1
+void sk2_kernel<1, 8, 1, 1, 8, 1, 6, false, true, 4, 3, f...       4.9 µs   5.6%      1
+void sk2_kernel<1, 8, 1, 1, 8, 2, 4, true, false, 2, 1, _...       4.6 µs   5.3%      1
+_boundary1                                                         4.4 µs   5.1%      1
+_boundary2                                                         4.3 µs   5.0%      1
+_route_split                                                       4.0 µs   4.6%      1
+total                                                             86.8 µs
+
+profile 2: batch=16 ctx=80000 dist=soft layer=sliding load=decode 16 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<false>(okc::Params)                           59.4 µs  44.7%      1
+void sk2_kernel<1, 16, 4, 1, 4, 1, 5, true, false, 2, 1, ...      16.2 µs  12.2%      1
+void sk2_kernel<1, 16, 4, 1, 8, 1, 5, true, false, 2, 1, ...      15.9 µs  12.0%      1
+void sk2_kernel<1, 16, 3, 1, 4, 2, 5, true, false, 1, 1, ...      10.6 µs   7.9%      1
+void (anonymous namespace)::attn_kernel<1, false, 1>((ano...       7.4 µs   5.6%      1
+void sk2_kernel<1, 16, 4, 1, 4, 1, 4, true, false, 2, 1, ...       6.1 µs   4.6%      1
+void sk2_kernel<1, 16, 1, 1, 8, 1, 6, false, true, 4, 3, ...       4.7 µs   3.6%      1
+_boundary2                                                         4.4 µs   3.3%      1
+_boundary1                                                         4.2 µs   3.2%      1
+_route_split                                                       3.9 µs   2.9%      1
+total                                                            132.8 µs
+GPU busy (kernels overlap: PDL or streams)                       131.4 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 3: batch=16 ctx=80000 dist=soft layer=full load=decode 16 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::attn_kernel<1, true, 0>((anon...      87.8 µs  37.6%      1
+void okc::moe_fused<false>(okc::Params)                           80.1 µs  34.3%      1
+void sk2_kernel<1, 16, 4, 1, 8, 1, 5, true, false, 2, 1, ...      15.6 µs   6.7%      1
+void sk2_kernel<1, 16, 4, 1, 4, 1, 5, true, false, 2, 1, ...      14.8 µs   6.3%      1
+void sk2_kernel<1, 16, 3, 1, 4, 2, 5, true, false, 1, 1, ...      10.0 µs   4.3%      1
+void sk2_kernel<1, 16, 4, 1, 4, 1, 4, true, false, 2, 1, ...       7.4 µs   3.2%      1
+void sk2_kernel<1, 16, 1, 1, 8, 1, 6, false, true, 4, 3, ...       4.8 µs   2.1%      1
+_boundary2                                                         4.6 µs   2.0%      1
+_boundary1                                                         4.4 µs   1.9%      1
+_route_split                                                       4.1 µs   1.8%      1
+total                                                            233.5 µs
+GPU busy (kernels overlap: PDL or streams)                       228.5 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 4: batch=32 ctx=80000 dist=soft layer=sliding load=decode 32 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<false>(okc::Params)                           92.0 µs  52.2%      1
+void sk2_kernel<2, 32, 4, 2, 2, 2, 3, true, false, 1, 1, ...      19.7 µs  11.2%      1
+void sk2_kernel<2, 32, 2, 2, 2, 2, 5, true, false, 1, 1, ...      17.5 µs   9.9%      1
+void sk2_kernel<2, 32, 3, 1, 4, 2, 4, true, false, 1, 1, ...      12.2 µs   6.9%      1
+void (anonymous namespace)::attn_kernel<1, false, 1>((ano...       9.4 µs   5.4%      1
+void sk2_kernel<2, 32, 2, 2, 2, 2, 3, true, false, 1, 1, ...       7.2 µs   4.1%      1
+void sk2_kernel<2, 32, 1, 1, 8, 1, 4, false, true, 4, 3, ...       5.2 µs   3.0%      1
+_boundary2                                                         4.6 µs   2.6%      1
+_boundary1                                                         4.4 µs   2.5%      1
+_route_split                                                       4.1 µs   2.3%      1
+total                                                            176.2 µs
+GPU busy (kernels overlap: PDL or streams)                       169.8 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 5: batch=32 ctx=80000 dist=soft layer=full load=decode 32 page=1 spread=agentic
+kernel                                                           GPU time  share  calls
+void (anonymous namespace)::attn_kernel<1, true, 0>((anon...     171.0 µs  52.7%      1
+void okc::moe_fused<false>(okc::Params)                           80.4 µs  24.8%      1
+void sk2_kernel<2, 32, 4, 2, 2, 2, 3, true, false, 1, 1, ...      18.9 µs   5.8%      1
+void sk2_kernel<2, 32, 2, 2, 2, 2, 5, true, false, 1, 1, ...      15.6 µs   4.8%      1
+void sk2_kernel<2, 32, 3, 1, 4, 2, 4, true, false, 1, 1, ...      11.7 µs   3.6%      1
+void sk2_kernel<2, 32, 2, 2, 2, 2, 3, true, false, 1, 1, ...       8.2 µs   2.5%      1
+void sk2_kernel<2, 32, 1, 1, 8, 1, 4, false, true, 4, 3, ...       5.3 µs   1.6%      1
+_boundary1                                                         4.6 µs   1.4%      1
+_boundary2                                                         4.5 µs   1.4%      1
+_route_split                                                       4.1 µs   1.3%      1
+total                                                            324.3 µs
+GPU busy (kernels overlap: PDL or streams)                       315.1 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 6: batch=1 ctx=80000 dist=soft layer=sliding load=verify 1 page=1 q_len=8
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<false>(okc::Params)                           63.9 µs  51.5%      1
+void sk2_kernel<1, 8, 1, 2, 2, 4, 3, true, false, 1, 1, _...      14.8 µs  12.0%      1
+void sk2_kernel<1, 8, 3, 1, 4, 2, 6, true, false, 1, 1, _...       9.9 µs   8.0%      1
+void (anonymous namespace)::attn_kernel<8, false, 15>((an...       6.5 µs   5.2%      1
+void sk2_kernel<1, 8, 4, 1, 4, 1, 4, true, false, 2, 1, _...       6.1 µs   4.9%      1
+void sk2_kernel<1, 8, 1, 1, 8, 2, 4, true, false, 2, 1, _...       5.7 µs   4.6%      1
+void sk2_kernel<1, 8, 1, 1, 8, 1, 6, false, true, 4, 3, f...       4.7 µs   3.8%      1
+_boundary2                                                         4.4 µs   3.5%      1
+_boundary1                                                         4.2 µs   3.4%      1
+_route_split                                                       4.0 µs   3.2%      1
+total                                                            124.2 µs
+GPU busy (kernels overlap: PDL or streams)                       122.8 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 7: batch=1 ctx=80000 dist=soft layer=full load=verify 1 page=1 q_len=8
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<false>(okc::Params)                           63.6 µs  48.2%      1
+void sk2_kernel<1, 8, 1, 2, 2, 4, 3, true, false, 1, 1, _...      15.1 µs  11.4%      1
+void (anonymous namespace)::attn_kernel<8, false, 11>((an...      13.8 µs  10.5%      1
+void sk2_kernel<1, 8, 3, 1, 4, 2, 6, true, false, 1, 1, _...      11.0 µs   8.3%      1
+void sk2_kernel<1, 8, 4, 1, 4, 1, 4, true, false, 2, 1, _...       6.3 µs   4.7%      1
+void sk2_kernel<1, 8, 1, 1, 8, 2, 4, true, false, 2, 1, _...       5.0 µs   3.8%      1
+void sk2_kernel<1, 8, 1, 1, 8, 1, 6, false, true, 4, 3, f...       4.8 µs   3.7%      1
+_boundary2                                                         4.4 µs   3.3%      1
+_boundary1                                                         4.2 µs   3.2%      1
+_route_split                                                       3.9 µs   3.0%      1
+total                                                            132.1 µs
+GPU busy (kernels overlap: PDL or streams)                       130.7 µs
+an overlapping kernel's time includes any wait for the one before it, so the rows add up to more
+
+profile 8: batch=16 ctx=80000 dist=soft layer=sliding load=verify 16 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<true>(okc::Params)                           152.2 µs  59.8%      1
+nvjet_sm90_tss_96x64_64x10_4x2_h_bz_TNN                           26.0 µs  10.2%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_NNT                           21.2 µs   8.4%      1
+nvjet_sm90_tss_96x64_64x10_4x2_h_bz_splitK_TNN                    15.3 µs   6.0%      1
+void (anonymous namespace)::attn_kernel<8, false, 3>((ano...      10.9 µs   4.3%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                            7.8 µs   3.1%      1
+_boundary2                                                         5.8 µs   2.3%      1
+_boundary1                                                         5.6 µs   2.2%      1
+_route                                                             5.0 µs   1.9%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...       3.2 µs   1.3%      1
+void at::native::vectorized_elementwise_kernel<8, at::nat...       1.4 µs   0.5%      1
+total                                                            254.4 µs
+
+profile 9: batch=16 ctx=80000 dist=soft layer=full load=verify 16 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<true>(okc::Params)                           158.6 µs  45.0%      1
+void (anonymous namespace)::attn_kernel<8, true, 0>((anon...     103.5 µs  29.4%      1
+nvjet_sm90_tss_96x64_64x10_4x2_h_bz_TNN                           26.0 µs   7.4%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_NNT                           20.9 µs   5.9%      1
+nvjet_sm90_tss_96x64_64x10_4x2_h_bz_splitK_TNN                    15.4 µs   4.4%      1
+nvjet_sm90_tst_128x64_64x8_1x2_h_bz_TNT                            7.6 µs   2.2%      1
+_boundary2                                                         5.6 µs   1.6%      1
+_boundary1                                                         5.3 µs   1.5%      1
+_route                                                             4.8 µs   1.4%      1
+void cublasLt::splitKreduce_kernel<32, 16, int, float, fl...       3.3 µs   0.9%      1
+void at::native::vectorized_elementwise_kernel<8, at::nat...       1.4 µs   0.4%      1
+total                                                            352.1 µs
+
+profile 10: batch=32 ctx=80000 dist=soft layer=sliding load=verify 32 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<true>(okc::Params)                           210.6 µs  61.2%      1
+nvjet_sm90_tss_80x128_64x8_4x2_h_bz_TNN                           33.3 µs   9.7%      1
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_NNT                          27.0 µs   7.8%      1
+nvjet_sm90_tss_96x64_64x10_2x4_h_bz_TNN                           24.0 µs   7.0%      1
+void (anonymous namespace)::attn_kernel<8, false, 3>((ano...      14.3 µs   4.2%      1
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT                           9.7 µs   2.8%      1
+_boundary1                                                         9.5 µs   2.8%      1
+_boundary2                                                         7.9 µs   2.3%      1
+_route                                                             6.0 µs   1.7%      1
+void at::native::vectorized_elementwise_kernel<8, at::nat...       1.7 µs   0.5%      1
+total                                                            344.0 µs
+
+profile 11: batch=32 ctx=80000 dist=soft layer=full load=verify 32 page=1 q_len=8 spread=agentic
+kernel                                                           GPU time  share  calls
+void okc::moe_fused<true>(okc::Params)                           203.9 µs  40.5%      1
+void (anonymous namespace)::attn_kernel<8, true, 0>((anon...     184.0 µs  36.5%      1
+nvjet_sm90_tss_80x128_64x8_4x2_h_bz_TNN                           32.6 µs   6.5%      1
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_NNT                          26.1 µs   5.2%      1
+nvjet_sm90_tss_96x64_64x10_2x4_h_bz_TNN                           22.9 µs   4.6%      1
+nvjet_sm90_tst_128x128_64x6_2x1_v_bz_TNT                           9.4 µs   1.9%      1
+_boundary1                                                         9.2 µs   1.8%      1
+_boundary2                                                         7.9 µs   1.6%      1
+_route                                                             5.7 µs   1.1%      1
+void at::native::vectorized_elementwise_kernel<8, at::nat...       1.8 µs   0.3%      1
+total                                                            503.7 µs

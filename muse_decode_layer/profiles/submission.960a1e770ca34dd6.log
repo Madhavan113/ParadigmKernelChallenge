@@ -1,0 +1,23 @@
+[route-logits] bs=  1: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/1, time plain   30.9 us vs in-kernel routing   33.2 us
+[route-logits] bs=  4: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/4, time plain   46.5 us vs in-kernel routing   49.0 us
+[route-logits] bs=  8: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/8, time plain   80.6 us vs in-kernel routing   83.2 us
+[route-logits] bs= 16: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 5.1e-08, random-logit tokens differing 0/16, time plain  116.8 us vs in-kernel routing  121.8 us
+[route-logits] bs= 32: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 1.5e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/32, time plain  174.7 us vs in-kernel routing  182.1 us
+[route-logits] bs= 33: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/33, time plain  147.7 us vs in-kernel routing  157.3 us
+[route-logits] bs=128: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/128, time plain  197.7 us vs in-kernel routing  225.8 us
+[route-logits] bs=256: ids == host top-8 True (same set as the input routing True), max |w - w_ref| 3.0e-08, out rel L2 vs plain entry 0.0e+00, random-logit tokens differing 0/256, time plain  231.5 us vs in-kernel routing  285.0 us
+route tail: not available
+boundary tails: not available
+boundary-1 prologue T1: MISMATCH rel err s1 4.79e-08 h nan pooled 0.00e+00 logits 0.00e+00
+routing in the MoE kernel ok: T1 ids0 x0.0e+00 o0.0e+00 T8 ids0 x0.0e+00 o0.0e+00 T16 ids0 x0.0e+00 o1.2e-05 T32 ids0 x0.0e+00 o3.7e-05
+calib delta 0.154 routes/token 1.60 experts@32 17.1
+T1/3r3e qkvB:14 oB:10 pr[T31 M30 B27 F27] prF:27 unT:8 mcfg8a:45 mar2:100 mar1:91 age2:81 age1:72 pdl[2:72 3:72 4:73 6:73]->2 rim[72/76]->0
+T2/5r5e qkvB:14 oB:10 pr[T31 M30 B27 F26] prF:26 unT:8 mcfg8a:35 mar2:124 mar1:115 age2:96 age1:87 pdl[2:86 3:87 4:87 6:88]->2 rim[86/91]->0
+T4/8r7e qkvB:14 oB:10 pr[T32 M30 B28 F27] prF:27 unT:8 mcfg8a:85 mar2:146 mar1:137 age2:109 age1:100 pdl[2:100 3:101 4:102 6:101]->2 rim[100/104]->0
+T8/10r7e qkvB:14 oB:10 pr[T32 M30 B27 F27] prF:27 unT:9 mcfg8a:100 mar2:148 mar1:139 age2:108 age1:100 pdl[2:100 3:100 4:101 6:101]->2 rim[100/104]->0
+T16/20r13e qkvB:14 oB:10 pr[T32 M31 B27 F29] prB:27 unB:19 mcfg8a:152 mar2:220 mar1:219 age2:160 age1:157 pdl[2:156 3:158 4:159 6:160]->2 rim[157/157]->1
+T32/54r24e qkvB:16 oB:11 pr[T35 M32 B28 F32] prB:28 unB:20 mcfg8:255 mar2:337 mar1:326 age2:242 age1:232 pdl[2:233 3:233 4:233 6:233]->2 rim[233/233]->0
+T64/91r24e qkvt:19 ot:11 pr[T33 M33 B1000000000000000019884624838656 F1000000000000000019884624838656] prt:33 unt:22 mcfg8a:290 mar2:388 mar1:383 age2:262 age1:246
+T128/199r26e qkvm:21 qkv[T20.9 M20.7 m20.6 t20.7 q22.1] oq:11 o[T11.6 M11.5 m11.0 t11.3 q11.0] pr[T32 M33 B1000000000000000019884624838656 F1000000000000000019884624838656] prT:32 pr[T32.1 M33.3 t33.1 q39.9] unt:24 un[T23.8 M23.9 m24.8 t23.8 q24.7] mcfg8a:373 mar2:526 mar1:499 age2:297 age1:268
+T256/396r28e qkvq:23 qkv[T24.4 M24.5 m24.4 t24.0 q23.0] oq:13 o[T13.8 M13.7 m12.9 t12.9 q12.8] pr[T40 M39 B1000000000000000019884624838656 F1000000000000000019884624838656] prM:39 pr[T39.7 M38.6 t43.2 q52.9] unm:28 un[T28.7 M29.4 m27.7 t28.5 q28.8] mcfg16a:397 mar2:627 mar1:580 age2:372 age1:322
+tune: pbmax 0 moe {1: 'agent', 2: 'agent', 4: 'agent', 8: 'agent', 16: 'agent', 32: 'agent', 64: 'agent', 128: 'agent', 256: 'agent'} gluev2 {1: False, 2: False, 4: False, 8: False, 16: False, 32: False, 64: False, 128: False, 256: False}

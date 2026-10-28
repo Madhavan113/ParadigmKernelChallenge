@@ -1,0 +1,17 @@
+route tail ok: T1 ids0 w2.2e-08 x0.0e+00 T8 ids0 w4.5e-08 x0.0e+00 T16 ids0 w3.0e-08 x0.0e+00 T32 ids0 w4.5e-08 x7.9e-04
+boundary tails: not available
+boundary-1 prologue T1: fused launch 22.8 us -> with the prologue 36.1 us
+boundary-1 prologue T1: too costly (+13.3 us), off
+routing in the MoE kernel ok: T1 ids0 x0.0e+00 o0.0e+00 T8 ids0 x0.0e+00 o1.6e-06 T16 ids0 x0.0e+00 o4.2e-06 T32 ids0 x1.1e-05 o3.0e-04
+routing in the MoE kernel (no barrier) ok: T1 ids0 o5.1e-03 T8 ids0 o5.3e-03 T16 ids0 o5.3e-03 T32 ids0 o5.2e-03
+calib delta 0.252 routes/token 1.60 experts@32 16.8
+T1/3r3e qkvB:14 oB:10 pr[T30 M30 B26 F26] prB:26 unT:8 mcfg8a:53 mar2:101 mar1:92 age2:79 age1:71 pdl[2:70 3:72 4:72 6:72]->2 rmode[split:70 sk2f:70 moe:71 moe_nb:70]->sk2f
+T2/6r6e qkvB:14 oB:10 pr[T33 M30 B27 F27] prF:27 unT:8 mcfg8a:67 mar2:132 mar1:123 age2:101 age1:91 pdl[2:92 3:92 4:93 6:92]->2 rmode[split:92 sk2f:96 moe:99 moe_nb:94]->split
+T4/8r7e qkvB:14 oB:10 pr[T31 M31 B28 F27] prF:27 unT:8 mcfg8a:86 mar2:145 mar1:135 age2:108 age1:99 pdl[2:99 3:100 4:100 6:100]->2 rmode[split:99 sk2f:104 moe:106 moe_nb:102]->split
+T8/10r8e qkvB:14 oB:10 pr[T32 M30 B27 F27] prB:27 unT:8 mcfg8a:149 mar2:157 mar1:150 age2:113 age1:107 pdl[2:107 3:109 4:109 6:109]->2 rmode[split:107 sk2f:108 moe:107 moe_nb:107]->split
+T16/29r14e qkvB:14 oB:10 pr[T32 M31 B26 F30] prB:26 unB:18 mcfg8:181 mar2:232 mar1:222 age2:169 age1:159 pdl[2:158 3:159 4:161 6:161]->2 rmode[split:158 sk2f:159 moe:158 moe_nb:157]->moe_nb
+T32/49r16e qkvB:15 om:10 pr[T35 M33 B27 F32] prB:27 unB:19 mcfg8a:214 mar2:266 mar1:255 age2:192 age1:182 pdl[2:182 3:182 4:182 6:183]->3 rmode[split:183 sk2f:182 moe:182 moe_nb:181]->moe_nb
+T64/88r20e qkvt:19 oq:11 pr[T34 M33 B1000000000000000019884624838656 F1000000000000000019884624838656] prt:33 unt:22 mcfg8a:320 mar2:357 mar1:344 age2:240 age1:225
+T128/216r27e qkvq:20 qkv[T21.1 M20.7 m20.6 t20.4 q20.2] oq:11 o[T11.8 M11.3 m11.2 t10.9 q10.7] pr[T32 M32 B1000000000000000019884624838656 F1000000000000000019884624838656] prT:32 pr[T31.6 M31.8 t32.8 q39.9] unt:22 un[T25.2 M24.0 m23.4 t22.2 q23.6] mcfg8:363 mar2:554 mar1:529 age2:304 age1:274
+T256/390r28e qkvm:23 qkv[T23.8 M24.4 m22.8 t24.1 q24.4] om:13 o[T13.6 M13.7 m12.6 t12.7 q12.7] pr[T39 M39 B1000000000000000019884624838656 F1000000000000000019884624838656] prM:39 pr[T38.8 M38.7 t42.6 q52.6] unt:28 un[T28.6 M28.5 m27.6 t27.6 q27.6] mcfg16:398 mar2:636 mar1:590 age2:377 age1:327
+tune: pbmax 0 moe {1: 'agent', 2: 'agent', 4: 'agent', 8: 'agent', 16: 'agent', 32: 'agent', 64: 'agent', 128: 'agent', 256: 'agent'} gluev2 {1: False, 2: False, 4: False, 8: False, 16: False, 32: False, 64: False, 128: False, 256: False}
