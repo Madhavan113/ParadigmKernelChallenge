@@ -106,6 +106,23 @@ def apply(S, st, spec, saved):
         elif kind == "pdlmax":   # PDL_MAX_T: programmatic launches (attention, MoE, glue, sk2) up to this T
             saved.append(("pdlmax", None, S.PDL_MAX_T))
             S.PDL_MAX_T = int(val)
+        elif kind == "gmode":    # the CUDA glue kernels' mode bits (1 late trigger, 2 early wait, 4 exact rank loop, 8 1024 threads)
+            saved.append(("gmode", None, st.get("glue_mode")))
+            st["glue_mode"] = int(val)
+        elif kind == "pdlflags":   # the proj fork's PDL word flags: 0x100 sk2 trigger at entry, 0x200 cgemv as a PDL launch
+            saved.append(("pdlflags", None, S.SK2_PDL_FLAGS))
+            S.SK2_PDL_FLAGS = int(val)
+        elif kind == "attplan":   # attention plan kwargs for every call of this variant: attplan=cs:8,nc:4 (single-shape batches)
+            saved.append(("attplan", None, dict(S.ATT_PLAN_OVERRIDE)))
+            S.ATT_PLAN_OVERRIDE[None] = {kv.split(":")[0]: int(kv.split(":")[1]) for kv in val.split(",") if kv}
+        elif kind == "m1":   # pin a layer's m = 1 route in the proj fork: m1:unpooler=sgemv|cgemv|sk2 (qkv_gate / o / unpooler)
+            ch = st["bfp"]["choice"]
+            saved.append(("m1", (sel, 1), ch.get((sel, 1))))
+            ch[(sel, 1)] = (val,)
+        elif kind == "tinyh0":   # the MoE TINY build with OKC_WSH0 (pre-built when MOE_TINY_H0_BUILD)
+            saved.append(("tinyh0", None, S.moe_TINY_DEFINES))
+            base = tuple(d for d in S.moe_TINY_DEFINES if d != "-DOKC_WSH0=1")
+            S.moe_TINY_DEFINES = base + (("-DOKC_WSH0=1",) if val in ("1", "True") else ())
         else:
             raise ValueError(item)
 
@@ -126,6 +143,23 @@ def restore(S, st, saved):
             S.bfp_SK2_PICK[k] = old
         elif kind == "pdlmax":
             S.PDL_MAX_T = old
+        elif kind == "gmode":
+            if old is None:
+                st.pop("glue_mode", None)
+            else:
+                st["glue_mode"] = old
+        elif kind == "pdlflags":
+            S.SK2_PDL_FLAGS = old
+        elif kind == "tinyh0":
+            S.moe_TINY_DEFINES = old
+        elif kind == "m1":
+            if old is None:
+                st["bfp"]["choice"].pop(k, None)
+            else:
+                st["bfp"]["choice"][k] = old
+        elif kind == "attplan":
+            S.ATT_PLAN_OVERRIDE.clear()
+            S.ATT_PLAN_OVERRIDE.update(old)
         else:
             d = st[kind]
             if old is None:

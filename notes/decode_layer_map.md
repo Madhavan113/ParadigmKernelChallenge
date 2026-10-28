@@ -415,3 +415,47 @@ diagnosis 16/16 at T=128/256 with PDL on, and all 13 TASK.md tests ok eager + gr
 d1f +3.2/+2.8/+2.5, d16s +0.8/+2.8/+2.0, d16f +1.6/+1.3/+1.6, d32s +2.5/+2.5/+2.7, d32f +1.8/+2.5/+1.6, v1s
 +2.5/+2.9/+2.9, v1f +2.9/+3.7/+3.0, v16s +3.1/+4.4/+2.8, v16f +3.0/+1.9/+2.0, v32s +1.4/+2.1/+0.5, v32f
 +0.8/+0.6/+1.5 (order check within +-0.9). Handed to main for a scored run (checks were exhausted that day).
+Scored: job 75a47c1c 2.1388x (CI 2.107-2.171; d1s 73.7, d1f 79.5, d16s 129.5, d16f 207.1, d32s 156.8, d32f 306.7,
+v1s 110.6, v1f 115.2, v16s 258.3, v16f 335.0, v32s 331.2, v32f 496.4; prepare 134.5 s); rank 56 / 875. Merged 0c0a49e.
+
+## 13. Round 2 on the T <= 32 chain (Oct 28 evening; paired, seeds 0-2, lock >= 1 us, stop after two failed variants)
+
+nsys graph-replay timeline, T=1 sliding (vm_ab/nsys_chain.sh + nsys_rows.py; start-end us, overlap with the
+previous kernel): qkv sk2 0.0-9.5 | attn 9.0-14.8 (0.5) | o sk2 12.1-18.7 (2.7) | bnd1 18.0-21.6 (0.8; 2.8 exposed) |
+pooler sk2f 18.8-37.4 (2.8) | route 34.5-40.5 (2.9; 3.1 exposed) | moe 35.9-55.6 (4.6; effective from 40.5) |
+unpooler sgemv 55.7-59.5 (gap 0.1: plain launch) | bnd2 59.2-62.9 (0.2; 3.5 exposed); span 63 us. The exposed glue
+is ~9.4 us (13.7 with Triton); each glue kernel shows 2.8-3.5 us after its producer although its post-wait work is
+~1.5 us: the rest is the PDL wait-return / launch latency of a kernel boundary. The fork's m=1 route autotuner flips
+between prepares (this one: sk2 / sk2 / sgemv; the judge profile a day earlier: cgemv x3).
+
+Items (variant minus base, us; closed = under the bar):
+1. routing rank as a 16-bit SIMD pre-pass (__vsetgtu2 on packed ordered keys, exact pass over the 16-bit
+   candidates; gmode bit 4 = the old loop): within +-0.8 at every T <= 32 - the rank is not on the exposed path.
+   Kept (harmless), closed.
+2. PDL placement: glue trigger after the stores (gmode=1) +1.0..+3.5 everywhere; sk2 trigger at entry (pdlflags=256)
+   +1.0..+2.1 at T=1/8, 0 at T=16/32; cgemv as a PDL launch (pdlflags=512) 0 (the autotuner had not picked cgemv) ->
+   ab16 with pinned m=1 routes and sgemv on the same PDL path (pending).
+3. boundaries with 1024 threads x 8 columns (gmode=8): +0.1..+0.6, closed (the producer row is already the first
+   load after the wait; the cost is the boundary latency, not the reduction).
+4. MoE TINY + OKC_WSH0 at T=1 (one paired run, check ok): d1s +0.3/-0.1/-0.4, d1f -0.3/-1.0/-0.6 - neutral, closed.
+5. attention plans at B=1 sliding q1 (ATT_PLAN_OVERRIDE -> att__launch kwargs; cs 8 / 16, coop over 4 copies, 16
+   two-tile splits, 64 splits): pending (ab17).
+2b. (ab16, T=1, m=1 routes pinned via m1:<layer>=<kind>) the fork's m=1 autotuner flip is worth 6 us: qkv / o as
+   cgemv (+ unpooler sgemv) +6.5/+6.5 vs the sk2 choice (rows +5.4/+7.6/+6.1, +8.9/+5.6/+5.2); with the GEMVs as
+   PDL launches (pdlflags=512) +4.3/+5.3 (the GEMV-PDL path recovers 1.2-2.2 us when a GEMV is in the chain);
+   sk2 routes + sk2 entry trigger +2.2/+2.6; sk2 routes + unpooler cgemv +0.1/+0.4 (= base). ab18 (qkv / o pinned
+   to sk2): unpooler cgemv plain +0.4/+0.3, cgemv as a PDL launch -1.0/-0.7 (rows -1.6/-1.1/-0.6, +0.1/-0.9/-1.5),
+   sgemv plain -0.1/+0.1, sgemv PDL +0.1/-0.2, unpooler as sk2 (slice8_r192) -1.4/-0.9 (rows -1.6/-1.3/-0.8,
+   -0.7/-1.6/-0.6; check ok). LOCK (682afcb): M1_ROUTE_PIN = all sk2 at m = 1, applied after the fork's prepare and
+   printed; SK2_PDL_FLAGS stays 0 (the GEMV-PDL path kept for the fallback). Value: ~1 us at T=1 vs a prepare that
+   drew sk2 anyway, +7.7 us vs one that drew cgemv for qkv / o (the Oct 27 judge profile did).
+5. attention plans at B=1 sliding q1 (ab17, check ok for each): clusters cs 8 +5.5 (+5.0/+5.7/+5.7), cs 16 +5.8,
+   cooperative finalize over 4 copies +0.5, 16 two-tile splits +1.5, 64 splits +0.6 - the module's plain 32-split
+   plan is the chain's best; closed.
+
+Locked build 682afcb (submission md5 42931740) validated (ab19): the judge's check on the 12 scored shapes at seeds
+2/3 ALL OK, the 13 TASK.md tests ALL OK; before/after at T=1 (variant minus locked, s0/s1/s2): all-cgemv m=1 routes
++6.4/+9.4/+8.0 d1s, +9.9/+7.1/+7.1 d1f; unpooler cgemv alone +1.0/+1.5/+1.4, +0.9/+0.8/+1.2; order check -0.3/-0.5.
+Handed to main for a scored run. Round 2 closed: the T <= 32 chain is at its launch-structure floor (~9 kernels,
+~1 us of PDL wait-return each); further gains need fewer kernels (a boundary folded into its producer's epilogue,
+which the ticket tails showed is one-CTA compute-bound) or faster MoE / attention / sk2 bodies.

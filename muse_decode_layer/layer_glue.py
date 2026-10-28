@@ -111,12 +111,43 @@ if "bfp_CUTLASS_LAYERS" in globals():   # standalone proj composition: no CUTLAS
     bfp_CUTLASS_LAYERS = set()
 
 
+M1_ROUTE_PIN = {"qkv_gate": "sk2", "o": "sk2", "unpooler": "sk2"}
+# the fork's m = 1 route per layer, pinned: its isolated autotuner flips between sk2 and the GEMVs (cgemv / sgemv)
+# from one prepare to the next; on the chain the qkv / o GEMVs cost +6.5 us at T = 1 (H200 paired, seeds 0-2,
+# vm_ab/ab16: sk2 streams its weights under the previous kernel's tail through PDL, the plain-launched GEMV cannot)
+# and the unpooler slice as sk2 (slice8_r192) is 0.9-1.4 us faster than the GEMVs (ab18: rows -1.6/-1.3/-0.8 d1s,
+# -0.7/-1.6/-0.6 d1f; the GEMVs as PDL launches recover at most 1.0 of it)
+
+
+def _pin_m1_routes(bst):
+    """Apply M1_ROUTE_PIN to the fork's autotuned choices where the pinned kind is built and validated."""
+    pinned = []
+    for layer, kind in M1_ROUTE_PIN.items():
+        ok = False
+        if kind == "sk2":
+            ok = (bfp__sk2_name(layer, 1) in bst.get("sk2", {})
+                  and bfp__route_key(layer, 1, "sk2") not in bst.get("disabled", ()))
+        elif kind == "cgemv":
+            ok = (layer, bfp_CG_CONFIGS[layer][0]) in bst.get("cg", {}) and bfp__route_key(layer, 1, "cgemv") not in bst.get("disabled", ())
+        elif kind == "sgemv":
+            ok = layer == "unpooler" and layer in bst.get("raw", {}) and bfp__route_key(layer, 1, "sgemv") not in bst.get("disabled", ())
+        if ok:
+            bst.setdefault("choice", {})[(layer, 1)] = (kind,)
+            pinned.append(f"{layer}:{kind}")
+    print("m=1 routes pinned: " + (" ".join(pinned) or "none") + "; autotuned: "
+          + " ".join(f"{l_}:{bst.get('choice', {}).get((l_, 1), ('?',))[0]}" for l_ in ("qkv_gate", "o", "unpooler")), flush=True)
+
+
 def _bfp_prepare(weights, st):
     """Their prepare() on the five dense matrices, guarded: any failure just disables the backend."""
     st["bfp"] = None
     try:
         w5 = {k: weights[k].contiguous() for k in ("qkv_gate", "o", "pooler", "unpooler", "router")}
         st["bfp"] = bfp_prepare(w5)
+        try:
+            _pin_m1_routes(st["bfp"])
+        except Exception as ex:  # noqa: BLE001
+            print("m=1 route pin skipped:", repr(ex)[:200], flush=True)
     except Exception as ex:  # noqa: BLE001
         s = repr(ex)
         print("bfp disabled:", s[:200] + (" ... " + s[-1500:] if len(s) > 1700 else s[200:]), flush=True)
@@ -141,10 +172,15 @@ PR_FORM_LOCK = {1: ("bfpf", False), 2: ("bfpf", False), 4: ("bfpf", False), 8: (
                                       # boundary-1 prologue cost 0.8-1.3 us at T = 1 (ab1 / ab5, both seeds)
 
 
+SK2_PDL_FLAGS = 0   # OR-ed into the proj fork's PDL word: 0x100 = the sk2 kernels trigger launch_dependents at entry
+                    # (not after their main loop), 0x200 = the m = 1 cgemv is a PDL launch (weights before its wait,
+                    # trigger at entry). Measured on the H200 (vm_ab/ab14).
+
+
 def _bfp_pdl(T):
     """Their launchers read SK2_PDL (bfp_SK2_PDL once inlined) at every launch: same T rule as this file's glue."""
     global bfp_SK2_PDL
-    bfp_SK2_PDL = _PDL_N_BY_T.get(T, BFP_PDL_N) if _pdl(T) else 0
+    bfp_SK2_PDL = (_PDL_N_BY_T.get(T, BFP_PDL_N) | SK2_PDL_FLAGS) if _pdl(T) else 0
 
 
 def _bfp_gemm(st, name, x, m, n, k):
@@ -483,12 +519,18 @@ ROUTE_IN_MOE = False  # [off: moe / moe_nb lost 4-10 us at every T on the H200, 
                       # normalizes xm after a grid barrier); the tuner picks per T on the chain time, self-test gated
 
 
+MOE_TINY_H0_BUILD = True   # also build the TINY (M <= 8) variant with OKC_WSH0 (helper warp = hardware warp 0) for the
+                           # chain A/B (vm_ab/ab15; the standalone measured it neutral); selected by moe_TINY_DEFINES
+
+
 def _moe_builds(sfx):
     """The builds the moe module's prepare() will ask for (its rule), so prepare() here can run them in parallel."""
     mods = [tuple(moe__main_defines(sfx)) + sfx]
     for d in (moe_TINY_DEFINES, moe_TINY2_DEFINES, moe_MID_DEFINES):
         if d and (sfx or "-DOKC_WGS=1" not in tuple(d)):   # the WGS build needs the PRMT scale decode
             mods.append(tuple(d) + sfx)
+    if MOE_TINY_H0_BUILD and moe_TINY_DEFINES and "-DOKC_WSH0=1" not in tuple(moe_TINY_DEFINES):
+        mods.append(tuple(moe_TINY_DEFINES) + ("-DOKC_WSH0=1",) + sfx)
     if globals().get("moe_ROUTE_LOGITS_BUILDS") and "moe__logits_defines" in globals():
         mods += [moe__logits_defines(d) for d in list(mods)]
     return mods
@@ -1421,8 +1463,10 @@ def _boundary2(P, S: tl.constexpr, T, NU: tl.constexpr, S1, A2, B2, GPOST, GNEXT
 # coalesced columns per thread, alpha / beta of the residual gate precomputed at prepare (st["ab1"] / ["ab2"]: ~12
 # instructions per element), the four row sums in ONE block reduction (sum s^2 = A + 2rB + r^2 D gives both norms), no
 # inter-CTA traffic; routing = one 1024-thread CTA per token, top-8 by rank with 64-bit (ordered score, 255 - e) keys
-# in shared memory (4 threads per expert, 64 compares each, no serial rounds; ties to the lower index as tl.argmax),
-# the pre-expert norm fused. Weights and inputs load before griddepcontrol.wait, the producer's data after it.
+# in shared memory (4 threads per expert; ties to the lower index as tl.argmax), the pre-expert norm fused: a 16-bit
+# SIMD pre-pass (__vsetgtu2 on the keys' top halves, 2 keys per instruction) gives the rank up to 16-bit ties, and
+# only the candidates (16-bit rank < 8) resolve the exact rank among themselves (an expert tied with a candidate at
+# 16 bits is itself a candidate). Weights and inputs load before griddepcontrol.wait, the producer's data after it.
 GLUE_CUDA = True
 GLUE_MAX_T = 256
 GLUE_MODE = 0        # PDL placement bits: 1 = launch_dependents after the stores (not at the start), 2 = wait before the prologue
@@ -1449,8 +1493,8 @@ GLUE_CUDA_SRC = r"""
 namespace okc_glue {
 
 constexpr int HID = 8192, DEX = 4096, NEXP = 256, PRW = 4608;
-constexpr int BNT = 512;            // boundary: one CTA per token, 512 threads x 16 columns (4 coalesced chunks of 4)
-constexpr int BCH = HID / (4 * BNT);   // = 4 chunks per thread
+constexpr int BNT = 512;            // boundary: one CTA per token, 512 threads x 16 columns (4 coalesced chunks of 4);
+                                    // 1024 threads x 8 columns under mode bit 8 (A/B)
 constexpr int RNT = 1024;           // routing: one CTA per token, 4 threads per expert, 4 pooled columns per thread
 
 __device__ __forceinline__ void pdl_wait() {
@@ -1511,19 +1555,20 @@ __device__ __forceinline__ void st4bf(__nv_bfloat16* p, const float* v) {
 // One 512-thread CTA per token, thread tid owns chunks 4 (tid + k 512), k < 4 (coalesced). The four row sums
 // (sum x^2, A = sum (alpha st)^2, B = sum (alpha st)(beta x), D = sum (beta x)^2) in ONE block reduction;
 // sum s^2 = A + 2 r B + r^2 D gives the second norm without a second pass. No inter-CTA traffic.
-template <int KIND, typename AT>
-__global__ void __launch_bounds__(BNT) bnd_kernel(const AT* a, int lda, int nu, const float* __restrict__ st,
+template <int KIND, typename AT, int NT>
+__global__ void __launch_bounds__(NT) bnd_kernel(const AT* a, int lda, int nu, const float* __restrict__ st,
     const float* __restrict__ alpha, const float* __restrict__ beta, const __nv_bfloat16* __restrict__ g1,
     const __nv_bfloat16* __restrict__ g2, float* sout, __nv_bfloat16* hout, int pdl, int mode) {
+  constexpr int BCH = HID / (4 * NT);   // 16-B chunks per thread (4 at 512 threads, 2 at 1024)
   const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-  __shared__ float red[BNT / 32][4];
+  __shared__ float red[NT / 32][4];
   __shared__ float scl[2];
   if (pdl && !(mode & 1)) pdl_trigger();
   if (pdl && (mode & 2)) pdl_wait();
   float sv[BCH][4], al[BCH][4], be[BCH][4], gw[BCH][4], gn[BCH][4];
 #pragma unroll
   for (int k = 0; k < BCH; ++k) {
-    const int col = 4 * (tid + k * BNT);
+    const int col = 4 * (tid + k * NT);
     ld4f(st + (size_t)t * HID + col, sv[k]);
     ld4f(alpha + col, al[k]);
     ld4f(beta + col, be[k]);
@@ -1534,7 +1579,7 @@ __global__ void __launch_bounds__(BNT) bnd_kernel(const AT* a, int lda, int nu, 
   float x[BCH][4];
 #pragma unroll
   for (int k = 0; k < BCH; ++k) {
-    const int col = 4 * (tid + k * BNT);
+    const int col = 4 * (tid + k * NT);
     x[k][0] = x[k][1] = x[k][2] = x[k][3] = 0.f;
     if (KIND == 1 || col < nu) ld4cg<AT>(a + (size_t)t * lda + col, x[k]);
     if (KIND == 2) {
@@ -1555,9 +1600,9 @@ __global__ void __launch_bounds__(BNT) bnd_kernel(const AT* a, int lda, int nu, 
   __syncthreads();
   if (warp == 0) {
     float4 p = make_float4(0.f, 0.f, 0.f, 0.f);
-    if (lane < BNT / 32) p = make_float4(red[lane][0], red[lane][1], red[lane][2], red[lane][3]);
+    if (lane < NT / 32) p = make_float4(red[lane][0], red[lane][1], red[lane][2], red[lane][3]);
 #pragma unroll
-    for (int o = (BNT / 32) / 2; o > 0; o >>= 1) {
+    for (int o = (NT / 32) / 2; o > 0; o >>= 1) {
       p.x += __shfl_xor_sync(0xffffffffu, p.x, o); p.y += __shfl_xor_sync(0xffffffffu, p.y, o);
       p.z += __shfl_xor_sync(0xffffffffu, p.z, o); p.w += __shfl_xor_sync(0xffffffffu, p.w, o);
     }
@@ -1571,7 +1616,7 @@ __global__ void __launch_bounds__(BNT) bnd_kernel(const AT* a, int lda, int nu, 
   const float r = scl[0], r1 = scl[1];
 #pragma unroll
   for (int k = 0; k < BCH; ++k) {
-    const int col = 4 * (tid + k * BNT);
+    const int col = 4 * (tid + k * NT);
     float s[4], h[4];
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -1602,8 +1647,11 @@ __global__ void __launch_bounds__(RNT) route_kernel(const void* pooled_, const f
   const int t = blockIdx.x, tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int e = tid & (NEXP - 1), quarter = tid >> 8;
   const int col = 4 * tid;   // pooled columns of this thread
-  __shared__ unsigned long long key_s[NEXP];
+  __shared__ unsigned long long key_s[NEXP];   // exact keys: (ordered score << 32) | (255 - e)
+  __shared__ uint32_t k16_s[NEXP / 2];           // the keys' top 16 bits, pair j = experts 2j (low half), 2j + 1
   __shared__ int rk_s[4][NEXP];
+  __shared__ int cand_s[NEXP];
+  __shared__ int ncand_s;
   __shared__ int sel_idx[8];
   __shared__ float sel_val[8];
   __shared__ float qred[RNT / 32];
@@ -1631,24 +1679,67 @@ __global__ void __launch_bounds__(RNT) route_kernel(const void* pooled_, const f
   if (lane == 0) qred[warp] = q;
   const float sc = sigm(lg * 0.1767766952966369f);
   const float sel = sc + bv;
-  if (quarter == 0) key_s[e] = ((unsigned long long)ordered(sel) << 32) | (unsigned)(NEXP - 1 - e);
+  const uint32_t ok = ordered(sel);
+  const uint32_t k16 = ok >> 16;
+  const uint32_t nb16 = __shfl_down_sync(0xffffffffu, k16, 1);   // expert e + 1 is the next lane
+  if (quarter == 0) {
+    key_s[e] = ((unsigned long long)ok << 32) | (unsigned)(NEXP - 1 - e);
+    if (!(e & 1)) k16_s[e >> 1] = k16 | (nb16 << 16);
+  }
+  if (tid == 0) ncand_s = 0;
   __syncthreads();
-  const unsigned long long mykey = key_s[e];
-  int rk = 0;
-  const unsigned long long* kq = key_s + quarter * (NEXP / 4);
+  int rk;
+  if (mode & 4) {   // the exact 64-bit rank over this thread's quarter of the keys (the previous form, for A/B)
+    const unsigned long long mykey = key_s[e];
+    const unsigned long long* kq = key_s + quarter * (NEXP / 4);
+    rk = 0;
 #pragma unroll 16
-  for (int j = 0; j < NEXP / 4; ++j) rk += kq[j] > mykey;
+    for (int j = 0; j < NEXP / 4; ++j) rk += kq[j] > mykey;
+  } else {
+    // 16-bit SIMD pre-pass: how many keys beat mine in their top 16 bits (2 keys per compare, 8 x 16 B of smem)
+    const uint32_t me2 = k16 * 0x00010001u;
+    uint32_t acc = 0;
+    const uint4* kp = reinterpret_cast<const uint4*>(k16_s) + quarter * (NEXP / 2 / 4 / 4);
+#pragma unroll
+    for (int i = 0; i < NEXP / 2 / 4 / 4; ++i) {
+      const uint4 v = kp[i];
+      acc = __vadd2(acc, __vsetgtu2(v.x, me2)); acc = __vadd2(acc, __vsetgtu2(v.y, me2));
+      acc = __vadd2(acc, __vsetgtu2(v.z, me2)); acc = __vadd2(acc, __vsetgtu2(v.w, me2));
+    }
+    rk = (int)((acc & 0xFFFFu) + (acc >> 16));
+  }
   rk_s[quarter][e] = rk;
   __syncthreads();
+  bool cand = false;
+  int rk0 = 0;
   if (quarter == 0) {
-    const int r = rk_s[0][e] + rk_s[1][e] + rk_s[2][e] + rk_s[3][e];
-    if (r < 8) { sel_idx[r] = e; sel_val[r] = sc; }
+    rk0 = rk_s[0][e] + rk_s[1][e] + rk_s[2][e] + rk_s[3][e];
+    if (mode & 4) {
+      if (rk0 < 8) { sel_idx[rk0] = e; sel_val[rk0] = sc; }
+    } else if (rk0 < 8) {   // a top-8 candidate by 16-bit rank: exact rank among the candidates below
+      cand = true;
+      cand_s[atomicAdd(&ncand_s, 1)] = e;
+    }
   }
   if (tid == 0) {
     float qs = 0.f;
 #pragma unroll
     for (int w = 0; w < RNT / 32; ++w) qs += qred[w];
     scl = rsqrtf(qs / (float)DEX + 1e-5f);
+  }
+  __syncthreads();
+  if (cand) {
+    // every expert tied with a candidate at 16 bits has the same 16-bit rank, so it is a candidate too: the exact
+    // rank is the 16-bit rank plus the tied candidates whose full key beats mine (ties to the lower index)
+    const int n = ncand_s;
+    const unsigned long long mk = key_s[e];
+    int extra = 0;
+    for (int i = 0; i < n; ++i) {
+      const unsigned long long kd = key_s[cand_s[i]];
+      extra += ((uint32_t)(kd >> 48) == k16) && (kd > mk);
+    }
+    const int r = rk0 + extra;
+    if (r < 8) { sel_idx[r] = e; sel_val[r] = sc; }
   }
   __syncthreads();
   if (tid < 8) {
@@ -1680,19 +1771,26 @@ static void set_pdl(cudaLaunchConfig_t& lc, cudaLaunchAttribute* at_, int pdl) {
   }
 }
 
+template <int KIND, typename AT, int NT>
+static void launch_bnd_nt(const torch::Tensor& a, int lda, int nu, const torch::Tensor& st, const torch::Tensor& alpha,
+                          const torch::Tensor& beta, const torch::Tensor& g1, const torch::Tensor& g2, torch::Tensor& sout,
+                          torch::Tensor& hout, int T, int pdl, int mode) {
+  cudaLaunchConfig_t lc = {};
+  cudaLaunchAttribute at_[1];
+  lc.gridDim = dim3(T);
+  lc.blockDim = dim3(NT);
+  set_pdl(lc, at_, pdl);
+  C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, bnd_kernel<KIND, AT, NT>, reinterpret_cast<const AT*>(a.data_ptr()), lda, nu,
+      st.data_ptr<float>(), alpha.data_ptr<float>(), beta.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(g1.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr()),
+      sout.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(hout.data_ptr()), pdl, mode));
+}
 template <int KIND, typename AT>
 static void launch_bnd(const torch::Tensor& a, int lda, int nu, const torch::Tensor& st, const torch::Tensor& alpha,
                        const torch::Tensor& beta, const torch::Tensor& g1, const torch::Tensor& g2, torch::Tensor& sout,
                        torch::Tensor& hout, int T, int pdl, int mode) {
-  cudaLaunchConfig_t lc = {};
-  cudaLaunchAttribute at_[1];
-  lc.gridDim = dim3(T);
-  lc.blockDim = dim3(BNT);
-  set_pdl(lc, at_, pdl);
-  C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, bnd_kernel<KIND, AT>, reinterpret_cast<const AT*>(a.data_ptr()), lda, nu,
-      st.data_ptr<float>(), alpha.data_ptr<float>(), beta.data_ptr<float>(),
-      reinterpret_cast<const __nv_bfloat16*>(g1.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(g2.data_ptr()),
-      sout.data_ptr<float>(), reinterpret_cast<__nv_bfloat16*>(hout.data_ptr()), pdl, mode));
+  if (mode & 8) launch_bnd_nt<KIND, AT, 1024>(a, lda, nu, st, alpha, beta, g1, g2, sout, hout, T, pdl, mode);
+  else launch_bnd_nt<KIND, AT, BNT>(a, lda, nu, st, alpha, beta, g1, g2, sout, hout, T, pdl, mode);
 }
 
 template <bool SPLIT>
@@ -1763,7 +1861,7 @@ def _glue_build():
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
     return load_inline(
-        name=f"okc_glue_v5_{arch}",
+        name=f"okc_glue_v7_{arch}",
         cpp_sources=GLUE_CPP_SRC,
         cuda_sources=GLUE_CUDA_SRC,
         functions=["glue_bnd", "glue_route"],
@@ -1840,6 +1938,8 @@ def _glue_selftest(st):
             report.append(f"T{T}{'f' if a_f32 else ''} b1 {e1:.1e}/{e2:.1e} b2 {e3:.1e}/{e4:.1e}")
         pooled = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
         logits = torch.randn(T, N_EXPERTS, generator=g, device=dev) * 3.0
+        if T in (8, 128):   # coarse logits: many scores equal at 16 bits and exactly (the rank's tie paths)
+            logits = torch.round(logits * 2.0) / 2.0
         outs = [(torch.empty((T, 8), device=dev, dtype=torch.int32), torch.empty((T, 8), **f32),
                  torch.empty((T, D_EXPERT), device=dev, dtype=torch.bfloat16), torch.empty((T, 8), device=dev, dtype=torch.int32))
                 for _ in range(4)]
@@ -2411,15 +2511,20 @@ def _att7():
 ATT_HAS_PDL = True   # does the embedded attention launcher take pdl= (their v63+)?
 
 
+ATT_PLAN_OVERRIDE = {}   # (B, q_len, sliding) -> plan kwargs for the att module's launcher (n_splits / flat / cs / ncl /
+                         # nc / coop / w0): the chain-timed alternatives to its own plan (vm_ab/ab17); None = all shapes
+
+
 def _decode_attention7(data, state, qkv):
     """The attention module's own launcher (att__launch): plan, workspace sizes and the coop / w0 bits always match
     the kernel version composed in. This layer's config already carries their keys (heads, head_dim, page_size,
     window, rope_theta, scales)."""
     cfg = data["config"]
     pdl = {"pdl": _pdl(cfg["batch"] * cfg["q_len"])} if ATT_HAS_PDL else {}   # their launcher's PDL switch
+    plan = ATT_PLAN_OVERRIDE.get((cfg["batch"], cfg["q_len"], bool(cfg["window"])), ATT_PLAN_OVERRIDE.get(None, {}))
     out = att__launch({"config": cfg, "qkv": qkv, "seq_lens": data["seq_lens"], "cache_loc": data["cache_loc"],
                     "k_cache": data["k_cache"], "v_cache": data["v_cache"], "page_table": data["page_table"],
-                    "k_scale": data["k_scale"], "v_scale": data["v_scale"]}, **pdl)
+                    "k_scale": data["k_scale"], "v_scale": data["v_scale"]}, **pdl, **plan)
     return out.view(cfg["batch"] * cfg["q_len"], 1024)
 
 
