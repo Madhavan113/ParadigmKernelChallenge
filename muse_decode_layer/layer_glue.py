@@ -488,12 +488,18 @@ ROUTE_IN_MOE = False  # [off: moe / moe_nb lost 4-10 us at every T on the H200, 
                       # normalizes xm after a grid barrier); the tuner picks per T on the chain time, self-test gated
 
 
+MOE_TINY_H0_BUILD = True   # also build the TINY (M <= 8) variant with OKC_WSH0 (helper warp = hardware warp 0) for the
+                           # chain A/B (vm_ab/ab15; the standalone measured it neutral); selected by moe_TINY_DEFINES
+
+
 def _moe_builds(sfx):
     """The builds the moe module's prepare() will ask for (its rule), so prepare() here can run them in parallel."""
     mods = [tuple(moe__main_defines(sfx)) + sfx]
     for d in (moe_TINY_DEFINES, moe_TINY2_DEFINES, moe_MID_DEFINES):
         if d and (sfx or "-DOKC_WGS=1" not in tuple(d)):   # the WGS build needs the PRMT scale decode
             mods.append(tuple(d) + sfx)
+    if MOE_TINY_H0_BUILD and moe_TINY_DEFINES and "-DOKC_WSH0=1" not in tuple(moe_TINY_DEFINES):
+        mods.append(tuple(moe_TINY_DEFINES) + ("-DOKC_WSH0=1",) + sfx)
     if globals().get("moe_ROUTE_LOGITS_BUILDS") and "moe__logits_defines" in globals():
         mods += [moe__logits_defines(d) for d in list(mods)]
     return mods
@@ -2474,15 +2480,20 @@ def _att7():
 ATT_HAS_PDL = True   # does the embedded attention launcher take pdl= (their v63+)?
 
 
+ATT_PLAN_OVERRIDE = {}   # (B, q_len, sliding) -> plan kwargs for the att module's launcher (n_splits / flat / cs / ncl /
+                         # nc / coop / w0): the chain-timed alternatives to its own plan (vm_ab/ab17); None = all shapes
+
+
 def _decode_attention7(data, state, qkv):
     """The attention module's own launcher (att__launch): plan, workspace sizes and the coop / w0 bits always match
     the kernel version composed in. This layer's config already carries their keys (heads, head_dim, page_size,
     window, rope_theta, scales)."""
     cfg = data["config"]
     pdl = {"pdl": _pdl(cfg["batch"] * cfg["q_len"])} if ATT_HAS_PDL else {}   # their launcher's PDL switch
+    plan = ATT_PLAN_OVERRIDE.get((cfg["batch"], cfg["q_len"], bool(cfg["window"])), ATT_PLAN_OVERRIDE.get(None, {}))
     out = att__launch({"config": cfg, "qkv": qkv, "seq_lens": data["seq_lens"], "cache_loc": data["cache_loc"],
                     "k_cache": data["k_cache"], "v_cache": data["v_cache"], "page_table": data["page_table"],
-                    "k_scale": data["k_scale"], "v_scale": data["v_scale"]}, **pdl)
+                    "k_scale": data["k_scale"], "v_scale": data["v_scale"]}, **pdl, **plan)
     return out.view(cfg["batch"] * cfg["q_len"], 1024)
 
 

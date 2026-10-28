@@ -3041,7 +3041,8 @@ void cgemv(at::Tensor L, at::Tensor C, at::Tensor x, at::Tensor etab, int64_t pm
 // k = 8i (one 16 B load per row and one of x), fixed-order reductions.
 template <int ROWS, int NTH, int K>
 __global__ void __launch_bounds__(NTH) sgemv_kernel(const __nv_bfloat16* __restrict__ W, const __nv_bfloat16* __restrict__ x,
-                                                    __nv_bfloat16* __restrict__ out) {
+                                                    __nv_bfloat16* __restrict__ out, int pdl){
+  if (pdl) asm volatile("griddepcontrol.launch_dependents;" ::: "memory");   // dependents may prefetch now
   constexpr int PER = K / NTH / 8;
   constexpr int NWARP = NTH / 32;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
@@ -3052,7 +3053,8 @@ __global__ void __launch_bounds__(NTH) sgemv_kernel(const __nv_bfloat16* __restr
 #pragma unroll
     for (int j = 0; j < PER; ++j) w[r][j] = __ldg(reinterpret_cast<const uint4*>(W + (size_t)(r0 + r) * K + j * (NTH * 8) + tid * 8));
 #pragma unroll
-  for (int j = 0; j < PER; ++j) xv[j] = __ldg(reinterpret_cast<const uint4*>(x + j * (NTH * 8) + tid * 8));
+  if (pdl) asm volatile("griddepcontrol.wait;" ::: "memory");   // x is the previous kernel's output
+  for (int j = 0; j < PER; ++j) xv[j] = __ldcg(reinterpret_cast<const uint4*>(x + j * (NTH * 8) + tid * 8));
   float acc[ROWS];
 #pragma unroll
   for (int r = 0; r < ROWS; ++r) acc[r] = 0.f;
@@ -3090,9 +3092,22 @@ __global__ void __launch_bounds__(NTH) sgemv_kernel(const __nv_bfloat16* __restr
 
 void sgemv(at::Tensor W, at::Tensor x, at::Tensor out, int64_t N) {
   TORCH_CHECK(W.size(1) == 4096 && x.size(0) == 1 && N % 4 == 0 && N <= W.size(0), "sgemv: m = 1, K = 4096");
-  sgemv_kernel<4, 512, 4096><<<(int)(N / 4), 512, 0, at::cuda::getCurrentCUDAStream()>>>(
+  {
+    auto st = at::cuda::getCurrentCUDAStream();
+    const int pdl = (g_sk2_pdl & 0x200) ? 1 : 0;   // PDL launch of the m = 1 GEMV (sk2_set_pdl bit 9)
+    if (pdl) {
+      cudaLaunchConfig_t lc = {}; lc.gridDim = dim3((int)(N / 4)); lc.blockDim = dim3(512); lc.dynamicSmemBytes = 0; lc.stream = st;
+      cudaLaunchAttribute at_[1]; at_[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+      at_[0].val.programmaticStreamSerializationAllowed = 1; lc.attrs = at_; lc.numAttrs = 1;
+      C10_CUDA_CHECK(cudaLaunchKernelEx(&lc, sgemv_kernel<4, 512, 4096>, 
       reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
-      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()));
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), 1));
+    } else {
+      sgemv_kernel<4, 512, 4096><<<(int)(N / 4), 512, 0, st>>>(
+      reinterpret_cast<const __nv_bfloat16*>(W.data_ptr()), reinterpret_cast<const __nv_bfloat16*>(x.data_ptr()),
+      reinterpret_cast<__nv_bfloat16*>(out.data_ptr()), 0);
+    }
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -4004,7 +4019,9 @@ def _run(choice, x, layer, m, n, k, state):
         return out
     if kind == "sgemv":   # unpooler slice, m = 1: BF16 weights straight from memory (4 rows per CTA)
         out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
-        _get_ext().sgemv(state["raw"][layer], x, out, n)
+        ext = _get_ext()
+        ext.sk2_set_pdl(SK2_PDL)
+        ext.sgemv(state["raw"][layer], x, out, n)
         return out
     if kind == "rgemv":   # router, m = 1: FP32 weights straight from memory (one row per CTA)
         out = torch.empty((m, n), dtype=torch.float32, device=x.device)
