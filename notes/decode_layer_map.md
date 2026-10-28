@@ -440,3 +440,8 @@ Items (variant minus base, us; closed = under the bar):
 4. MoE TINY + OKC_WSH0 at T=1 (one paired run, check ok): d1s +0.3/-0.1/-0.4, d1f -0.3/-1.0/-0.6 - neutral, closed.
 5. attention plans at B=1 sliding q1 (ATT_PLAN_OVERRIDE -> att__launch kwargs; cs 8 / 16, coop over 4 copies, 16
    two-tile splits, 64 splits): pending (ab17).
+2b. (ab16, T=1, m=1 routes pinned via m1:<layer>=<kind>) the fork's m=1 autotuner flip is worth 6 us: qkv / o as
+   cgemv (+ unpooler sgemv) +6.5/+6.5 vs the sk2 choice (rows +5.4/+7.6/+6.1, +8.9/+5.6/+5.2); with the GEMVs as
+   PDL launches (pdlflags=512) +4.3/+5.3 (the GEMV-PDL path recovers 1.2-2.2 us when a GEMV is in the chain);
+   sk2 routes + sk2 entry trigger +2.2/+2.6; sk2 routes + unpooler cgemv +0.1/+0.4 (= base). ab18 isolates the
+   lock: qkv / o pinned to sk2, the unpooler slice as cgemv / sgemv (plain and PDL) / sk2.

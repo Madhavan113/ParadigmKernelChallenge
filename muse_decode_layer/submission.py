@@ -15953,12 +15953,42 @@ if "bfp_CUTLASS_LAYERS" in globals():   # standalone proj composition: no CUTLAS
     bfp_CUTLASS_LAYERS = set()
 
 
+M1_ROUTE_PIN = {"qkv_gate": "sk2", "o": "sk2"}   # the fork's m = 1 route per layer, pinned: its isolated autotuner flips
+                                                 # between sk2 and the compressed GEMV (cgemv) from one prepare to the
+                                                 # next, and on the chain the GEMV costs +6.5 us at T = 1 (H200 paired,
+                                                 # seeds 0-2, vm_ab/ab16: sk2 streams its weights under the attention's
+                                                 # / boundary's tail through PDL, the plain-launched GEMV cannot)
+
+
+def _pin_m1_routes(bst):
+    """Apply M1_ROUTE_PIN to the fork's autotuned choices where the pinned kind is built and validated."""
+    pinned = []
+    for layer, kind in M1_ROUTE_PIN.items():
+        ok = False
+        if kind == "sk2":
+            ok = (bfp__sk2_name(layer, 1) in bst.get("sk2", {})
+                  and bfp__route_key(layer, 1, "sk2") not in bst.get("disabled", ()))
+        elif kind == "cgemv":
+            ok = (layer, bfp_CG_CONFIGS[layer][0]) in bst.get("cg", {}) and bfp__route_key(layer, 1, "cgemv") not in bst.get("disabled", ())
+        elif kind == "sgemv":
+            ok = layer == "unpooler" and layer in bst.get("raw", {}) and bfp__route_key(layer, 1, "sgemv") not in bst.get("disabled", ())
+        if ok:
+            bst.setdefault("choice", {})[(layer, 1)] = (kind,)
+            pinned.append(f"{layer}:{kind}")
+    print("m=1 routes pinned: " + (" ".join(pinned) or "none") + "; autotuned: "
+          + " ".join(f"{l_}:{bst.get('choice', {}).get((l_, 1), ('?',))[0]}" for l_ in ("qkv_gate", "o", "unpooler")), flush=True)
+
+
 def _bfp_prepare(weights, st):
     """Their prepare() on the five dense matrices, guarded: any failure just disables the backend."""
     st["bfp"] = None
     try:
         w5 = {k: weights[k].contiguous() for k in ("qkv_gate", "o", "pooler", "unpooler", "router")}
         st["bfp"] = bfp_prepare(w5)
+        try:
+            _pin_m1_routes(st["bfp"])
+        except Exception as ex:  # noqa: BLE001
+            print("m=1 route pin skipped:", repr(ex)[:200], flush=True)
     except Exception as ex:  # noqa: BLE001
         s = repr(ex)
         print("bfp disabled:", s[:200] + (" ... " + s[-1500:] if len(s) > 1700 else s[200:]), flush=True)
