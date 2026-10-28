@@ -40,6 +40,7 @@ sentinel words; prepare() checks them after the tuner and an attention self-test
 """
 
 import math
+import os
 
 import torch
 import triton
@@ -154,7 +155,8 @@ def T_of(t):
     return int(t.shape[0])
 
 
-FUSE_BOUNDARY = False   # OFF: the v2 tails (every load in flight, one reduction, alpha/beta from the gate in-kernel) are
+FUSE_BOUNDARY = os.environ.get("OKC_FUSE_BOUNDARY", "0") == "1"   # (GPU A/B hook; the judge sees the default)
+                        # OFF: the v2 tails (every load in flight, one reduction, alpha/beta from the gate in-kernel) are
                         # exact but compute-bound on one CTA: o launch 8.8 -> 46.0 us, unpooler slice 7.2 -> 21.5
                         # (a15e0698, a3816fbb; the ticket flavor made no difference). T = 1: the o-projection / unpooler-slice sk2 launches' last CTA computes _boundary1 / _boundary2
                         # (proj_fork's sk2b); enabled only when the prepare-time self-test matches the Triton kernels
@@ -1895,7 +1897,8 @@ def _attn_cfg(B, L, sliding):
 
 # The attention module's extension, built once for this layer: its source with the layer's measured flags (the
 # standalone entry's defaults are QDIRECT=1, PK2=1, W0ENABLE=0; this build is their "v298w1").
-ATT_BUILD_FLAGS = ()   # A/B 7d23a37c vs c8b5aab9: the standalone defaults (QDIRECT=1 PK2=1 W0ENABLE=0) measured 0.3-3 us
+ATT_BUILD_FLAGS = tuple(f for f in os.environ.get("OKC_ATT_FLAGS", "").split(",") if f)   # (GPU A/B hook; default ())
+                       # A/B 7d23a37c vs c8b5aab9: the standalone defaults (QDIRECT=1 PK2=1 W0ENABLE=0) measured 0.3-3 us
                        # faster per attention launch on 10 of 12 shapes than the layer's old build (0/0/1)
 
 

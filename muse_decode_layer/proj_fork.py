@@ -3405,10 +3405,11 @@ def _sk2_src(sm90):
                 'at::Tensor, at::Tensor, int64_t) { TORCH_CHECK(false, "sk2b needs sm_90"); }\n'
                 'void sk2_set_pdl(int64_t) {}')
     lines = []
+    sk2_all = _os.environ.get("OKC_SK2_ALL", "0") == "1"   # A/B on a GPU: every config launchable (SK2_PICK switched at run time)
     for ci, cfg in enumerate(SK2_CONFIGS):
         name, layer, n_rows, R, NT, NWR, WSK, UPW, NACC, CL = cfg
         for tokr in (8, 16, 32):
-            if SK2_PICK.get((layer, tokr)) != name:
+            if SK2_PICK.get((layer, tokr)) != name and not (sk2_all and (layer, tokr) in SK2_PICK):
                 continue
             hl, nstage = _sk2_geom(cfg, tokr)
             mt = 2 if tokr == 32 else 1
