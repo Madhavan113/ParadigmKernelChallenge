@@ -238,3 +238,16 @@ load-issue-bound unless it keeps <= ~16 elements per thread in flight (the Trito
 >= 512 threads or a streamed two-pass structure; (3) the per-token top-8 costs ~2.3 us wherever it runs, so moving
 it only pays if nothing else is added; (4) the judge flushes L2 before each replay: anything an input row is read
 by must be prefetched before the kernel's gdc_wait.
+
+## 9. Overnight (launch removal, m = 1 GEMVs), judged
+
+| job | change | speedup | finding |
+|---|---|---|---|
+| f046f778 | cooperative boundary-1 prologue (CTA c: its 64 columns of all rows, 2 grid tickets at the kernel start, producer streams the ring meanwhile, x boxes after h) | 2.0899 | isolated cost +3.9 us at T=1 (was +13.3 whole-row), +6.8 at T=8; registers 101-130, zero spills; gated off by an all-or-nothing self-test bug (fixed per T) |
+| 89687f36 | + m = 1 GEMVs ported (cgemv 12-bit planes qkv/o/pooler/unpooler slice, sgemv, rgemv router) | 1.847 (build failure) | the ported block needed the standalone's `esc_delta`; the offline harness had skipped the new block; the bf16_proj backend was disabled everywhere |
+| 47921ff6 | fixed; pooler+router form at T <= 8 chain-timed among separate GEMVs / fused / fused+prologue | 2.0952 (2.064-2.127) | rows at T=1: qkv cgemv 9.2 (sk2 10.3-10.8), o 5.2 (6.0-6.5), unpooler 3.5 (4.3-4.4): ~-3 us of GEMM rows; prform T1 bfp 90 / bfpf 90 / bfpf+bnd1 91 -> fused, prologue a wash (as its +3.9 us isolated cost predicted); T8 bfp 102 / bfpf 99. Judged d1 78.2/83.6: noise band (the MoE row moved 22 -> 28.5 us between runs on the same code) |
+
+State: HEAD carries every lever self-tested and tuner-picked (cgemv/sgemv/rgemv kept where the fork's autotune
+picks them; prologue, routing modes and pr form chosen on the chain per T). Judged band of the last 9 runs on
+near-identical code: 2.076-2.098. The remaining layer time at T=1 is kernel-side: MoE 22-29 us (routing-dependent),
+fused pooler+router 19, qkv cgemv 9.2 (floor 7.9), attention 4.7, three glue kernels ~13 us of rows (~8 exposed).

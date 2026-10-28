@@ -21,7 +21,8 @@ sm90 = True
 common = P.CUDA_SRC.replace("@@MBAR@@", P.MBAR_HELPERS).replace("@@BODY@@", P.WG_HELPERS)
 defs = P.wgmma_defs([8, 16, 32, 64, 128])
 if "--all" in sys.argv:
-    body = P._tma_srcs(sm90) + P.MAP_SRC + P._gemm_src(sm90) + P._wide_src(sm90) + P._sk2_src(sm90) + P._gq_src(sm90)
+    body = (P._tma_srcs(sm90) + P.MAP_SRC + P._gemm_src(sm90) + P._wide_src(sm90) + P._sk2_src(sm90) + P._gq_src(sm90)
+            + (P._rgemv_src() if hasattr(P, "_rgemv_src") else ""))
 else:
     body = P.MAP_SRC + P._sk2_src(sm90)
 src = common + defs + body

@@ -105,7 +105,8 @@ def _bfp_prepare(weights, st):
         w5 = {k: weights[k].contiguous() for k in ("qkv_gate", "o", "pooler", "unpooler", "router")}
         st["bfp"] = bfp_prepare(w5)
     except Exception as ex:  # noqa: BLE001
-        print("bfp disabled:", repr(ex)[:160], flush=True)
+        s = repr(ex)
+        print("bfp disabled:", s[:200] + (" ... " + s[-1500:] if len(s) > 1700 else s[200:]), flush=True)
 
 
 _BFP_LAYER = {"qkv": "qkv_gate", "o": "o", "un": "unpooler", "pool": "pooler", "router": "router"}
@@ -243,11 +244,13 @@ def _boundary_selftest(st):
 FUSE_BND1 = True   # the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
                    # output (every CTA redundantly, before its x boxes; the weight ring is already streaming): no
                    # _boundary1 launch at T <= BND1_MAX_T. Enabled only when the prepare-time self-test matches.
-BND1_MAX_T = 1     # one row per CTA prologue is hidden behind the ring fill; 8 rows are not (measured design limit)
+BND1_MAX_T = 8     # cooperative prologue: CTA c owns its 64 columns of every row (<= 3 KB per CTA), two grid tickets
+                   # at the kernel start, the weight ring streams meanwhile (the per-CTA whole-row versions were
+                   # load-issue bound: +10..13 us isolated)
 
 
 def _bnd1_fuse_ok(state, T):
-    return (FUSE_BND1 and T <= BND1_MAX_T and state.get("fuse_bnd1_ok") and state.get("bfp") is not None
+    return (FUSE_BND1 and T <= BND1_MAX_T and T in state.get("fuse_bnd1_ok_T", ()) and state.get("bfp") is not None
             and "bnd1" in bfp_fused_pooler_router.__code__.co_varnames and "ab1" in state
             and state["g_preffn"].dtype == torch.bfloat16 and state.get("bnd1_on", {}).get(T, True))
 
@@ -264,7 +267,7 @@ def _bnd1_selftest(st):
     g = torch.Generator(device=dev).manual_seed(779)
     f32 = dict(device=dev, dtype=torch.float32)
     report = []
-    for T in (1,):   # the prologue keeps h in 16 KB of shared memory: M = 1 only
+    for T in (1, 8):   # the cooperative prologue handles M <= 8 rows
         a = (torch.randn(T, HIDDEN, generator=g, device=dev) * 0.1).to(torch.bfloat16)
         s = torch.randn(T, HIDDEN, generator=g, device=dev)
         h = torch.empty((T, HIDDEN), device=dev, dtype=torch.bfloat16)
@@ -302,10 +305,12 @@ def _bnd1_selftest(st):
         del flush_
         print(f"boundary-1 prologue T{T}: fused launch {t_plain:.1f} us -> with the prologue {t_bnd1:.1f} us", flush=True)
         if not (t_bnd1 - t_plain < BND1_MAX_COST_US):   # (the chain timing in _tune makes the final on/off choice)
-            print(f"boundary-1 prologue T{T}: too costly (+{t_bnd1 - t_plain:.1f} us), off", flush=True)
-            return
-    print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report), flush=True)
-    st["fuse_bnd1_ok"] = True
+            print(f"boundary-1 prologue T{T}: too costly (+{t_bnd1 - t_plain:.1f} us), off at T{T}", flush=True)
+            continue   # per T: a costly row count does not switch the other off
+        st.setdefault("fuse_bnd1_ok_T", set()).add(T)
+    print("boundary-1 prologue ok: " + " ".join(f"T{T} " + "/".join(f"{e:.1e}" for e in errs) for T, errs in report)
+          + f"; enabled at T {sorted(st.get('fuse_bnd1_ok_T', ()))}", flush=True)
+    st["fuse_bnd1_ok"] = bool(st.get("fuse_bnd1_ok_T"))
 
 
 BND1_MAX_COST_US = 6.0   # isolated gate (a guard against a broken prologue); the chain timing per T decides below it
@@ -1711,19 +1716,26 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
-        if st.get("fuse_bnd1_ok") and T <= BND1_MAX_T:   # the boundary-1 prologue vs the _boundary1 launch, on the chain
+        if T <= BND1_MAX_T and st.get("bfp") is not None:
+            # the pooler + router form at this T, on the chain: separate launches (pooler cgemv / sk2 + router rgemv /
+            # sk2) + _boundary1, the fused launch + _boundary1, or the fused launch computing the boundary in its
+            # prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each other
+            cands = [("bfp", False), ("bfpf", False)] + ([("bfpf", True)] if T in st.get("fuse_bnd1_ok_T", ()) else [])
             btimes = {}
-            for flag in (False, True):
+            for pr_pick, flag in cands:
+                st["mm_pick"][(T, "pr")] = pr_pick
                 st.setdefault("bnd1_on", {})[T] = flag
                 try:
-                    btimes[flag] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
+                    btimes[(pr_pick, flag)] = _graph_time(lambda: _after_attention(data, st, o_in, None, T), flush)
                 except Exception as ex:  # noqa: BLE001
-                    btimes[flag] = 1e30
+                    btimes[(pr_pick, flag)] = 1e30
                     if log:
-                        msg.append(f"bnd1X:{repr(ex)[:80]}")
-            st["bnd1_on"][T] = btimes[True] < btimes[False]
+                        msg.append(f"prX:{pr_pick}{int(flag)}:{repr(ex)[:80]}")
+            best_pr = min(btimes, key=lambda k_: btimes[k_])
+            st["mm_pick"][(T, "pr")], st["bnd1_on"][T] = best_pr
             if log:
-                msg.append(f"bnd1[{btimes[False]:.0f}/{btimes[True]:.0f}]->{int(st['bnd1_on'][T])}")
+                msg.append("prform[" + " ".join(f"{p_}{'+bnd1' if f_ else ''}:{t:.0f}" for (p_, f_), t in btimes.items())
+                           + f"]->{best_pr[0]}{'+bnd1' if best_pr[1] else ''}")
         tb = 1e30
         if log:
             print(f"T{T}/{nloc}r{ndis}e " + " ".join(msg) + (f" pb:{tb:.0f}" if tb < 1e9 else ""), flush=True)
@@ -1816,15 +1828,12 @@ def prepare(weights):
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
+        if k[1] == "pr" and k[0] <= BND1_MAX_T:
+            continue   # the pooler + router form at T <= BND1_MAX_T is chosen on the chain in _tune ("prform")
         if isinstance(v, tuple):
             times = st.get("mm_times", {}).get(k, {})
             v = min(v, key=lambda p: times.get(p, 1e30))
         st.setdefault("mm_pick", {})[k] = v
-    if st.get("fuse_bnd1_ok"):   # the boundary-1 prologue lives in the fused pooler + router launch: pin it at those T
-        for T_ in TUNED_T:
-            if T_ <= BND1_MAX_T:
-                st["mm_pick"][(T_, "pr")] = "bfpf"
-                st["mm_pick"][(T_, "o")] = "bfp"
     torch.cuda.synchronize()
     if st.get("att_ok"):
         _attn_selftest(st)     # every attention plan family once, on synthetic inputs
