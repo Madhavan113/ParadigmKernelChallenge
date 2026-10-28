@@ -1662,7 +1662,7 @@ __global__ void __launch_bounds__(RNT) route_kernel(const void* pooled_, const f
   const float r = scl;
   float xo[4];
 #pragma unroll
-  for (int i = 0; i < 4; ++i) xo[i] = pv[i] * r * gp[i];
+  for (int i = 0; i < 4; ++i) xo[i] = pv[i] * r * (1.f + gp[i]);   // the pre-expert norm's weight is (1 + g)
   st4bf(xm + (size_t)t * DEX + col, xo);
 }
 
@@ -1761,7 +1761,7 @@ def _glue_build():
     major, minor = torch.cuda.get_device_capability()
     arch = f"{major}{minor}" + ("a" if major >= 9 else "")
     return load_inline(
-        name=f"okc_glue_v4_{arch}",
+        name=f"okc_glue_v5_{arch}",
         cpp_sources=GLUE_CPP_SRC,
         cuda_sources=GLUE_CUDA_SRC,
         functions=["glue_bnd", "glue_route"],
