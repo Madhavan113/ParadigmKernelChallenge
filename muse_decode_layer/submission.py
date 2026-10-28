@@ -41,6 +41,7 @@ sentinel words; prepare() checks them after the tuner and an attention self-test
 
 import math
 import os
+import time
 
 import torch
 import triton
@@ -16119,7 +16120,10 @@ def dense_ng(x, gate, w, T, state=None):
     return P, S
 
 
-TUNED_T = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+TUNED_T = (1, 8, 16, 32, 128, 256)   # the scored token counts; T = 2 / 4 / 64 take the next row's picks (the 300 s
+                                     # prepare budget: tuning them cost ~60 s of the VM's 307 s)
+TRY_MARLIN = False   # SGLang's Marlin experts as a candidate when the moe agent's kernel is available: it lost by
+                     # 30-50% at every T in every prepare (10 config + 2 chain timings per T); still the fallback
 
 
 def _bucket(T):
@@ -16998,7 +17002,7 @@ def _tune(st, log=False):
     st["marlin_cfg"] = {}
     st["mm_pick"] = {}
     pb_ok = {}
-    for T in (1, 2, 4, 8, 16, 32, 64, 128, 256):
+    for T in TUNED_T:
         data = {"stream": torch.randn(T, HIDDEN, generator=g, device=dev),
                 "local_start": torch.zeros(1, dtype=torch.int32, device=dev)}
         o_in = (torch.randn(T, 1024, generator=g, device=dev) * 0.1).to(torch.bfloat16)
@@ -17016,6 +17020,9 @@ def _tune(st, log=False):
         nloc = ndis = -1
         for name, w, K in (("qkv", st["qkv"], HIDDEN), ("o", st["o"], 1024), ("pr", st["pr"], HIDDEN),
                            ("un", st["unpool_slice"] if T <= 8 else st["unpool"], D_EXPERT)):
+            pin = PIN_PICK.get((T, name))
+            if (pin is not None and not isinstance(pin, tuple)) or (name == "pr" and T in PR_FORM_LOCK):
+                continue   # decided (PIN_PICK, applied after the tuner; PR_FORM_LOCK below): no isolated timing
             xd = (torch.randn(T, K, generator=g, device=dev) * 0.1).to(torch.bfloat16)
             # the pooler + router candidates are timed WITH the routing kernel / the fused routing tail they imply
             r_ids = torch.empty((T, 8), device=dev, dtype=torch.int32)
@@ -17108,7 +17115,8 @@ def _tune(st, log=False):
                 msg.append(f"{name}{letters[bestp]}:{opts[bestp]:.0f}")
                 if T >= 128:   # DIAG: every candidate's graph time (us) for the T > 32 dense GEMMs
                     msg.append(f"{name}[" + " ".join(f"{letters[p]}{v:.1f}" for p, v in opts.items() if v < 1e29) + "]")
-        if st["bank"] is not None and T <= 384:
+        try_marlin = st["bank"] is not None and (TRY_MARLIN or not st["ma_ok"])
+        if try_marlin and T <= 384:
             xm = (torch.randn(T, D_EXPERT, generator=g, device=dev) * 0.1).to(torch.bfloat16)
             raw = torch.randint(0, N_EXPERTS, (T, 8), generator=g, device=dev, dtype=torch.int32)
             # the convention the router kernel writes: local index 0..31, -1 for another GPU's expert
@@ -17132,7 +17140,7 @@ def _tune(st, log=False):
                 st["marlin_cfg"].pop(T, None)
         # my own MoE kernel (FP16 expert input) is offered only where neither SGLang's Marlin nor the moe agent's
         # kernel is available (never on the judge image): both beat it everywhere, and SGLang keeps BF16 there
-        cands = [c for c in ("marlin", "agent") if (c != "marlin" or st["bank"] is not None)
+        cands = [c for c in ("marlin", "agent") if (c != "marlin" or try_marlin)
                  and (c != "agent" or st["ma_ok"])]
         for moe in cands:
             if moe == "marlin" and st["bank"] is None:
@@ -17258,6 +17266,12 @@ def _tune(st, log=False):
 
 
 def prepare(weights):
+    _t0 = time.perf_counter()   # wall time per phase printed (the judge's .log): the budget is 300 s
+
+    def _ph(what):
+        torch.cuda.synchronize()
+        print(f"prepare: {what} at {time.perf_counter() - _t0:.1f} s", flush=True)
+
     dev = weights["qkv_gate"].device
     router = weights["router"].float()
     hi = router.to(torch.bfloat16)
@@ -17302,13 +17316,17 @@ def prepare(weights):
         th.join()
     if errs:
         raise errs[0]
+    _ph("builds")
     _ma_prepare(weights, st)
+    _ph("moe prepare")
     _bfp_prepare(weights, st)
+    _ph("proj prepare")
     for selftest in (_route_selftest, _boundary_selftest, _bnd1_selftest, _norm_selftest):   # the fused paths, each enabled only when it matches
         try:
             selftest(st)
         except Exception as ex:  # noqa: BLE001
             print(f"{selftest.__name__} failed: {repr(ex)[:300]}", flush=True)
+    _ph("self-tests")
     st["nsm"] = torch.cuda.get_device_properties(dev).multi_processor_count
     st["fa3"] = None
     st["bank"] = None
@@ -17322,6 +17340,7 @@ def prepare(weights):
         st["bank"] = _marlin_bank(weights)
     except Exception as ex:  # noqa: BLE001  (local GPUs without sgl_kernel: fall back to our own kernels)
         print("fallback (no sgl_kernel/sglang):", repr(ex)[:200])
+    _ph("marlin bank")
     try:
         _tune(st, log=_TUNE_LOG)
     except Exception as ex:  # noqa: BLE001
@@ -17331,6 +17350,7 @@ def prepare(weights):
         st["gluev2"] = {}
         st["marlin_cfg"] = {}
         st["mm_pick"] = {}
+    _ph("tuner")
     for k, v in PIN_PICK.items():      # in-chain winners the isolated tuner sometimes misses (no PDL in its timing)
         if k[1] == "pr" and k[0] <= PRFORM_MAX_T:
             continue   # the pooler + router form at T <= PRFORM_MAX_T is chosen on the chain in _tune ("prform")
@@ -17342,6 +17362,7 @@ def prepare(weights):
     if st.get("att_ok"):
         _attn_selftest(st)     # every attention plan family once, on synthetic inputs
     _check_guards()            # after the tuner (every moe build) and the attention self-test
+    _ph("done")
     return st
 
 
