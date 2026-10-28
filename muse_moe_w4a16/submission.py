@@ -207,6 +207,14 @@ CUDA_SRC = r'''
 #ifndef OKC_WGS
 #define OKC_WGS 0  // tiny build on RS-wgmma: 4 consumer warpgroups split K of 64-row units, plus a TMA producer warp
 #endif
+#ifndef OKC_WGSREG
+#define OKC_WGSREG 0   // WGS: consumer registers per thread via setmaxnreg: the producers form a full warpgroup (warps
+                       // 16 weights, 17 x, 18-19 idle) that releases its registers (dec 24) so the 4 consumer
+                       // warpgroups can grow (inc OKC_WGSREG): per SM quadrant 4 x OKC_WGSREG + 24 <= 512 -> up to 120
+#endif
+#if OKC_WGSREG
+static_assert(4 * OKC_WGSREG + 24 <= 512 && OKC_WGSREG % 8 == 0, "OKC_WGSREG: at most 120, a multiple of 8");
+#endif
 #ifndef OKC_WGSFOLD
 #define OKC_WGSFOLD 0  // WGS: no producer warps: lane 0 of warp 0 issues the weight and x TMAs between its own k16
                        // steps (polls, never blocking except for the stage about to be consumed), so the CTA is
@@ -307,7 +315,7 @@ __device__ __forceinline__ void st_keep_f32(float* a, float v) { *a = v; }
 
 constexpr int HD = 4096, ID = 4096;
 constexpr int NW = OKC_NW, NT = NW * 32;
-constexpr int NTL = NT + (OKC_WGS ? (OKC_WGSFOLD ? 0 : 64) : OKC_WS ? 32 : 0);  // + helper warp (WS) | weights and x producer warps (WGS)  // launched: NT compute threads (+ helper warp | WGS producer warp + epilogue warpgroup)
+constexpr int NTL = NT + (OKC_WGS ? (OKC_WGSFOLD ? 0 : OKC_WGSREG ? 128 : 64) : OKC_WS ? 32 : 0);  // + helper warp (WS) | weights and x producer warps (WGS)  // launched: NT compute threads (+ helper warp | WGS producer warp + epilogue warpgroup)
 constexpr int NRB = OKC_WS ? OKC_WSNR : 2;   // cross-warp partial-sum buffers
 #if OKC_WS || OKC_WGS
 // CTA barrier over the NT compute threads only (the helper warp syncs with them through mbarriers and barrier 2)
@@ -3902,10 +3910,20 @@ __global__ void __launch_bounds__(NTL, 1) moe_fused(Params p) {
 #endif
 #if OKC_WGS
   if (tid >= NT) {
+#if OKC_WGSREG
+    asm volatile("setmaxnreg.dec.sync.aligned.u32 24;\n" ::: "memory");  // the producer warpgroup gives its registers up
+    if (tid < NT + 32) wgs_wproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
+    else if (tid < NT + 64) wgs_xproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
+    else WS_JOIN();  // (the two idle warps of the producer warpgroup join the one CTA-wide barrier, then leave)
+#else
     if (tid < NT + 32) wgs_wproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
     else wgs_xproducer(p, S, reinterpret_cast<unsigned char*>(xbuf));
+#endif
     return;
   }
+#if OKC_WGSREG
+  asm volatile("setmaxnreg.inc.sync.aligned.u32 %0;\n" ::"n"(OKC_WGSREG) : "memory");  // consumer warpgroups grow
+#endif
 #endif
 #if OKC_ROUTE_LOGITS
   {  // the top-8 selection, one warp per token (every CTA, identical result): S.eid for the routing below; the
@@ -4934,7 +4952,7 @@ TINY2_MAX_M = 8
 MID_DEFINES = ('-DOKC_NW=8', '-DOKC_TINY=1', '-DOKC_SPLIT=1', '-DOKC_CPF=0', '-DOKC_EPI4=0', '-DOKC_FAST1=2', '-DOKC_NACC=4', '-DOKC_UWARP=0', '-DOKC_WS=1', '-DOKC_WSB=1', '-DOKC_WSBL=2', '-DOKC_WSBLK=2', '-DOKC_FINPF=1')  # bf16 split-job MID (Oct 26): tiny-style, experts > 8 tokens split
 MID_MAX_M = 16  # M 17..63 runs on the WGS MAIN build (v179: faster than the v122c MID kernel at bs32)
 DIAG = True                # prepare() prints an H200 timing/diagnostic table (untimed; for development only)
-DIAG_SET = "L"             # which variant set below (a copy of this file with another set runs as a second check)
+DIAG_SET = "M"             # which variant set below (a copy of this file with another set runs as a second check)
 _WGS_SHAPES = [32, 128, 256]
 # name -> defines (all DIAG_SHAPES) or {"defines": ..., "shapes": [...]}, compiled and timed in diag mode
 DIAG_VARIANT_SETS = {
@@ -4946,13 +4964,19 @@ DIAG_VARIANT_SETS = {
         "wgs_nomma": {"defines": MAIN_DEFINES + ("-DOKC_WGSX=1",), "shapes": _WGS_SHAPES},
         "wgs_nodq": {"defines": MAIN_DEFINES + ("-DOKC_XNODQ=1",), "shapes": _WGS_SHAPES},
     },
+    "M": {  # WGS with setmaxnreg: producer warpgroup dec 24, consumers inc 120; wgmma pipeline depth variants
+        "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
+        "reg120": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120",), "shapes": _WGS_SHAPES},
+        "reg120_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4"), "shapes": _WGS_SHAPES},
+        "reg120_gs4_wd2": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_WGSGS=4", "-DOKC_WGSWD=2"), "shapes": _WGS_SHAPES},
+        "reg120_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSREG=120", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+    },
     "L": {  # WGS with the producers folded into warp 0 (16-warp CTA, 128 registers): wgmma pipeline depth variants
         "main": {"defines": MAIN_DEFINES, "shapes": _WGS_SHAPES},
         "fold": {"defines": MAIN_DEFINES + ("-DOKC_WGSFOLD=1",), "shapes": _WGS_SHAPES},
         "fold_gs4": {"defines": MAIN_DEFINES + ("-DOKC_WGSFOLD=1", "-DOKC_WGSGS=4"), "shapes": _WGS_SHAPES},
-        "fold_wd2": {"defines": MAIN_DEFINES + ("-DOKC_WGSFOLD=1", "-DOKC_WGSWD=2"), "shapes": _WGS_SHAPES},
-        "fold_gs4_wd2": {"defines": MAIN_DEFINES + ("-DOKC_WGSFOLD=1", "-DOKC_WGSGS=4", "-DOKC_WGSWD=2"), "shapes": _WGS_SHAPES},
         "fold_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSFOLD=1", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
+        "fold_gs4_dbg": {"defines": MAIN_DEFINES + ("-DOKC_WGSFOLD=1", "-DOKC_WGSGS=4", "-DOKC_DEBUG=1"), "shapes": _WGS_SHAPES},
     },
     "K": {  # bs1: L2H (evict_first stream + evict_last inter) with / without the phase-B prefetch, prefetch caps
         "tiny": {"defines": TINY_DEFINES, "shapes": [1]},
@@ -5044,7 +5068,7 @@ DIAG_VARIANT_SETS = {
     },
 }
 DIAG_VARIANTS = DIAG_VARIANT_SETS[DIAG_SET]
-DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
+DIAG_SHAPES = [1, 8, 16, 32, 128, 256] if DIAG_SET == "A" else [1, 8] if DIAG_SET == "J" else [1] if DIAG_SET == "K" else _WGS_SHAPES if DIAG_SET in ("D", "F", "G", "I", "L", "M") else [32, 128] if DIAG_SET == "H" else [1, 16, 32, 128, 256] if DIAG_SET == "E" else [1, 8, 16]
 DIAG_SEED = 1234
 DIAG_BW = DIAG_SET == "A"  # also run the bandwidth microbenchmarks
 DIAG_BW_MODES = (8, 16, 17, 19, 24)
