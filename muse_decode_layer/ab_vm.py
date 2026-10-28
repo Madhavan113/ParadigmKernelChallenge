@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """A/B the decode layer's chain-timed picks on a real GPU with statistics: ONE prepare per seed, then variants applied as
-runtime overrides of the tuner's picks, each timed on the scored shapes by CUDA-graph replay with a 256 MB read flush of
-L2 before every replay (as the judge and tools/gpu_run.py do). Medians per (variant, shape, seed) and deltas vs the
-first variant.
+runtime overrides of the tuner's picks, each captured as its own CUDA graph; the graphs of one shape are then replayed
+round-robin (paired samples: no drift / order effect), every replay preceded by a 256 MB read flush of L2 (as the judge
+and tools/gpu_run.py do). Medians per (variant, shape, seed), the paired delta vs the first variant (median of the
+per-round differences), and a final table of means over seeds.
 
     python3 muse_decode_layer/ab_vm.py --seeds 0 1 --iters 25 --shapes d1s d1f v1s v1f \
         --variant base --variant "pr:1=bfp" --variant "pr:1=bfpf;bnd1:1=1" --variant "pdl:1=6" --variant "rmode:1=moe_nb"
@@ -10,9 +11,10 @@ first variant.
 Override keys (T = token count): pr:T=bfp|bfpf (the pooler+router form), rmode:T=split|sk2f|moe|moe_nb,
 bnd1:T=0|1 (boundary-1 prologue in the fused launch), pdl:T=N (sk2 pre-wait weight stages), btail:T.o=0|1,
 btail:T.unpooler=0|1 (boundary tails), sk2:layer.tokr=config (needs OKC_SK2_ALL=1 at build), mm:T.name=pick
-(dense pick: False|True|bfp|mm16|torchT|bfq). Run inside the judge image with the repo at /work (cwd = /work).
+(dense pick: False|True|bfp|mm16|torchT|bfq). A spec "s0:<overrides>|s1:<overrides>" applies per seed (e.g. an earlier
+prepare's picks as the "before" of a before/after). Run inside the judge image with the repo at /work (cwd = /work).
 """
-import argparse, importlib, os, statistics, sys, time
+import argparse, importlib, os, re, statistics, sys, time
 
 import torch
 
@@ -49,6 +51,16 @@ def parse_shape(spec):
 
 def parse_pick(v):
     return {"False": False, "True": True, "0": False, "1": True}.get(v, v)
+
+
+def for_seed(spec, seed):
+    """A per-seed spec "s0:<overrides>|s1:<overrides>" resolves to this seed's part ("base" when the seed has none)."""
+    if not re.match(r"^s\d+:", spec):
+        return spec
+    for part in spec.split("|"):
+        if part.startswith(f"s{seed}:"):
+            return part[len(f"s{seed}:"):]
+    return "base"
 
 
 def apply(S, st, spec, saved):
@@ -113,6 +125,20 @@ def restore(S, st, saved):
                 d[k] = old
 
 
+def capture(S, st, data):
+    """Two warm-up calls, then one CUDA graph of kernel_fn on its own stream."""
+    s = torch.cuda.Stream()
+    with torch.cuda.stream(s):
+        for _ in range(2):
+            S.kernel_fn(data, st)
+    torch.cuda.synchronize()
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g, stream=s):
+        S.kernel_fn(data, st)
+    torch.cuda.synchronize()
+    return g
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--seeds", type=int, nargs="+", default=[0])
@@ -130,39 +156,37 @@ def main():
     torch.cuda.set_device(0)
     flush_buf = torch.empty(args.flush_mb << 20, dtype=torch.uint8, device="cuda")
     results = {}   # (variant, shape, seed) -> median us
+    nan = float("nan")
     for seed in args.seeds:
         weights = R.generate_weights(seed)
-        t0 = time.time()
+        t0 = time.perf_counter()
         st = S.prepare(weights)
         torch.cuda.synchronize()
-        print(f"[prepare] seed {seed}: {time.time() - t0:.1f} s", flush=True)
+        print(f"[prepare] seed {seed}: {time.perf_counter() - t0:.1f} s", flush=True)
         picks = {k: v for k, v in st.get("mm_pick", {}).items() if k[0] in (1, 8, 16, 32, 128, 256)}
         print(f"[picks] seed {seed}: mm {picks}", flush=True)
         print(f"[picks] seed {seed}: route_mode {st.get('route_mode')} bnd1 {st.get('bnd1_on')} btail {st.get('btail_on')} "
               f"pdl {dict(S._PDL_N_BY_T)} gluev2 {st.get('gluev2')} moe {st.get('moe_pick')}", flush=True)
         datas = {name: R.generate_input(seed=seed, **parse_shape(SHAPES[name])) for name in args.shapes}
-        for vi, spec in enumerate(args.variant):
-            saved = []
-            apply(S, st, spec, saved)
-            for name in args.shapes:
-                data = datas[name]
+        for name in args.shapes:
+            data = datas[name]
+            graphs = []   # one graph per variant, captured with its overrides applied (the overrides act at launch)
+            for vi, spec in enumerate(args.variant):
+                saved = []
+                g = None
                 try:
-                    s = torch.cuda.Stream()
-                    with torch.cuda.stream(s):
-                        for _ in range(2):
-                            S.kernel_fn(data, st)
-                    torch.cuda.synchronize()
-                    g = torch.cuda.CUDAGraph()
-                    with torch.cuda.graph(g, stream=s):
-                        S.kernel_fn(data, st)
-                    torch.cuda.synchronize()
+                    apply(S, st, for_seed(spec, seed), saved)
+                    g = capture(S, st, data)
                 except Exception as ex:  # noqa: BLE001  (a variant this build cannot run: keep the batch going)
                     torch.cuda.synchronize()
-                    results[(vi, name, seed)] = float("nan")
                     print(f"[fail] v{vi} seed {seed} {name}: {repr(ex)[:300]} ({spec})", flush=True)
-                    continue
-                ts = []
-                for _ in range(args.iters):
+                restore(S, st, saved)
+                graphs.append(g)
+            ts = [[] for _ in graphs]
+            for _ in range(args.iters):   # round-robin: every round replays every variant once (paired samples)
+                for vi, g in enumerate(graphs):
+                    if g is None:
+                        continue
                     flush_buf.view(torch.int32).sum()
                     torch.cuda.synchronize()
                     e0 = torch.cuda.Event(enable_timing=True)
@@ -171,11 +195,18 @@ def main():
                     g.replay()
                     e1.record()
                     torch.cuda.synchronize()
-                    ts.append(e0.elapsed_time(e1) * 1000.0)
-                med = statistics.median(ts)
+                    ts[vi].append(e0.elapsed_time(e1) * 1000.0)
+            for vi, spec in enumerate(args.variant):
+                if graphs[vi] is None:
+                    results[(vi, name, seed)] = nan
+                    continue
+                med = statistics.median(ts[vi])
+                pair = statistics.median([a - b for a, b in zip(ts[vi], ts[0])]) if graphs[0] is not None else nan
                 results[(vi, name, seed)] = med
-                print(f"[time] v{vi} seed {seed} {name}: med {med:.1f} min {min(ts):.1f} us ({spec})", flush=True)
-            restore(S, st, saved)
+                print(f"[time] v{vi} seed {seed} {name}: med {med:.1f} min {min(ts[vi]):.1f} pair {pair:+.1f} us ({spec})",
+                      flush=True)
+            del graphs
+            torch.cuda.synchronize()
     # table: per variant, per shape: mean over seeds of the median, and delta vs v0
     print("\n=== medians (us), averaged over seeds; delta vs v0 in brackets")
     print("variant".ljust(44) + " ".join(n.rjust(14) for n in args.shapes))

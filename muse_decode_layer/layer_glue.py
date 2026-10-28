@@ -75,8 +75,17 @@ TUNE_MARGIN = 0.95
 # pr at T=32: separate bfp 166.8 / 318.7 vs fused bfpf 167.9 / 320.2 us (32x1 sliding / full). T=256 pr/un: 4-way tie.
 # un at T=1/8 (the 1024-row slice): bfp 80.7 / 80.1 / 116.7 / 138.2 vs split-K 81.9 / 81.2 / 118.8 / 140.1 us (1x1 s/f, 1x8 s/f).
 PIN_PICK = {(1, "un"): "bfp", (8, "un"): "bfp", (1, "o"): "bfp", (8, "o"): "bfp", (32, "o"): "bfp",
-            (1, "pr"): ("bfpf", "bfp"), (8, "pr"): ("bfpf", "bfp"), (16, "pr"): ("bfpf", "bfp"), (32, "pr"): ("bfpf", "bfp"),
-            (128, "qkv"): (True, "mm16"), (256, "qkv"): (True, "mm16")}   # (8, "o"): in-chain sk2 112.5/133.4 vs cuBLAS 114.7/136.3 us (Oct 26)
+            # H200 paired replays (vm_ab/ab5, both seeds): o sk2 beat cuBLAS bf16 out by 2.0-2.6 us at T = 16 (the
+            # isolated tuner flipped to mm16 one prepare in three) and by 2-3.4 at T = 32, cuBLAS fp32 out by 1.1-2.1 at
+            # T = 1 and 1.9-3.3 at T = 8; the unpooler slice's cuBLAS lost 2.7-4.1 at T = 1/8 (its Triton split-K ties at
+            # T = 1, loses 1.3-1.9 at T = 8); qkv cuBLAS lost 3-5 us and bf16 out 8-13 us at every T <= 32
+            (16, "o"): "bfp", (1, "qkv"): "bfp", (8, "qkv"): "bfp", (16, "qkv"): "bfp", (32, "qkv"): "bfp",
+            # T = 128 / 256 (H200, vm_ab/ab4: 20 variants x 4 shapes x 2 seeds, 25 replays each; the isolated tuner
+            # flipped these between prepares): qkv cuBLAS fp32 out beat its bf16-out / K-major / proj-module forms by
+            # 1.2-3.5 us per shape; un on the K-major copy by 0-2 us; o and pr are ties within +-1 us (one fixed pick
+            # each so a prepare cannot flip them); the Triton split-K and the proj module's pr route lose 2-14 us
+            (128, "qkv"): True, (256, "qkv"): True, (128, "o"): "mm16", (256, "o"): "torchT",
+            (128, "pr"): True, (256, "pr"): True, (128, "un"): "torchT", (256, "un"): "torchT"}
 # pr at T <= 32: the bf16_proj kernels (fused launch incl. the fused routing tail, or separate + _route_split), by the
 # tuner's times; never the Triton split-K / cuBLAS cat GEMM (check 19ea8e60: Triton pr picked by a biased timing cost
 # 6-8 us per decode shape)
@@ -119,6 +128,14 @@ BFP_PDL_N = 2   # bf16_proj's sk2 / fused kernels: weight stages issued before g
 
 PDL_N_SWEEP = (2, 3, 4, 6)   # prepare(): per T, the sk2 pre-wait weight-stage count timed on the whole post-attention chain
 _PDL_N_BY_T = {}             # T -> the winner (the ring has 4-6 stages at tokr 8; 6 = the whole ring streams before the wait)
+# Chain-timed picks decided with statistics on an H200 (vm_ab/ab1 + ab5: 25 paired graph replays x 2 seeds per shape,
+# 8e96589 build, Oct 28) instead of the tuner's single-sample coin flips; a T in a lock skips its chain timing in _tune.
+PDL_LOCK = {1: 2, 2: 2, 4: 2, 8: 2, 16: 2, 32: 2}   # 3/4/6 lost 1.5-3.5 us at T = 16/32, 0.4-3 us at T = 8; no effect at T = 1
+ROUTE_MODE_LOCK = {1: "split", 2: "split", 4: "split", 8: "split", 16: "split", 32: "split"}   # sk2f / moe / moe_nb lost 3-10 us everywhere
+PR_FORM_LOCK = {1: ("bfpf", False), 2: ("bfpf", False), 4: ("bfpf", False), 8: ("bfpf", False), 16: ("bfpf", False),
+                32: ("bfp", False)}   # T -> (form, bnd1 prologue): the fused launch + _route_split won by 1-2 us at T = 1,
+                                      # 3-4 us at T = 8, 0.5-1.5 us at T = 16; the separate GEMMs by 2-3 us at T = 32; the
+                                      # boundary-1 prologue cost 0.8-1.3 us at T = 1 (ab1 / ab5, both seeds)
 
 
 def _bfp_pdl(T):
@@ -132,7 +149,7 @@ def _bfp_gemm(st, name, x, m, n, k):
     return bfp_kernel_fn({"x": x, "config": {"layer": _BFP_LAYER[name], "m": m, "n": n, "k": k}}, st["bfp"])
 
 
-FUSE_ROUTE = True   # the fused pooler + router launch (sk2f) also does the pre-expert norm after a grid barrier (every CTA its
+FUSE_ROUTE = False  # [off: lost 3-7 us at every T on the H200, vm_ab/ab1; ROUTE_MODE_LOCK = split] the fused pooler + router launch (sk2f) also does the pre-expert norm after a grid barrier (every CTA its
                     # own columns) and the routing of token t by CTA t (parallel, no serial tail; the d467a5c5 "last CTA does
                     # everything" tail was latency-bound: 29/35/43/64 us at T 1/8/16/32). Per T the tuner picks among
                     # _route_split / routing in the MoE kernel / this, on the chain time. The fused launch's last
@@ -258,7 +275,7 @@ def _boundary_selftest(st):
     st["fuse_bnd_ok"] = True
 
 
-FUSE_BND1 = True   # the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
+FUSE_BND1 = False  # [off: the prologue cost 0.8-1.3 us at T = 1 on the H200, vm_ab/ab1] the fused pooler + router launch computes h (its own x) and s1 in its PROLOGUE from the o-projection
                    # output (every CTA redundantly, before its x boxes; the weight ring is already streaming): no
                    # _boundary1 launch at T <= BND1_MAX_T. Enabled only when the prepare-time self-test matches.
 PRFORM_MAX_T = 32  # the pooler + router form (separate / fused [/ fused + prologue]) is chosen on the chain per T up to here
@@ -459,7 +476,7 @@ def _moe_sfx(weights):
 
 if "moe_ROUTE_LOGITS_BUILDS" in globals():   # the MoE module's in-kernel routing from the router logits (its prepare()
     moe_ROUTE_LOGITS_BUILDS = True             # then also builds the OKC_ROUTE_LOGITS variants; see _ma_run_logits)
-ROUTE_IN_MOE = True   # offer "routing in the MoE kernel" (no _route_split launch; the fused pooler+router launch
+ROUTE_IN_MOE = False  # [off: moe / moe_nb lost 4-10 us at every T on the H200, vm_ab/ab1] offer "routing in the MoE kernel" (no _route_split launch; the fused pooler+router launch
                       # normalizes xm after a grid barrier); the tuner picks per T on the chain time, self-test gated
 
 
@@ -1714,7 +1731,9 @@ def _tune(st, log=False):
             best, bestv2 = DEFAULT_MOE, dfltv2
         st["moe_pick"][T] = best if best is not None else DEFAULT_MOE
         st["gluev2"][T] = bestv2
-        if _pdl(T) and st.get("bfp") is not None:   # sk2 PDL depth: weight stages issued before griddepcontrol.wait,
+        if T in PDL_LOCK:
+            _PDL_N_BY_T[T] = PDL_LOCK[T]
+        elif _pdl(T) and st.get("bfp") is not None:   # sk2 PDL depth: weight stages issued before griddepcontrol.wait,
             ptimes = {}                               # timed on the whole post-attention chain (where the overlap is)
             for n in PDL_N_SWEEP:
                 _PDL_N_BY_T[T] = n
@@ -1728,7 +1747,9 @@ def _tune(st, log=False):
                 msg.append("pdl[" + " ".join(f"{n}:{t:.0f}" for n, t in ptimes.items()) + f"]->{nbest}")
         modes = (["split"] + (["sk2f"] if st.get("fuse_route_ok") else []) + (["moe"] if st.get("route_moe_ok") else [])
                  + (["moe_nb"] if st.get("route_moe_nb_ok") else []))
-        if len(modes) > 1 and T <= 32:   # where the routing runs: the _route_split kernel, CTA t of the fused pooler +
+        if T in ROUTE_MODE_LOCK:
+            st.setdefault("route_mode", {})[T] = ROUTE_MODE_LOCK[T] if ROUTE_MODE_LOCK[T] in modes else "split"
+        elif len(modes) > 1 and T <= 32:   # where the routing runs: the _route_split kernel, CTA t of the fused pooler +
             rtimes = {}                   # router launch after its grid barrier, or every CTA of the MoE kernel
             for mode in modes:
                 st.setdefault("route_mode", {})[T] = mode
@@ -1741,7 +1762,11 @@ def _tune(st, log=False):
             st["route_mode"][T] = min(rtimes, key=lambda m_: rtimes[m_])
             if log:
                 msg.append("rmode[" + " ".join(f"{m_}:{t:.0f}" for m_, t in rtimes.items()) + f"]->{st['route_mode'][T]}")
-        if T <= PRFORM_MAX_T and st.get("bfp") is not None:
+        if T in PR_FORM_LOCK and st.get("bfp") is not None:
+            form, flag = PR_FORM_LOCK[T]
+            st["mm_pick"][(T, "pr")] = form
+            st.setdefault("bnd1_on", {})[T] = bool(flag) and T in st.get("fuse_bnd1_ok_T", ())
+        elif T <= PRFORM_MAX_T and st.get("bfp") is not None:
             # the pooler + router form at this T, on the chain: separate launches (pooler cgemv / sk2 + router rgemv /
             # sk2) + _boundary1, the fused launch + _boundary1, or (T <= BND1_MAX_T) the fused launch computing the
             # boundary in its prologue (no _boundary1 launch); the prologue and the separate m = 1 GEMVs exclude each

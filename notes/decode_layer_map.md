@@ -271,3 +271,33 @@ instruction stream with one warp per scheduler (~6.5 us x 2 and x 5 reproduce +1
 would cut ~70% of the instructions but adds 16-32 loads per thread (spills at the slice kernel's 157-register cap) and
 lands at ~2.5-3 us = the separate kernel's exposed cost: no win in the last-CTA structure at T=1. Left off
 (FUSE_BOUNDARY = False); code, self-test and chain pick kept.
+
+## 11. Chain-timed picks re-decided with statistics on a rented H200 (judge image), Oct 28
+
+Instrument: `muse_decode_layer/ab_vm.py` (one prepare per seed; variants = runtime overrides of the tuner's picks, one
+CUDA graph each, replayed round-robin after a 256 MB L2 read flush; medians + paired deltas) driven by
+`muse_decode_layer/vm_ab/ab*.sh`. VM medians run 5-12% lighter than the judge and the MoE row is a per-seed routing draw,
+so only fixed-seed paired comparisons count; every call below holds at seeds 0 and 1.
+
+Baseline 8e96589 (VM, seed 0 / 1, us): d1s 72.0/61.0, d1f 86.3/80.8, d16s 131.4/121.5, d16f 189.5/195.3, d32s
+146.4/157.0, d32f 301.6/322.8, v1s 105.9/105.6, v1f 112.0/105.2, v16s 249.0/255.7, v16f 327.1/350.6, v32s 314.2/301.6,
+v32f 477.6/495.1. Prepare 245-304 s on the VM (builds cached): the 300 s budget is tight.
+
+The tuner's single-sample chain timings flipped between prepares: pr form at T=1/16, o at T=16 (sk2 vs cuBLAS bf16),
+PDL depth 2/3/4/6, rmode, and at T=128/256 qkv (cuBLAS fp32 / bf16 out), o, pr (Triton / cuBLAS / torchT), un.
+
+ab1 (pr form x rmode, bnd1, PDL; 8 shapes, 12 variants):
+- T=8: fused pooler+router + _route_split beats separate by 3.2/4.1 (s0) and 4.1/4.3 (s1) us.
+- T=32: separate beats fused by 1.9/1.8 and 3.3/2.8 us. T=16: fused+split beats separate by 0.7/0.5 and 1.2/0.5.
+- T=1: fused+split beats separate by ~1.8 us; the bnd1 prologue costs +0.8-1.3 on top. (Artifact seen: the FIRST
+  captured variant of a run came out 2.6-3.7 us faster at T=1 only; hence the round-robin harness and ab5.)
+- rmode sk2f / moe / moe_nb: +3-10 us at every T vs _route_split (the grid barrier / the MoE-side top-8 on every CTA).
+- PDL depth 3 costs +1.5-2.2 us at T=16/32, +0.4-1.3 at T=8; 4 and 6 worse; nothing at T=1 (the m=1 GEMVs).
+
+ab4 (T=128/256 dense routes, 5 per layer): qkv cuBLAS fp32-out wins by 1.2-3.5 us vs the other forms; un torchT best
+(bfq/mm16 +0-2.4, Triton / cuBLAS fp32 +3-4 at T=256); o: mm16 / torchT / bfq tie (+-1); pr: Triton == cuBLAS, torchT
++2-4, the proj module's bfq route +12-14 us.
+
+Locks (layer_glue): PDL_LOCK = 2 at every T; ROUTE_MODE_LOCK = split; PR_FORM_LOCK T8 fused / T32 separate (T1, T16
+after ab5); PIN_PICK at 128/256: qkv True, o mm16/torchT, pr True, un torchT. FUSE_ROUTE / ROUTE_IN_MOE / FUSE_BND1 off
+(code kept; their self-tests and the 11 chain timings per T no longer run in prepare).
