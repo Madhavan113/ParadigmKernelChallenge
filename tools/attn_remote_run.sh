@@ -10,7 +10,7 @@ SSH="ssh -o ConnectTimeout=20 -o ServerAliveInterval=15 -o BatchMode=yes"
 REPO=/Users/madhavanp/kerneloptimizer/.claude/worktrees/agent-af7174b5096001399
 retry() {   # retry a command up to 40 times, 30 s apart (flaky link)
   local n=0
-  until "$@"; do n=$((n + 1)); [ $n -ge 40 ] && return 1; sleep 30; done
+  until "$@"; do n=$((n + 1)); [ $n -ge ${RETRIES:-400} ] && return 1; sleep 30; done
 }
 if [ "$1" = "--poll" ]; then
   name=$2
