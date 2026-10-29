@@ -168,7 +168,8 @@ namespace {
 #define OKC_SC8 1       // coop finalize: the eight workspace copies' loads in one round trip
 #endif
 #ifndef OKC_SC4
-#define OKC_SC4 1       // ... and four copies (the rolled 4-copy loop below took two dependent L2 round trips)
+#define OKC_SC4 0       // ... and four copies (the rolled 4-copy loop below took two dependent L2 round trips; no plan uses
+                        // four copies since nc 4 measured +0.1..+0.7 us at b16/b32 sliding, so the code is compiled out)
 #endif
 #ifndef OKC_PINDIV
 #define OKC_PINDIV 1    // coop finalize: the slice divisions pinned above the barrier wait
@@ -657,12 +658,9 @@ struct WSRow {   // workspace row layout per q_len
 };
 constexpr int WSL = 64;                    // padded rows: the row sum's column
 
-// the workspace row sum of row `row` (padded rows: column 64 of the row; else the separate ws_l vector)
-template <int L, bool F, class IX>
-__device__ __forceinline__ float* wsl(const Params& p, IX row) {
-  if constexpr (WSRow<L, F>::P72) return p.ws_acc + (long long)row * WSRow<L, F>::STR + WSL;
-  else return p.ws_l + row;
-}
+// the workspace row sum of row `row` (padded rows: column 64 of the row; else the separate ws_l vector; a macro so
+// the non-padded layouts keep the committed inline address expressions and compile byte-identically)
+#define WSL_AT(F, row) (WSRow<L, F>::P72 ? (p.ws_acc + (long long)(row) * WSRow<L, F>::STR + WSL) : (p.ws_l + row))
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return (uint32_t)__cvta_generic_to_shared(p);
 }
@@ -1382,7 +1380,7 @@ __device__ __noinline__ bool cluster_multi(const Params& p, SM& S, const int CS,
       const float4 a = *reinterpret_cast<const float4*>(&RB[e * 4]);
       red_v4(acc, a.x, a.y, a.z, a.w);
     }
-    for (int e = tid; e < RPC; e += NT) red_f32(wsl<L, false>(p, (bp * p.nc + copy) * L * 16 + row0 + e), RL[e]);
+    for (int e = tid; e < RPC; e += NT) red_f32(WSL_AT(false, (bp * p.nc + copy) * L * 16 + row0 + e), RL[e]);
     __threadfence();
     __syncthreads();
     if (tid == 0) {
@@ -1414,7 +1412,7 @@ __device__ __noinline__ bool cluster_multi(const Params& p, SM& S, const int CS,
       for (int e = tid; e < RPC; e += NT) {
         float a = 0.f;
         for (int c = 0; c < p.nc; ++c) {
-          float* lw = wsl<L, false>(p, (bp * p.nc + c) * L * 16 + row0 + e);
+          float* lw = WSL_AT(false, (bp * p.nc + c) * L * 16 + row0 + e);
           a += __ldcg(lw);
           *lw = 0.f;
         }
@@ -1651,13 +1649,13 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
       float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
       const float4 xa = __ldcg(reinterpret_cast<const float4*>(acc));
       const float4 xb = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-      const float lc = __ldcg(wsl<L, F>(p, (bp * L + j) * 16 + hh));
+      const float lc = __ldcg(WSL_AT(F, (bp * L + j) * 16 + hh));
       y[0] += xa.x; y[1] += xa.y; y[2] += xa.z; y[3] += xa.w;
       y[4] += xb.x; y[5] += xb.y; y[6] += xb.z; y[7] += xb.w;
       lsum += lc;
       *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
       *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-      if (part == 0) *wsl<L, F>(p, (bp * L + j) * 16 + hh) = 0.f;
+      if (part == 0) *WSL_AT(F, (bp * L + j) * 16 + hh) = 0.f;
     }
     return;
   }
@@ -1670,7 +1668,7 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
         const float* acc = p.ws_acc + ((ix_t)((bp * 8 + c) * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
         xa[c] = __ldcg(reinterpret_cast<const float4*>(acc));
         xb[c] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-        lc[c] = __ldcg(wsl<L, F>(p, ((bp * 8 + c) * L + j) * 16 + hh));
+        lc[c] = __ldcg(WSL_AT(F, ((bp * 8 + c) * L + j) * 16 + hh));
       }
 #pragma unroll
       for (int c = 0; c < 8; ++c) {
@@ -1680,7 +1678,7 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
         float* acc = p.ws_acc + ((ix_t)((bp * 8 + c) * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
         *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
         *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (part == 0) *wsl<L, F>(p, ((bp * 8 + c) * L + j) * 16 + hh) = 0.f;
+        if (part == 0) *WSL_AT(F, ((bp * 8 + c) * L + j) * 16 + hh) = 0.f;
       }
     }
     return;
@@ -1694,7 +1692,7 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
         const float* acc = p.ws_acc + ((ix_t)((bp * 4 + c) * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
         xa[c] = __ldcg(reinterpret_cast<const float4*>(acc));
         xb[c] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-        lc[c] = __ldcg(wsl<L, F>(p, ((bp * 4 + c) * L + j) * 16 + hh));
+        lc[c] = __ldcg(WSL_AT(F, ((bp * 4 + c) * L + j) * 16 + hh));
       }
 #pragma unroll
       for (int c = 0; c < 4; ++c) {
@@ -1704,7 +1702,7 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
         float* acc = p.ws_acc + ((ix_t)((bp * 4 + c) * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
         *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
         *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (part == 0) *wsl<L, F>(p, ((bp * 4 + c) * L + j) * 16 + hh) = 0.f;
+        if (part == 0) *WSL_AT(F, ((bp * 4 + c) * L + j) * 16 + hh) = 0.f;
       }
     }
     return;
@@ -1723,7 +1721,7 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
         const float* acc = p.ws_acc + ((ix_t)((bp * p.nc + c) * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
         xa[u] = __ldcg(reinterpret_cast<const float4*>(acc));
         xb[u] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-        lc[u] = __ldcg(wsl<L, F>(p, ((bp * p.nc + c) * L + j) * 16 + hh));
+        lc[u] = __ldcg(WSL_AT(F, ((bp * p.nc + c) * L + j) * 16 + hh));
       }
     }
 #pragma unroll
@@ -1736,7 +1734,7 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
         float* acc = p.ws_acc + ((ix_t)((bp * p.nc + c) * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
         *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
         *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (part == 0) *wsl<L, F>(p, ((bp * p.nc + c) * L + j) * 16 + hh) = 0.f;
+        if (part == 0) *WSL_AT(F, ((bp * p.nc + c) * L + j) * 16 + hh) = 0.f;
       }
     }
   }
@@ -1749,7 +1747,9 @@ template <int L, bool F, int NT>
 __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int pair, const int bp, const float vscale,
                                      const int dry) {
   const int tid = threadIdx.x;
-  if (tid >= NT) return;   // (NT 256 CTAs at q_len 1: the first 128 threads finalize; no barrier below)
+  if constexpr (OKC_W8 && L == 1) {
+    if (tid >= NT) return;   // (NT 256 CTAs at q_len 1: the first 128 threads finalize; no barrier below)
+  }
   // loads of a group of passes first (one L2 round trip per group), then math and stores; groups of 2 passes in a
   // rolled loop (this runs once per launch from a cold instruction cache: q_len 8 has 4 passes)
   constexpr int PASSES = L * 16 / (NT / 8);
@@ -1767,7 +1767,7 @@ __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int 
       const float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * WSRow<L, F>::STR + part * 8;
       xa[u] = __ldcg(reinterpret_cast<const float4*>(acc));
       xb[u] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-      lc[u] = __ldcg(wsl<L, F>(p, (bp * L + j) * 16 + hh));
+      lc[u] = __ldcg(WSL_AT(F, (bp * L + j) * 16 + hh));
       graw[u] = *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + j) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + hh) * 64 + part * 8);
     }
 #pragma unroll
@@ -1778,7 +1778,7 @@ __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int 
       if (!dry) {
         *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
         *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (part == 0) *wsl<L, F>(p, (bp * L + j) * 16 + hh) = 0.f;
+        if (part == 0) *WSL_AT(F, (bp * L + j) * 16 + hh) = 0.f;
       }
       const float inv = lc[u] > 0.f ? __fdividef(vscale, lc[u]) : 0.f;
       float y[8] = {pr8(xa[u].x * inv), pr8(xa[u].y * inv), pr8(xa[u].z * inv), pr8(xa[u].w * inv),
@@ -3884,8 +3884,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     constexpr int NXW = NT / 64 - 1;   // partner warps per head (1 with 4 warps, 3 with 8)
     cp_wait<0>();
     csync<WS, NT>();
-    float* xs = reinterpret_cast<float*>(S.k) + (((wsub > 0 ? wsub - 1 : 0) * 2 + (warp & 1)) * 32 + lane) * 18;
-    if (wsub > 0) {
+    float* xs = reinterpret_cast<float*>(S.k) +
+                ((NXW == 1 ? (warp & 1) : ((wsub > 0 ? wsub - 1 : 0) * 2 + (warp & 1))) * 32 + lane) * 18;
+    if (NXW == 1 ? wsub == 1 : wsub > 0) {
       xs[0] = m_r[0];
       xs[1] = l_r[0];
 #pragma unroll
@@ -3893,6 +3894,19 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     }
     csync<WS, NT>();
     if (wsub == 0) {
+      if constexpr (NXW == 1) {   // one partner (4 warps): the fused two-way merge
+        const float m1 = xs[0], l1 = xs[1];
+        const float mm = fmaxf(m_r[0], m1);
+        const float f0 = (m_r[0] == -INFINITY) ? 0.f : ex2(m_r[0] - mm);
+        const float f1 = (m1 == -INFINITY) ? 0.f : ex2(m1 - mm);
+        m_r[0] = mm;
+        l_r[0] = l_r[0] * f0 + l1 * f1;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+          o[0][t][0] = o[0][t][0] * f0 + xs[2 + 2 * t] * f1;
+          o[0][t][1] = o[0][t][1] * f0 + xs[3 + 2 * t] * f1;
+        }
+      } else {
       float mq[NXW], lq[NXW];
       float mm = m_r[0];
 #pragma unroll
@@ -3917,6 +3931,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
         }
       }
       m_r[0] = mm;
+      }
     } else {
       do_red = false;
     }
@@ -4032,7 +4047,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
       for (int t = 0; t < 8; ++t) red_v2(acc + 8 * t + 2 * tig, o[mt][t][2 * hf] * f, o[mt][t][2 * hf + 1] * f);
     }
-    if (tig == 0) red_f32(wsl<L, FLAT>(p, ((bp * p.nc + copy) * L + j) * 16 + hh), lsum * f);
+    if (tig == 0) red_f32(WSL_AT(FLAT, ((bp * p.nc + copy) * L + j) * 16 + hh), lsum * f);
   }
   }
   if constexpr (BULKRED) {
