@@ -167,6 +167,9 @@ namespace {
 #ifndef OKC_SC8
 #define OKC_SC8 1       // coop finalize: the eight workspace copies' loads in one round trip
 #endif
+#ifndef OKC_SC4
+#define OKC_SC4 1       // ... and four copies (the rolled 4-copy loop below took two dependent L2 round trips)
+#endif
 #ifndef OKC_PINDIV
 #define OKC_PINDIV 1    // coop finalize: the slice divisions pinned above the barrier wait
 #endif
@@ -178,6 +181,9 @@ namespace {
 #endif
 #ifndef OKC_PFASTPR
 #define OKC_PFASTPR 1   // per-request issue_kv: branch-free shift-add addressing on fully cached tiles (page size 1)
+#endif
+#ifndef OKC_PFASTPRO
+#define OKC_PFASTPRO 0  // ... also for the prologue's tiles (not only the in-loop refills)
 #endif
 #ifndef OKC_PFAST
 #define OKC_PFAST 1     // flat producer: branch-free shift-add addressing on common tiles (page size 1, < 4 GB)
@@ -444,6 +450,45 @@ __device__ __noinline__ void spin_fail() { __trap(); }   // (out of line: keeps 
 #ifndef OKC_STN
 #define OKC_STN 3       // per-request kernels: pipeline stages
 #endif
+#ifndef OKC_STN1
+#define OKC_STN1 OKC_STN   // ... the q_len 1 per-request kernels (measured on the H200: deeper rings lose, 4/5/6 stages
+                           // +0.1/+0.5/+0.9 us at b16 sliding -- the random gathers are best kept to 2 tiles in flight per CTA)
+#endif
+#ifndef OKC_W8
+#define OKC_W8 0        // q_len 1 per-request kernels: 8 warps per CTA, warp = (KV head, 16-key quarter of the tile) instead of
+                        // 4 warps on 32-key halves. Measured on the H200 (paired, seeds 0-1): +0.1..+0.4 us on b16/b32/b1
+                        // sliding and b1 full -- the tile time is SM pipe throughput (HMMA / F2FP), not one warp's chain
+#endif
+#ifndef OKC_XP_RELAXTICKET
+#define OKC_XP_RELAXTICKET 0   // (timing probe only, wrong results possible) last-CTA ticket as a relaxed atomic: no membar
+#endif
+#ifndef OKC_BULKRED
+#define OKC_BULKRED 1   // per-request merge: the rescaled partial (L*16 rows x 64 fp32 + the row sums) goes to shared memory and
+                        // ONE thread adds it into the workspace with one cp.reduce.async.bulk (TMA, .add.f32) instead of 272 (q1)
+                        // / 2176 (q8) red.global ops per CTA, so the ticket's release waits for a bulk group, not for contended
+                        // atomics (H200: the acq_rel ticket cost 1.37 us after the reds at b16 q1, 0.61 us relaxed; one op per
+                        // row instead measured +0.2 us at q8: the TMA unit serializes the ops). Needs OKC_WS72.
+#endif
+#ifndef OKC_WS72
+#define OKC_WS72 2      // workspace rows of 72 floats: the 64 dims, the row sum in column 64, 7 pad -- one contiguous bulk
+                        // reduction per partial, and the padded shared-memory copy's row stores land on distinct banks.
+                        // 1: every kernel; 2: the q_len 1 kernels only (q_len 8 keeps 64-float rows and the row-sum vector)
+#endif
+#ifndef OKC_BULKRED_NOTONE
+#define OKC_BULKRED_NOTONE 1   // ... not in the ONE builds (one tile per split: b1 sliding measured -0.27 us with the reds)
+#endif
+#ifndef OKC_BULKOPS1
+#define OKC_BULKOPS1 1  // q_len 1: bulk reductions per partial (row ranges, one issuing thread each); 0 = the red.global path
+#endif
+#ifndef OKC_TKT2
+#define OKC_TKT2 0      // last-CTA finalizes with a bulk merge: the key ticket as a relaxed atomic issued while the bulk op
+                        // completes, then a released "done" count after it; the last CTA polls the done count (acquire)
+                        // before it reads the partials (the acq_rel ticket's fence and round trip leave the critical path)
+#endif
+#ifndef OKC_BULKOPS8
+#define OKC_BULKOPS8 0  // q_len 8: the same (H200: one 36 KB op measured neutral / -0.1..-0.2 us vs the 2176 red.v4: the TMA
+                        // unit streams it at ~30 B per cycle, the ticket's membar had little to wait for either way)
+#endif
 #ifndef OKC_PACK4
 #define OKC_PACK4 0     // e4m3x4 packing in PTX (same SASS: ptxas already merges the halves with F2FP.MERGE_C)
 #endif
@@ -543,7 +588,7 @@ struct Cfg {
   // q_len 8 flat kernel on sm_90: one CTA per SM with two consumer streams; each KV head's two warpgroups claim
   // tiles from a shared counter, so the faster one takes more (two CTAs per SM do not progress equally)
   static constexpr bool F2 = (L == 8) && F && OKC_F2 && OKC_SM90 && PV8ON && OKC_PV8FLAT && OKC_QSS && !OKC_CONT && !OKC_PTR;
-  static constexpr int NT = (L == 1) ? 128 : ((S2 || F2) ? 512 : 256);   // consumer threads per CTA
+  static constexpr int NT = (L == 1) ? ((!F && OKC_W8) ? 256 : 128) : ((S2 || F2) ? 512 : 256);   // consumer threads per CTA
   // flat kernel on sm_90: one extra producer warp issues every K/V copy (warp specialization), so the
   // consumers never stall in cp.async issue; the stages are handed over with mbarriers
   static constexpr bool WS = F && OKC_SM90 && OKC_WS && (L == 1 || OKC_WS8);
@@ -557,7 +602,7 @@ struct Cfg {
                                    ? 248 : ((BASEREGS * NTX - PREGS * NP) / (NT > 0 ? NT : 1)) / 8 * 8;
   // cp.async pipeline depth (64-key tiles): deep for the long flat runs, shallow (smaller shared memory,
   // more CTAs per SM, all clusters resident) for the per-request grids of sliding windows / one request
-  static constexpr int STAGES = F ? ((L == 1) ? OKC_ST1F : (F2 ? 8 : OKC_ST8F)) : (S2 ? 6 : OKC_STN);
+  static constexpr int STAGES = F ? ((L == 1) ? OKC_ST1F : (F2 ? 8 : OKC_ST8F)) : (S2 ? 6 : ((L == 1) ? OKC_STN1 : OKC_STN));
   // producer passes: NP/8 rows each must tile the 64-row tile exactly (else rows go missing and the consumers wait
   // forever on the stage barrier)
   static_assert(!WS || (NP % 8 == 0 && NP >= 8 && 64 % (NP >= 8 ? NP / 8 : 1) == 0),
@@ -605,7 +650,19 @@ struct Params {
   CUtensorMap tk, tv;   // [rows, row_bytes] views of the K / V caches, 128x1-byte boxes, 128B swizzle
   CUtensorMap tpt;      // producer mode: the page table as one int32 vector, 64-entry boxes (zero past the end)
 };
+template <int L>
+struct WSRow {   // workspace row layout per q_len
+  static constexpr int STR = (OKC_WS72 == 1 || (OKC_WS72 == 2 && L == 1)) ? 72 : 64;   // row stride (floats)
+  static constexpr bool P72 = STR == 72;   // padded rows: the row sum in column 64 (else the separate ws_l vector)
+};
+constexpr int WSL = 64;                    // padded rows: the row sum's column
 
+// the workspace row sum of row `row` (padded rows: column 64 of the row; else the separate ws_l vector)
+template <int L, class IX>
+__device__ __forceinline__ float* wsl(const Params& p, IX row) {
+  if constexpr (WSRow<L>::P72) return p.ws_acc + (long long)row * WSRow<L>::STR + WSL;
+  else return p.ws_l + row;
+}
 __device__ __forceinline__ uint32_t smem_u32(const void* p) {
   return (uint32_t)__cvta_generic_to_shared(p);
 }
@@ -696,6 +753,28 @@ __device__ __forceinline__ void bulk_load(void* dst, const void* src, int bytes,
 #endif
 }
 // one 64-entry box of a 1-D int32 tensor map into shared memory (TMA), completion on an mbarrier
+// TMA bulk reduction: global[dst .. dst + bytes) += shared[src ..] (fp32 add), tracked by the thread's bulk async-group
+__device__ __forceinline__ void bulk_red_add_f32(float* dst, const void* src, int bytes) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("cp.reduce.async.bulk.global.shared::cta.bulk_group.add.f32 [%0], [%1], %2;\n"
+               ::"l"(dst), "r"(smem_u32(src)), "r"(bytes) : "memory");
+#endif
+}
+__device__ __forceinline__ void bulk_commit() {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("cp.async.bulk.commit_group;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void bulk_wait_all() {   // every bulk op of this thread complete (writes performed)
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("cp.async.bulk.wait_group 0;\n" ::: "memory");
+#endif
+}
+__device__ __forceinline__ void fence_proxy_async_global() {   // async-proxy global writes ordered before generic ones
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+  asm volatile("fence.proxy.async.global;\n" ::: "memory");
+#endif
+}
 __device__ __forceinline__ void tma_load_1d(void* dst, const CUtensorMap* map, int c0, uint64_t* bar) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
   asm volatile("cp.async.bulk.tensor.1d.shared::cluster.global.tile.mbarrier::complete_tx::bytes [%0], [%1, {%2}], [%3];\n"
@@ -1299,11 +1378,11 @@ __device__ __noinline__ bool cluster_multi(const Params& p, SM& S, const int CS,
     const int copy = clu - fdiv_i(clu, p.nc) * p.nc;
     for (int e = tid; e < RPC * 16; e += NT) {
       const int row = row0 + (e >> 4);
-      float* acc = p.ws_acc + ((ix_t)(bp * p.nc + copy) * L * 16 + row) * 64 + (e & 15) * 4;
+      float* acc = p.ws_acc + ((ix_t)(bp * p.nc + copy) * L * 16 + row) * WSRow<L>::STR + (e & 15) * 4;
       const float4 a = *reinterpret_cast<const float4*>(&RB[e * 4]);
       red_v4(acc, a.x, a.y, a.z, a.w);
     }
-    for (int e = tid; e < RPC; e += NT) red_f32(p.ws_l + (bp * p.nc + copy) * L * 16 + row0 + e, RL[e]);
+    for (int e = tid; e < RPC; e += NT) red_f32(wsl<L>(p, (bp * p.nc + copy) * L * 16 + row0 + e), RL[e]);
     __threadfence();
     __syncthreads();
     if (tid == 0) {
@@ -1321,13 +1400,13 @@ __device__ __noinline__ bool cluster_multi(const Params& p, SM& S, const int CS,
         float4 v[NCM];
 #pragma unroll
         for (int c = 0; c < NCM; ++c)
-          if (c < p.nc) v[c] = __ldcg(reinterpret_cast<const float4*>(p.ws_acc + ((ix_t)(bp * p.nc + c) * L * 16 + row) * 64 + (e & 15) * 4));
+          if (c < p.nc) v[c] = __ldcg(reinterpret_cast<const float4*>(p.ws_acc + ((ix_t)(bp * p.nc + c) * L * 16 + row) * WSRow<L>::STR + (e & 15) * 4));
         float4 a = make_float4(0.f, 0.f, 0.f, 0.f);
 #pragma unroll
         for (int c = 0; c < NCM; ++c) {
           if (c < p.nc) {
             a.x += v[c].x; a.y += v[c].y; a.z += v[c].z; a.w += v[c].w;
-            *reinterpret_cast<float4*>(p.ws_acc + ((ix_t)(bp * p.nc + c) * L * 16 + row) * 64 + (e & 15) * 4) = make_float4(0.f, 0.f, 0.f, 0.f);
+            *reinterpret_cast<float4*>(p.ws_acc + ((ix_t)(bp * p.nc + c) * L * 16 + row) * WSRow<L>::STR + (e & 15) * 4) = make_float4(0.f, 0.f, 0.f, 0.f);
           }
         }
         *reinterpret_cast<float4*>(&RB[e * 4]) = a;
@@ -1335,7 +1414,7 @@ __device__ __noinline__ bool cluster_multi(const Params& p, SM& S, const int CS,
       for (int e = tid; e < RPC; e += NT) {
         float a = 0.f;
         for (int c = 0; c < p.nc; ++c) {
-          float* lw = p.ws_l + (bp * p.nc + c) * L * 16 + row0 + e;
+          float* lw = wsl<L>(p, (bp * p.nc + c) * L * 16 + row0 + e);
           a += __ldcg(lw);
           *lw = 0.f;
         }
@@ -1569,16 +1648,16 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
                                            const bool act, float (&y)[8], float& lsum) {
   if (OKC_SC1 && p.nc == 1) {   // one copy (the common case): no copy loop, no per-copy branches (scout's census)
     if (act) {
-      float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * 64 + part * 8;
+      float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
       const float4 xa = __ldcg(reinterpret_cast<const float4*>(acc));
       const float4 xb = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-      const float lc = __ldcg(p.ws_l + (bp * L + j) * 16 + hh);
+      const float lc = __ldcg(wsl<L>(p, (bp * L + j) * 16 + hh));
       y[0] += xa.x; y[1] += xa.y; y[2] += xa.z; y[3] += xa.w;
       y[4] += xb.x; y[5] += xb.y; y[6] += xb.z; y[7] += xb.w;
       lsum += lc;
       *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
       *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-      if (part == 0) p.ws_l[(bp * L + j) * 16 + hh] = 0.f;
+      if (part == 0) *wsl<L>(p, (bp * L + j) * 16 + hh) = 0.f;
     }
     return;
   }
@@ -1588,20 +1667,44 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
       float lc[8];
 #pragma unroll
       for (int c = 0; c < 8; ++c) {
-        const float* acc = p.ws_acc + ((ix_t)((bp * 8 + c) * L + j) * 16 + hh) * 64 + part * 8;
+        const float* acc = p.ws_acc + ((ix_t)((bp * 8 + c) * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
         xa[c] = __ldcg(reinterpret_cast<const float4*>(acc));
         xb[c] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-        lc[c] = __ldcg(p.ws_l + ((bp * 8 + c) * L + j) * 16 + hh);
+        lc[c] = __ldcg(wsl<L>(p, ((bp * 8 + c) * L + j) * 16 + hh));
       }
 #pragma unroll
       for (int c = 0; c < 8; ++c) {
         y[0] += xa[c].x; y[1] += xa[c].y; y[2] += xa[c].z; y[3] += xa[c].w;
         y[4] += xb[c].x; y[5] += xb[c].y; y[6] += xb[c].z; y[7] += xb[c].w;
         lsum += lc[c];
-        float* acc = p.ws_acc + ((ix_t)((bp * 8 + c) * L + j) * 16 + hh) * 64 + part * 8;
+        float* acc = p.ws_acc + ((ix_t)((bp * 8 + c) * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
         *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
         *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (part == 0) p.ws_l[((bp * 8 + c) * L + j) * 16 + hh] = 0.f;
+        if (part == 0) *wsl<L>(p, ((bp * 8 + c) * L + j) * 16 + hh) = 0.f;
+      }
+    }
+    return;
+  }
+  if (OKC_SC4 && p.nc == 4) {   // four copies: the same, one round trip
+    if (act) {
+      float4 xa[4], xb[4];
+      float lc[4];
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        const float* acc = p.ws_acc + ((ix_t)((bp * 4 + c) * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
+        xa[c] = __ldcg(reinterpret_cast<const float4*>(acc));
+        xb[c] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
+        lc[c] = __ldcg(wsl<L>(p, ((bp * 4 + c) * L + j) * 16 + hh));
+      }
+#pragma unroll
+      for (int c = 0; c < 4; ++c) {
+        y[0] += xa[c].x; y[1] += xa[c].y; y[2] += xa[c].z; y[3] += xa[c].w;
+        y[4] += xb[c].x; y[5] += xb[c].y; y[6] += xb[c].z; y[7] += xb[c].w;
+        lsum += lc[c];
+        float* acc = p.ws_acc + ((ix_t)((bp * 4 + c) * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
+        *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
+        *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
+        if (part == 0) *wsl<L>(p, ((bp * 4 + c) * L + j) * 16 + hh) = 0.f;
       }
     }
     return;
@@ -1617,10 +1720,10 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
       xb[u] = make_float4(0.f, 0.f, 0.f, 0.f);
       lc[u] = 0.f;
       if (act && c < p.nc) {
-        const float* acc = p.ws_acc + ((ix_t)((bp * p.nc + c) * L + j) * 16 + hh) * 64 + part * 8;
+        const float* acc = p.ws_acc + ((ix_t)((bp * p.nc + c) * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
         xa[u] = __ldcg(reinterpret_cast<const float4*>(acc));
         xb[u] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-        lc[u] = __ldcg(p.ws_l + ((bp * p.nc + c) * L + j) * 16 + hh);
+        lc[u] = __ldcg(wsl<L>(p, ((bp * p.nc + c) * L + j) * 16 + hh));
       }
     }
 #pragma unroll
@@ -1630,10 +1733,10 @@ __device__ __forceinline__ void sum_copies(const Params& p, const int bp, const 
         y[0] += xa[u].x; y[1] += xa[u].y; y[2] += xa[u].z; y[3] += xa[u].w;
         y[4] += xb[u].x; y[5] += xb[u].y; y[6] += xb[u].z; y[7] += xb[u].w;
         lsum += lc[u];
-        float* acc = p.ws_acc + ((ix_t)((bp * p.nc + c) * L + j) * 16 + hh) * 64 + part * 8;
+        float* acc = p.ws_acc + ((ix_t)((bp * p.nc + c) * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
         *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
         *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (part == 0) p.ws_l[((bp * p.nc + c) * L + j) * 16 + hh] = 0.f;
+        if (part == 0) *wsl<L>(p, ((bp * p.nc + c) * L + j) * 16 + hh) = 0.f;
       }
     }
   }
@@ -1646,6 +1749,7 @@ template <int L, int NT>
 __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int pair, const int bp, const float vscale,
                                      const int dry) {
   const int tid = threadIdx.x;
+  if (tid >= NT) return;   // (NT 256 CTAs at q_len 1: the first 128 threads finalize; no barrier below)
   // loads of a group of passes first (one L2 round trip per group), then math and stores; groups of 2 passes in a
   // rolled loop (this runs once per launch from a cold instruction cache: q_len 8 has 4 passes)
   constexpr int PASSES = L * 16 / (NT / 8);
@@ -1660,21 +1764,21 @@ __device__ __forceinline__ void fin_nc1(const Params& p, const int b, const int 
     for (int u = 0; u < GP; ++u) {
       const int rr = (p0 + u) * (NT / 8) + (tid >> 3);
       const int j = rr >> 4, hh = rr & 15;
-      const float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * 64 + part * 8;
+      const float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
       xa[u] = __ldcg(reinterpret_cast<const float4*>(acc));
       xb[u] = __ldcg(reinterpret_cast<const float4*>(acc) + 1);
-      lc[u] = __ldcg(p.ws_l + (bp * L + j) * 16 + hh);
+      lc[u] = __ldcg(wsl<L>(p, (bp * L + j) * 16 + hh));
       graw[u] = *reinterpret_cast<const uint4*>(p.qkv + (ix_t)(b * L + j) * p.ld_qkv + (p.Hq + 2 * p.Hkv) * 64 + (16 * pair + hh) * 64 + part * 8);
     }
 #pragma unroll
     for (int u = 0; u < GP; ++u) {
       const int rr = (p0 + u) * (NT / 8) + (tid >> 3);
       const int j = rr >> 4, hh = rr & 15;
-      float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * 64 + part * 8;
+      float* acc = p.ws_acc + ((ix_t)(bp * L + j) * 16 + hh) * WSRow<L>::STR + part * 8;
       if (!dry) {
         *reinterpret_cast<float4*>(acc) = make_float4(0.f, 0.f, 0.f, 0.f);
         *(reinterpret_cast<float4*>(acc) + 1) = make_float4(0.f, 0.f, 0.f, 0.f);
-        if (part == 0) p.ws_l[(bp * L + j) * 16 + hh] = 0.f;
+        if (part == 0) *wsl<L>(p, (bp * L + j) * 16 + hh) = 0.f;
       }
       const float inv = lc[u] > 0.f ? __fdividef(vscale, lc[u]) : 0.f;
       float y[8] = {pr8(xa[u].x * inv), pr8(xa[u].y * inv), pr8(xa[u].z * inv), pr8(xa[u].w * inv),
@@ -1746,6 +1850,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   constexpr bool ONE = !FLAT && (MODE & 4) != 0;
   const bool M_CL = !FLAT && ((MODE & 3) == 0 ? p.cs > 1 : (MODE & 3) == 2);
   const bool M_COOP = (MODE & 3) == 0 ? p.coop != 0 : (MODE & 3) == 3;
+  constexpr bool M_COOP_C = (MODE & 3) != 1;   // (compile-time: not a plain last-CTA instance; MODE 0 / 2 / 3 keep the acq_rel ticket)
   constexpr int NT = Cfg<L, FLAT>::NT;
   constexpr int STAGES = Cfg<L, FLAT>::STAGES;
   constexpr bool CONT = FLAT && Cfg<L, FLAT>::WS && OKC_CONT;
@@ -2084,8 +2189,8 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #if OKC_PFASTPR && OKC_OFF32 && !OKC_TMA
     // OKC_PFASTPR: every row of the tile cached (pos < min(end, seq)), page size 1, caches below 4 GB: one shift-add
     // per row, no per-row branches (the per-request issue runs from a cold instruction cache, mostly once)
-    if (with_new && p.off32 && p.lp == 0 && start + x * TILE + TILE <= min(end, seq)) {   // (in-loop issues only: the
-      // prologue's cold copy of the tile-0 issue stays the plain one, s1 measured +1.5% with it)
+    if ((with_new || OKC_PFASTPRO) && p.off32 && p.lp == 0 && start + x * TILE + TILE <= min(end, seq)) {   // (in-loop issues
+      // only unless OKC_PFASTPRO: the prologue's cold copy of the tile-0 issue stays the plain one, s1 measured +1.5% with it)
       const uint32_t kst = smem_u32(S.k + st * STAGE_BYTES), vst = smem_u32(S.v + st * STAGE_BYTES);
       const uint32_t col = (uint32_t)(pair * 128 + cchunk * 16);
 #pragma unroll
@@ -2191,7 +2296,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   }
 #endif
   int tidL = tid, partL = part;   // (OKC_LATETID: re-read after the page-index copies are issued)
-  constexpr int QPASS = L * 16 / RPP;            // L*16 rows, RPP rows per pass
+  constexpr int QPASS = (L * 16 + RPP - 1) / RPP;   // L*16 rows, RPP rows per pass (NT 256 at L 1: half the threads idle)
   const bool has_new = end > seq;
   constexpr int KPASS = (L * 4 + RPP - 1) / RPP; // L*4 rows (k, v of 2 heads), RPP rows per pass
   constexpr bool QDIR = OKC_QDIRECT && L == 8 && !WS && !Cfg<L, FLAT>::S2 && PV8ON && OKC_QSS && OKC_SM90 && OKC_Q8RAW &&
@@ -2462,8 +2567,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #endif
   for (int ps = 0; ps < QPASS; ++ps) {
     const int rr = ps * RPP + (tidL >> 3);
+    const bool qlive = (L * 16 % RPP == 0) || rr < L * 16;   // (rows past the block: no store; the shuffles stay warp-uniform)
     const int j = rr >> 4, hh = rr & 15;
-    const uint4 qv = *reinterpret_cast<const uint4*>(&S.qst()[rr * 64 + partL * 8]);
+    const uint4 qv = *reinterpret_cast<const uint4*>(&S.qst()[(qlive ? rr : 0) * 64 + partL * 8]);
     const __nv_bfloat162* h2 = reinterpret_cast<const __nv_bfloat162*>(&qv);
     float x[8];
 #pragma unroll
@@ -2509,7 +2615,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     if constexpr (L == 1) { const uint32_t t1 = qwp[1]; qwp[1] = qwp[2]; qwp[2] = t1; }   // (scout: quad order 0,2,1,3)
     if constexpr (WS) {   // in place over the raw row (same thread, same 16 bytes)
       *reinterpret_cast<uint4*>(S.kvq + rr * 128 + partL * 16) = qw;
-    } else {
+    } else if (qlive) {
       uint8_t* qs = (hk ? S.v : S.k) + (STAGES - 1) * STAGE_BYTES;
       *reinterpret_cast<uint4*>(qs + (j * 8 + gg) * 128 + partL * 16) = qw;
     }
@@ -2595,7 +2701,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   }
 
   if constexpr (!FLAT && OKC_FINWARM) {   // warm the cold last-CTA finalize code while the first tiles load
-    if (p.cs <= 1 && !p.coop && p.nc == 1) fin_nc1<L, NT>(p, b, pair, bp, 0.f, 1);
+    if (p.cs <= 1 && !p.coop && p.nc == 1) fin_nc1<L, (L == 1 && NT > 128) ? 128 : NT>(p, b, pair, bp, 0.f, 1);
   }
   DBG(2);
   // ---- consumer state ----
@@ -2625,6 +2731,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   const int hi_all = OKC_INV2 ? __shfl_sync(0xffffffffu, min(end - 1, seq), 0) : min(end - 1, seq);
 
   if constexpr (L == 1) {
+  // warp = (KV head hk, key block wsub of the tile): 8*NTQ keys per warp (NTQ n-tiles of 8 keys; 4 warps: halves of 32,
+  // OKC_W8: 8 warps on quarters of 16)
+  constexpr int NTQ = (NT == 256) ? 2 : 4;
   // Q A-fragments (f16, pre-scaled to log2 units) for 4 k-steps of 16 dims: thread holds dims
   // 16*tig + 4*ks + {0,1} (a0) and + {2,3} (a2); the K B-fragments use the same dims.
   uint32_t qa[4][2];
@@ -2665,17 +2774,17 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     const uint8_t* V = S.v + ((tb + i) % STAGES) * STAGE_BYTES;
     const int t0 = start + i * TILE;
     const bool interior = (t0 >= lo_all) && (t0 + TILE - 1 <= hi_all);
-    // warp: kv head hk, keys [32*wsub, 32*wsub+32) of the tile
-    float s[4][4];
-    uint32_t kw[4][4];
+    // warp: kv head hk, keys [8*NTQ*wsub, 8*NTQ*wsub + 8*NTQ) of the tile
+    float s[NTQ][4];
+    uint32_t kw[NTQ][4];
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) {
-      const int key = 32 * wsub + 8 * nt + g;
+    for (int nt = 0; nt < NTQ; ++nt) {
+      const int key = 8 * NTQ * wsub + 8 * nt + g;
       const uint4 kb = lds128(K + key * ROWB + (((hk * 4 + tig) ^ (key & 7)) << 4));
       kw[nt][0] = kb.x; kw[nt][1] = kb.y; kw[nt][2] = kb.z; kw[nt][3] = kb.w;
     }
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) {   // (scout: unpadded quads; even k-steps -> rows g of se, odd -> rows g+8 of so)
+    for (int nt = 0; nt < NTQ; ++nt) {   // (scout: unpadded quads; even k-steps -> rows g of se, odd -> rows g+8 of so)
       float se[4] = {0.f, 0.f, 0.f, 0.f}, so[4] = {0.f, 0.f, 0.f, 0.f};
 #pragma unroll
       for (int h = 0; h < 2; ++h) {
@@ -2687,16 +2796,16 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     PROF_MARK(2);
     if (!interior) {
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt)
+      for (int nt = 0; nt < NTQ; ++nt)
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
-          const int pos = t0 + 32 * wsub + 8 * nt + 2 * tig + e;
+          const int pos = t0 + 8 * NTQ * wsub + 8 * nt + 2 * tig + e;
           if (pos >= end) s[nt][e] = -INFINITY;
         }
     }
     float mx = -INFINITY;
 #pragma unroll
-    for (int nt = 0; nt < 4; ++nt) mx = fmaxf(mx, fmaxf(s[nt][0], s[nt][1]));
+    for (int nt = 0; nt < NTQ; ++nt) mx = fmaxf(mx, fmaxf(s[nt][0], s[nt][1]));
 #if OKC_LAZY1
     // lazy offset (log2 units, in m_r): P = 2^(s - m_r) <= 2^8 in f16; the offset moves (with a rescale of o and l)
     // only when a score passes it by 8 or on the first tile with keys. The check needs no row reduction: any such
@@ -2716,7 +2825,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     if (m_new != -INFINITY) {
       float ls = 0.f;
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt)
+      for (int nt = 0; nt < NTQ; ++nt)
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
           const float pv = ex2(s[nt][e] - m_new);
@@ -2732,7 +2841,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       m_r[0] = m_new;
       float ls = 0.f;
 #pragma unroll
-      for (int nt = 0; nt < 4; ++nt)
+      for (int nt = 0; nt < NTQ; ++nt)
 #pragma unroll
         for (int e = 0; e < 2; ++e) {
           const float pv = ex2(s[nt][e] - m_new);
@@ -2748,9 +2857,9 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
       }
 #endif
 #pragma unroll
-      for (int ks = 0; ks < (OKC_XHALFPV ? 1 : 2); ++ks) {   // (OKC_XHALFPV: timing probe only, wrong results)
+      for (int ks = 0; ks < (OKC_XHALFPV ? 1 : NTQ / 2); ++ks) {   // (OKC_XHALFPV: timing probe only, wrong results)
         uint32_t b0[8], b1[8];
-        load_v_frags(V, 32 * wsub + 16 * ks, hk, g, tig, b0, b1);
+        load_v_frags(V, 8 * NTQ * wsub + 16 * ks, hk, g, tig, b0, b1);
         const uint32_t a0 = pack_h2(s[2 * ks][0], s[2 * ks][1]);
         const uint32_t a2 = pack_h2(s[2 * ks + 1][0], s[2 * ks + 1][1]);
 #pragma unroll
@@ -3770,12 +3879,13 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
   bool do_red = true;
   if constexpr (Cfg<L, FLAT>::F2) do_red = (warp >> 3) == 0;   // stream 1's state was merged into stream 0
   if (L == 1 && !CONT && !(OKC_NOXCH1 && !M_CL)) {
-    // warps 2,3 (second key half) hand their state to warps 0,1 (same heads) through shared memory
-    // (OKC_NOXCH1: outside cluster mode both halves add their own rescaled state to the workspace instead)
+    // the other key blocks' warps (wsub >= 1) hand their state to the wsub == 0 warp of the same head through
+    // shared memory (OKC_NOXCH1: outside cluster mode every warp adds its own rescaled state to the workspace instead)
+    constexpr int NXW = NT / 64 - 1;   // partner warps per head (1 with 4 warps, 3 with 8)
     cp_wait<0>();
     csync<WS, NT>();
-    float* xs = reinterpret_cast<float*>(S.k) + ((warp & 1) * 32 + lane) * 18;
-    if (wsub == 1) {
+    float* xs = reinterpret_cast<float*>(S.k) + (((wsub > 0 ? wsub - 1 : 0) * 2 + (warp & 1)) * 32 + lane) * 18;
+    if (wsub > 0) {
       xs[0] = m_r[0];
       xs[1] = l_r[0];
 #pragma unroll
@@ -3783,17 +3893,30 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     }
     csync<WS, NT>();
     if (wsub == 0) {
-      const float m1 = xs[0], l1 = xs[1];
-      const float mm = fmaxf(m_r[0], m1);
-      const float f0 = (m_r[0] == -INFINITY) ? 0.f : ex2(m_r[0] - mm);
-      const float f1 = (m1 == -INFINITY) ? 0.f : ex2(m1 - mm);
-      m_r[0] = mm;
-      l_r[0] = l_r[0] * f0 + l1 * f1;
+      float mq[NXW], lq[NXW];
+      float mm = m_r[0];
 #pragma unroll
-      for (int t = 0; t < 8; ++t) {
-        o[0][t][0] = o[0][t][0] * f0 + xs[2 + 2 * t] * f1;
-        o[0][t][1] = o[0][t][1] * f0 + xs[3 + 2 * t] * f1;
+      for (int q = 0; q < NXW; ++q) {
+        mq[q] = xs[(q * 2 * 32) * 18];
+        lq[q] = xs[(q * 2 * 32) * 18 + 1];
+        mm = fmaxf(mm, mq[q]);
       }
+      const float f0 = (m_r[0] == -INFINITY) ? 0.f : ex2(m_r[0] - mm);
+      l_r[0] *= f0;
+#pragma unroll
+      for (int t = 0; t < 8; ++t) { o[0][t][0] *= f0; o[0][t][1] *= f0; }
+#pragma unroll
+      for (int q = 0; q < NXW; ++q) {
+        const float fq = (mq[q] == -INFINITY) ? 0.f : ex2(mq[q] - mm);
+        const float* xq = xs + (q * 2 * 32) * 18;
+        l_r[0] += lq[q] * fq;
+#pragma unroll
+        for (int t = 0; t < 8; ++t) {
+          o[0][t][0] += xq[2 + 2 * t] * fq;
+          o[0][t][1] += xq[3 + 2 * t] * fq;
+        }
+      }
+      m_r[0] = mm;
     } else {
       do_red = false;
     }
@@ -3840,6 +3963,15 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     cluster_finish<L>(p, S, b, pair, n_keys, chunk);
     return true;
   }
+  // OKC_BULKRED (no clusters): the partial goes to shared memory (the free stages) in the workspace's own row layout
+  // ([L*16][72]: dims, the row sum in column 64, pad) and one TMA bulk reduction adds it into the workspace below
+  constexpr int BULKOPS = (L == 1) ? OKC_BULKOPS1 : OKC_BULKOPS8;   // ops per partial (row ranges), 0 = reds
+  constexpr bool BULKRED = OKC_BULKRED && WSRow<L>::P72 && OKC_SM90 && !FLAT && !Cfg<L, FLAT>::S2 && !Cfg<L, FLAT>::F2 &&
+                           !(OKC_BULKRED_NOTONE && ONE) && BULKOPS > 0;
+  constexpr int PSTR = WSRow<L>::STR;                        // smem partial row stride (floats)
+  constexpr bool TKT2 = OKC_TKT2 && BULKRED && !M_COOP_C;   // (last-CTA finalize only)
+  float* pbuf = reinterpret_cast<float*>((L == 1) ? S.v : S.k);   // q1: the V stages (the K stages hold the exchange)
+  if constexpr (BULKRED && L == 8) csync<WS, NT>();   // every warpgroup's last QK^T wgmma has read the K stages
   if (do_red) {   // (one branch, not one per row: the post-loop merge runs straight-line from a cold cache)
 #pragma unroll
   for (int r = 0; r < NROW; ++r) {
@@ -3848,8 +3980,32 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     const int hh = hk * 8 + g;
     const float lsum = quad_sum(l_r[r]);
     const float f = (m_r[r] == -INFINITY) ? 0.f : ex2(fminf(m_r[r], 126.f));
-    float* acc = p.ws_acc + ((ix_t)((bp * p.nc + copy) * L + j) * 16 + hh) * 64;
-    if constexpr (L == 1) {
+    float* acc = p.ws_acc + ((ix_t)((bp * p.nc + copy) * L + j) * 16 + hh) * WSRow<L>::STR;
+    if constexpr (BULKRED && L == 1) {   // permuted dims (see below): float4 of n-tiles t4..t4+3 at dim 16*tig + 8*c + t4
+#pragma unroll
+      for (int c = 0; c < 2; ++c)
+#pragma unroll
+        for (int t4 = 0; t4 < 8; t4 += 4)
+          *reinterpret_cast<float4*>(pbuf + hh * PSTR + 16 * tig + 8 * c + t4) =
+              make_float4(o[mt][t4][2 * hf + c] * f, o[mt][t4 + 1][2 * hf + c] * f,
+                          o[mt][t4 + 2][2 * hf + c] * f, o[mt][t4 + 3][2 * hf + c] * f);
+      if (tig == 0) {   // the row sum in column 64, the pad zeroed (the bulk op adds whole rows)
+        *reinterpret_cast<float4*>(pbuf + hh * PSTR + WSL) = make_float4(lsum * f, 0.f, 0.f, 0.f);
+        *reinterpret_cast<float4*>(pbuf + hh * PSTR + WSL + 4) = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+      continue;
+    } else if constexpr (BULKRED) {   // natural dims: n-tile t, column c <-> dim 8*t + 2*tig + c; row j*16 + hh
+      const int row = j * 16 + hh;
+#pragma unroll
+      for (int t = 0; t < 8; ++t)
+        *reinterpret_cast<float2*>(pbuf + row * PSTR + 8 * t + 2 * tig) =
+            make_float2(o[mt][t][2 * hf] * f, o[mt][t][2 * hf + 1] * f);
+      if (tig == 0) {
+        *reinterpret_cast<float4*>(pbuf + row * PSTR + WSL) = make_float4(lsum * f, 0.f, 0.f, 0.f);
+        *reinterpret_cast<float4*>(pbuf + row * PSTR + WSL + 4) = make_float4(0.f, 0.f, 0.f, 0.f);
+      }
+      continue;
+    } else if constexpr (L == 1) {
 #pragma unroll
       for (int c = 0; c < 2; ++c)
 #pragma unroll
@@ -3876,8 +4032,30 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 #pragma unroll
       for (int t = 0; t < 8; ++t) red_v2(acc + 8 * t + 2 * tig, o[mt][t][2 * hf] * f, o[mt][t][2 * hf + 1] * f);
     }
-    if (tig == 0) red_f32(p.ws_l + ((bp * p.nc + copy) * L + j) * 16 + hh, lsum * f);
+    if (tig == 0) red_f32(wsl<L>(p, ((bp * p.nc + copy) * L + j) * 16 + hh), lsum * f);
   }
+  }
+  if constexpr (BULKRED) {
+    fence_proxy_async();   // the partial's st.shared, visible to the async proxy
+    csync<WS, NT>();
+    constexpr int NR = L * 16;
+    constexpr int NOPS = (BULKOPS > 0 && BULKOPS <= NR) ? BULKOPS : 1;   // row ranges of NR / NOPS rows
+    static_assert(NR % NOPS == 0, "bulk ops must split the rows evenly");
+    if (tid < NOPS) {
+      bulk_red_add_f32(p.ws_acc + ((ix_t)((bp * p.nc + copy) * L) * 16 + tid * (NR / NOPS)) * WSRow<L>::STR,
+                       pbuf + tid * (NR / NOPS) * WSRow<L>::STR, (NR / NOPS) * WSRow<L>::STR * 4);
+      bulk_commit();
+    }
+    if constexpr (TKT2) {   // the key ticket (relaxed: no data ordering) overlaps the bulk op's completion
+      if (tid == 0) {
+        const int old = atomicAdd(p.ws_cnt + bp, end - start);
+        S.flag = (old + (end - start) == n_keys);
+      }
+    }
+    if (tid < NOPS) {
+      bulk_wait_all();
+      fence_proxy_async_global();   // ... performed, and ordered (through the CTA barrier) before the ticket's release
+    }
   }
   if (OKC_MRGDBG) DBG(7);   // (debug: reds issued)
   // OKC_MERGE2 (last-CTA finalizes): no per-thread fences; one acq_rel atomic by thread 0 after the CTA barrier
@@ -4020,10 +4198,29 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
     }
     DBG(5);
   } else {
-  if (tid == 0) {
+  if constexpr (TKT2) {
+    // this CTA's partial is in the workspace (bulk op complete, proxy fence): count its keys on the done counter with
+    // release semantics; the ticket (relaxed, issued above) named the last CTA, which waits for every CTA's done count
+    if (tid == 0) {
+      const int mine = end - start;
+      asm volatile("red.release.gpu.global.add.s32 [%0], %1;\n" ::"l"(p.ws_cnt + 20480 + bp), "r"(mine) : "memory");
+      if (S.flag) {
+        int v;
+        SPIN_T0;
+        for (;;) {
+          asm volatile("ld.acquire.gpu.global.s32 %0, [%1];\n" : "=r"(v) : "l"(p.ws_cnt + 20480 + bp) : "memory");
+          if (v >= n_keys) break;
+          SPIN_CHECK;
+          __nanosleep(32);
+        }
+        p.ws_cnt[20480 + bp] = 0;   // (every CTA's count is in; the next launch starts from zero)
+      }
+    }
+  } else if (tid == 0) {
     const int mine = end - start;
     int old;
-    if constexpr (MRG2) asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;\n" : "=r"(old) : "l"(p.ws_cnt + bp), "r"(mine) : "memory");
+    if constexpr (OKC_XP_RELAXTICKET) old = atomicAdd(p.ws_cnt + bp, mine);   // (probe: no release / acquire)
+    else if constexpr (MRG2) asm volatile("atom.acq_rel.gpu.global.add.s32 %0, [%1], %2;\n" : "=r"(old) : "l"(p.ws_cnt + bp), "r"(mine) : "memory");
     else old = atomicAdd(p.ws_cnt + bp, mine);
     S.flag = (old + mine == n_keys);
   }
@@ -4035,7 +4232,7 @@ __device__ __forceinline__ bool segment(const Params& p, Smem<L, FLAT>& S, const
 
   // ---- last CTA: sum the copies, normalize, rmsnorm * sigmoid(gate), store; reset the workspace ----
   if (p.nc == 1) {
-    fin_nc1<L, NT>(p, b, pair, bp, vscale, 0);
+    fin_nc1<L, (L == 1 && NT > 128) ? 128 : NT>(p, b, pair, bp, vscale, 0);
   } else
   {
     const int part = tid & 7;
@@ -5076,9 +5273,9 @@ def _workspace(n_rows, device):
     """Persistent FP32 accumulators (zero between calls: the last CTA resets them)."""
     key = str(device)
     ws = _WS.get(key)
-    if ws is None or ws[0].numel() < n_rows * 64:
+    if ws is None or ws[0].numel() < n_rows * 72:
         n = max(n_rows, 1 << 15)
-        ws = (torch.zeros(n * 64, dtype=torch.float32, device=device),
+        ws = (torch.zeros(n * 72, dtype=torch.float32, device=device),   # rows of 72 floats (OKC_WS72: the row sum in column 64)
               torch.zeros(n, dtype=torch.float32, device=device),
               torch.zeros(n, dtype=torch.int32, device=device))
         _WS[key] = ws
